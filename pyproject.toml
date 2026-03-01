@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feedsummary-core"
+dynamic = ["version"]
+description = "Core library for FeedSummary."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+license-files = [ "LICENSE" ]
+authors = [{ name = "Martin Vesterlund" }]
+keywords = ["rss", "summarization", "llm"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "aiohttp>=3.13.3",          # :contentReference[oaicite:1]{index=1}
+  "aiolimiter>=1.2.1",        # :contentReference[oaicite:2]{index=2}
+  "feedparser>=6.0.12",       # :contentReference[oaicite:3]{index=3}
+  "tenacity>=9.1.4",          # :contentReference[oaicite:4]{index=4}
+  "tinydb>=4.8.2",            # :contentReference[oaicite:5]{index=5}
+  "tld>=0.13.1",              # :contentReference[oaicite:6]{index=6}
+  "PyYAML>=6.0.3",            # :contentReference[oaicite:7]{index=7}
+  "trafilatura>=2.0.0",       # :contentReference[oaicite:8]{index=8}
+  "ollama>=0.6.1",            # :contentReference[oaicite:9]{index=9}
+  "lxml_html_clean>=0.4.3",   # :contentReference[oaicite:10]{index=10}
+]
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+version_file = "src/feedsummary_core/_version.py"
+
+[tool.ruff]
+line-length = 100
