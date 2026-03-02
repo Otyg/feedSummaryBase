@@ -37,7 +37,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol
 
-from llmClient.ollama_cloud import LLMRateLimitError
+from llm_client import LLMRateLimitError
 
 log = logging.getLogger(__name__)
 
