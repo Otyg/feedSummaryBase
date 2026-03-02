@@ -35,9 +35,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
-
-from persistence.TinyDbStore import TinyDBStore
-from persistence.SqliteStore import SqliteStore
+from feedsummary_core.persistence import TinyDBStore
+from feedsummary_core.persistence import SqliteStore
 
 
 class StoreError(Exception):
