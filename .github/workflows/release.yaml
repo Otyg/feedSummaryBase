@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/<PACKAGE_NAME>/
+      url: https://pypi.org/project/feedsummary_core/
 
     steps:
       - name: Download dist artifacts
