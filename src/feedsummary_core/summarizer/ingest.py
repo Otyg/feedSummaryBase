@@ -45,8 +45,8 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from persistence import NewsStore
-from summarizer.helpers import (
+from feedsummary_core.persistence import NewsStore
+from feedsummary_core.summarizer.helpers import (
     RateLimitError,
     compute_content_hash,
     entry_published_ts,

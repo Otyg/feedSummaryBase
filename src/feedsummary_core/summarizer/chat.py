@@ -30,14 +30,14 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-from llmClient import LLMClient
-from summarizer.batching import (
+from feedsummary_core.llm_client import LLMClient
+from feedsummary_core.summarizer.batching import (
     PromptTooLongStructural,
     _choose_trim_action,
     _trim_last_user_word_boundary,
 )
-from summarizer.helpers import _extract_overflow_tokens
-from summarizer.token_budget import enforce_budget
+from feedsummary_core.summarizer.helpers import _extract_overflow_tokens
+from feedsummary_core.summarizer.token_budget import enforce_budget
 from typing import Dict, List
 import logging
 

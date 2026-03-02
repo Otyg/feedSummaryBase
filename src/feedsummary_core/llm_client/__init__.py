@@ -31,11 +31,15 @@
 #
 from __future__ import annotations
 
-from llmClient.fallback_client import FallbackLLMClient, FallbackPolicy
+from feedsummary_core.llm_client.fallback_client import FallbackLLMClient, FallbackPolicy
 
 from typing import Any, Dict, List, Optional, Protocol
 
-
+class LLMRateLimitError(RuntimeError):
+    def __init__(self, message: str, retry_after_seconds: Optional[int] = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        
 class LLMError(Exception):
     pass
 
@@ -48,12 +52,12 @@ def _create_single_llm(llm_cfg: Dict[str, Any]):
     provider = (llm_cfg.get("provider") or "ollama").lower()
 
     if provider == "ollama_cloud":
-        from llmClient.ollama_cloud import OllamaCloudClient
+        from feedsummary_core.llm_client.ollama_cloud import OllamaCloudClient
 
         return OllamaCloudClient(llm_cfg)
 
     if provider == "ollama_local":
-        from llmClient.ollama_local import OllamaLocalClient, OllamaConfig
+        from feedsummary_core.llm_client.ollama_local import OllamaLocalClient, OllamaConfig
 
         cfg = OllamaConfig(
             base_url=str(llm_cfg.get("base_url", "http://localhost:11434")),

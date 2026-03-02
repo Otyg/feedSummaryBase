@@ -42,9 +42,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from llmClient import create_llm_client
-from persistence import NewsStore, create_store
-from summarizer.helpers import (
+from feedsummary_core.llm_client import create_llm_client
+from feedsummary_core.persistence import NewsStore, create_store
+from feedsummary_core.summarizer.helpers import (
     setup_logging,
     load_prompts,
     parse_lookback_to_seconds,
@@ -54,8 +54,8 @@ from summarizer.helpers import (
     _meta_ckpt_path,
     _load_checkpoint,
 )
-from summarizer.ingest import gather_articles_to_store
-from summarizer.summarizer import (
+from feedsummary_core.summarizer.ingest import gather_articles_to_store
+from feedsummary_core.summarizer.summarizer import (
     summarize_batches_then_meta_with_stats,
     super_meta_from_topic_sections_with_stats,
 )

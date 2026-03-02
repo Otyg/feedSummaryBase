@@ -37,7 +37,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol
 
-from llm_client import LLMRateLimitError
+from feedsummary_core.llm_client import LLMRateLimitError
 
 log = logging.getLogger(__name__)
 

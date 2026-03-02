@@ -41,9 +41,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from llmClient import LLMClient
-from persistence import NewsStore
-from summarizer.batching import (
+from feedsummary_core.llm_client import LLMClient
+from feedsummary_core.persistence import NewsStore
+from feedsummary_core.summarizer.batching import (
     PromptTooLongStructural,
     _batch_article_ids_map,
     _budgeted_meta_user,
@@ -58,8 +58,8 @@ from summarizer.batching import (
     build_messages_for_batch,
     trim_text_tail_by_words,
 )
-from summarizer.chat import chat_guarded
-from summarizer.helpers import (
+from feedsummary_core.summarizer.chat import chat_guarded
+from feedsummary_core.summarizer.helpers import (
     _atomic_write_json,
     _checkpoint_key,
     _checkpoint_path,

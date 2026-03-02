@@ -37,7 +37,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from summarizer.helpers import trim_text_tail_by_words
+from feedsummary_core.summarizer.helpers import trim_text_tail_by_words
 
 logger = logging.getLogger("FeedSummarizer")
 

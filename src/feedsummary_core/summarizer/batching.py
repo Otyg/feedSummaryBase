@@ -30,7 +30,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-from summarizer.helpers import text_clip
+from feedsummary_core.summarizer.helpers import text_clip
 
 
 from typing import Any, Dict, List, Optional, Tuple

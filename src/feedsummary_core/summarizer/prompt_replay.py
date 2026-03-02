@@ -43,13 +43,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from llmClient import create_llm_client
-from persistence import NewsStore
-from summarizer.summarizer import (
+from feedsummary_core.llm_client import create_llm_client
+from feedsummary_core.persistence import NewsStore
+from feedsummary_core.summarizer.summarizer import (
     summarize_batches_then_meta_with_stats,
     super_meta_from_topic_sections_with_stats,
 )
-from summarizer.helpers import lookback_label_from_range
+from feedsummary_core.summarizer.helpers import lookback_label_from_range
 
 logger = logging.getLogger(__name__)
 
