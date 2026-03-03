@@ -251,10 +251,217 @@ async def _generate_summary_title(
         title = title[:120].rstrip() + "…"
     return title
 
+def _budgeted_proofread_user(
+    *,
+    prompts: Dict[str, Any],
+    draft_summary: str,
+    desk_underlag: str,
+    lookback: str,
+    budget_tokens: int,
+    chars_per_token: float,
+) -> str:
+    """
+    Build proofread user prompt using prompts['proofread_user_template'].
+    Template must accept:
+      - {lookback}
+      - {draft_summary}
+      - {desk_underlag}
+    We budget by trimming desk_underlag first, then (if needed) draft_summary.
+    """
+    tmpl = str(prompts.get("proofread_user_template") or "").strip()
+    if not tmpl:
+        raise KeyError("proofread_user_template")
 
-# ----------------------------
-# NEW: Super-meta (overview) from topic sections
-# ----------------------------
+    d_under = desk_underlag or ""
+    d_draft = (draft_summary or "").strip()
+
+    for _ in range(10):
+        user = tmpl.format(lookback=lookback, draft_summary=d_draft, desk_underlag=d_under)
+        est = _est_user_tokens(user, chars_per_token)
+        if est <= budget_tokens:
+            return user
+
+        # trim desk_underlag first
+        if len(d_under) > 2000:
+            d_under = d_under[: max(1200, int(len(d_under) * 0.85))]
+            continue
+
+        # then trim draft
+        if len(d_draft) > 1200:
+            d_draft = d_draft[: max(800, int(len(d_draft) * 0.85))]
+            continue
+
+        break
+
+    # last resort hard truncate
+    d_under = d_under[:2000]
+    d_draft = d_draft[:1200]
+    return tmpl.format(lookback=lookback, draft_summary=d_draft, desk_underlag=d_under)
+
+
+def _budgeted_revise_user(
+    *,
+    prompts: Dict[str, Any],
+    draft_summary: str,
+    desk_underlag: str,
+    feedback: str,
+    lookback: str,
+    budget_tokens: int,
+    chars_per_token: float,
+) -> str:
+    """
+    Build revise user prompt using prompts['revise_user_template'].
+    Template must accept:
+      - {lookback}
+      - {draft_summary}
+      - {desk_underlag}
+      - {feedback}
+    Budget by trimming desk_underlag first, then draft_summary, then feedback.
+    """
+    tmpl = str(prompts.get("revise_user_template") or "").strip()
+    if not tmpl:
+        raise KeyError("revise_user_template")
+
+    d_under = desk_underlag or ""
+    d_draft = (draft_summary or "").strip()
+    d_fb = (feedback or "").strip()
+
+    for _ in range(10):
+        user = tmpl.format(
+            lookback=lookback,
+            draft_summary=d_draft,
+            desk_underlag=d_under,
+            feedback=d_fb,
+        )
+        est = _est_user_tokens(user, chars_per_token)
+        if est <= budget_tokens:
+            return user
+
+        if len(d_under) > 2000:
+            d_under = d_under[: max(1200, int(len(d_under) * 0.85))]
+            continue
+        if len(d_draft) > 1200:
+            d_draft = d_draft[: max(800, int(len(d_draft) * 0.85))]
+            continue
+        if len(d_fb) > 1000:
+            d_fb = d_fb[: max(600, int(len(d_fb) * 0.85))]
+            continue
+        break
+
+    d_under = d_under[:2000]
+    d_draft = d_draft[:1200]
+    d_fb = d_fb[:800]
+    return tmpl.format(
+        lookback=lookback,
+        draft_summary=d_draft,
+        desk_underlag=d_under,
+        feedback=d_fb,
+    )
+
+
+async def _proofread_and_revise_meta_with_stats(
+    *,
+    config: Dict[str, Any],
+    llm: LLMClient,
+    store: NewsStore,
+    job_id: Optional[int],
+    prompts: Dict[str, Any],
+    lookback: str,
+    meta_text: str,
+    batch_summaries: List[Tuple[int, str]],
+    sources_text: str,
+    max_rounds: int = 4,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Runs proofread->revise loop max `max_rounds` times.
+    Returns (possibly revised meta_text, stats).
+    """
+
+    proof_sys = str(prompts.get("proofread_system") or "").strip()
+    proof_user_tmpl = str(prompts.get("proofread_user_template") or "").strip()
+    rev_sys = str(prompts.get("revise_system") or "").strip()
+    rev_user_tmpl = str(prompts.get("revise_user_template") or "").strip()
+
+    if not (proof_sys and proof_user_tmpl and rev_sys and rev_user_tmpl):
+        return meta_text, {"proofread_enabled": 0, "proofread_rounds": 0}
+
+    llm_cfg = config.get("llm") or {}
+    max_ctx = int(llm_cfg.get("context_window_tokens", 32768))
+    max_out = int(llm_cfg.get("max_output_tokens", 700))
+    margin = int(llm_cfg.get("prompt_safety_margin", 1024))
+    chars_per_token = float(llm_cfg.get("token_chars_per_token", 2.4))
+
+    batching = config.get("batching", {}) or {}
+    pr_budget_cfg = int(batching.get("proofread_budget_tokens") or 0)
+    budget_tokens = pr_budget_cfg if pr_budget_cfg > 0 else max(512, max_ctx - max_out - margin)
+
+    # Desk-underlag: batch-summaries + (valfritt) källor-lista
+    # (batch_summaries innehåller redan SOURCES-rader; sources_text är en kompletterande lista)
+    desk_parts: List[str] = []
+    for idx, txt in batch_summaries:
+        t = (txt or "").strip()
+        if not t:
+            continue
+        desk_parts.append(f"--- BATCH {idx} ---\n{t}")
+    desk_underlag = ("\n\n".join(desk_parts).strip() + "\n\n--- KÄLLOR (lista) ---\n" + (sources_text or "")).strip()
+
+    text = (meta_text or "").strip()
+    last_feedback = ""
+    rounds = 0
+
+    for r in range(1, max_rounds + 1):
+        rounds = r
+        set_job(f"Korrekturläser sammanfattning ({r}/{max_rounds})...", job_id, store)
+
+        user = _budgeted_proofread_user(
+            prompts=prompts,
+            draft_summary=text,
+            desk_underlag=desk_underlag,
+            lookback=lookback,
+            budget_tokens=budget_tokens,
+            chars_per_token=chars_per_token,
+        )
+
+        crit = await llm.chat(
+            [{"role": "system", "content": proof_sys}, {"role": "user", "content": user}],
+            temperature=0.2,
+        )
+        crit_s = (crit or "").strip()
+        if crit_s.upper().startswith("PASS"):
+            return text, {
+                "proofread_enabled": 1,
+                "proofread_rounds": r,
+                "proofread_last_feedback": "",
+            }
+
+        last_feedback = crit_s
+
+        set_job(f"Reviderar sammanfattning ({r}/{max_rounds})...", job_id, store)
+
+        user2 = _budgeted_revise_user(
+            prompts=prompts,
+            draft_summary=text,
+            desk_underlag=desk_underlag,
+            feedback=crit_s,
+            lookback=lookback,
+            budget_tokens=budget_tokens,
+            chars_per_token=chars_per_token,
+        )
+
+        revised = await llm.chat(
+            [{"role": "system", "content": rev_sys}, {"role": "user", "content": user2}],
+            temperature=0.2,
+        )
+        revised_s = (revised or "").strip()
+        if revised_s:
+            text = revised_s
+
+    return text, {
+        "proofread_enabled": 1,
+        "proofread_rounds": rounds,
+        "proofread_last_feedback": clip_text(last_feedback, 1200),
+    }
+
 def _budgeted_super_meta_user(
     *,
     prompts: Dict[str, Any],
@@ -755,7 +962,19 @@ async def summarize_batches_then_meta_with_stats(
             budget_tokens = new_budget
     else:
         raise RuntimeError(f"Meta misslyckades efter {meta_attempts} försök: {last_err}")
-
+    meta = (meta or "").strip()
+    meta, pr_stats = await _proofread_and_revise_meta_with_stats(
+        config=config,
+        llm=llm,
+        store=store,
+        job_id=job_id,
+        prompts=prompts,
+        lookback=lookback,
+        meta_text=meta,
+        batch_summaries=batch_summaries,
+        sources_text=sources_text,
+       max_rounds=4,
+    )
     # checkpoint meta-result
     if cp_enabled and meta_path is not None:
         _atomic_write_json(
@@ -769,6 +988,9 @@ async def summarize_batches_then_meta_with_stats(
                 "article_ids": [a.get("id", "") for a in articles],
                 "meta": meta,
                 "meta_budget_tokens": meta_budget_tokens_final,
+                "proofread_enabled": int(pr_stats.get("proofread_enabled") or 0),
+                "proofread_rounds": int(pr_stats.get("proofread_rounds") or 0),
+                "proofread_last_feedback": str(pr_stats.get("proofread_last_feedback") or ""),
                 "batch_article_ids": _batch_article_ids_map(batches),
                 "done_batches": _done_batches_payload(done_map, batches),
                 "trims": trims_count,
@@ -795,6 +1017,8 @@ async def summarize_batches_then_meta_with_stats(
         "trims": trims_count,
         "drops": drops_count,
         "meta_budget_tokens": meta_budget_tokens_final,
+        "proofread_enabled": int(pr_stats.get("proofread_enabled") or 0),
+        "proofread_rounds": int(pr_stats.get("proofread_rounds") or 0),
     }
     return meta, stats
 
