@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from feedsummary_core.persistence import CleanupPolicy
+from feedsummary_core.persistence.helpers import classify_summary_doc
 logger = logging.getLogger(__name__)
 
 
@@ -675,5 +677,88 @@ class SqliteStore:
                 "summary": row["summary"],
                 "meta": _json_loads(row["meta_json"]) or {},
             }
+        finally:
+            con.close()
+
+    def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]:
+        """
+        Cleanup for SqliteStore schema (articles, summary_docs, temp_summaries, jobs).
+        summary_docs: delete based on created + prompt_package classification.
+        """
+        now = int(time.time())
+        cut_articles = now - pol.articles_days * 86400
+        cut_daily = now - pol.daily_summaries_days * 86400
+        cut_weekly = now - pol.weekly_summaries_days * 86400
+        cut_temp = now - pol.temp_summaries_days * 86400
+        cut_jobs = now - pol.jobs_days * 86400
+
+        removed = {"articles": 0, "summary_docs": 0, "temp_summaries": 0, "jobs": 0}
+
+        con = self._connect()
+        try:
+            con.row_factory = sqlite3.Row
+
+            # Articles
+            cur = con.execute(
+                "DELETE FROM articles WHERE COALESCE(published_ts, fetched_at, 0) < ?",
+                (cut_articles,),
+            )
+            removed["articles"] = cur.rowcount if cur.rowcount is not None else 0
+
+            # Temp summaries
+            cur = con.execute(
+                "DELETE FROM temp_summaries WHERE COALESCE(created_at, 0) < ?",
+                (cut_temp,),
+            )
+            removed["temp_summaries"] = cur.rowcount if cur.rowcount is not None else 0
+
+            # Jobs: only delete old finished ones (never touch running/queued)
+            cur = con.execute(
+                """
+                DELETE FROM jobs
+                WHERE COALESCE(finished_at, created_at, 0) < ?
+                AND COALESCE(status, '') IN ('done','failed')
+                """,
+                (cut_jobs,),
+            )
+            removed["jobs"] = cur.rowcount if cur.rowcount is not None else 0
+
+            # Summary docs: fetch candidates up to max cutoff, classify in Python, delete by id
+            max_cut = max(cut_daily, cut_weekly)
+            rows = con.execute(
+                "SELECT id, created, doc_json FROM summary_docs WHERE COALESCE(created,0) < ?",
+                (max_cut,),
+            ).fetchall()
+
+            to_delete: List[str] = []
+            for r in rows:
+                sid = str(r["id"])
+                created = int(r["created"] or 0)
+                kind = classify_summary_doc(str(r["doc_json"] or ""))
+
+                if kind == "daily" and created < cut_daily:
+                    to_delete.append(sid)
+                elif kind == "weekly" and created < cut_weekly:
+                    to_delete.append(sid)
+                elif kind == "other" and created < cut_weekly:
+                    # unknown => keep like weekly by default
+                    to_delete.append(sid)
+
+            if to_delete:
+                # chunk deletes
+                chunk = 200
+                for i in range(0, len(to_delete), chunk):
+                    part = to_delete[i : i + chunk]
+                    placeholders = ",".join(["?"] * len(part))
+                    cur = con.execute(
+                        f"DELETE FROM summary_docs WHERE id IN ({placeholders})",
+                        tuple(part),
+                    )
+                    removed["summary_docs"] += (
+                        cur.rowcount if cur.rowcount is not None else 0
+                    )
+
+            con.commit()
+            return removed
         finally:
             con.close()

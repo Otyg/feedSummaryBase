@@ -38,6 +38,8 @@ from typing import Any, Dict, List, Optional, Set
 
 from tinydb import Query, TinyDB
 
+from feedsummary_core.persistence import CleanupPolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -290,3 +292,80 @@ class TinyDBStore:
         rows = t.search(T.job_id == int(job_id))
         db.close()
         return rows[0] if rows else None
+    def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]:
+        """
+        Cleanup for TinyDB schema:
+        tables: articles, summary_docs, temp_summaries, jobs
+        """
+        now = int(time.time())
+        cut_articles = now - pol.articles_days * 86400
+        cut_daily = now - pol.daily_summaries_days * 86400
+        cut_weekly = now - pol.weekly_summaries_days * 86400
+        cut_temp = now - pol.temp_summaries_days * 86400
+        cut_jobs = now - pol.jobs_days * 86400
+
+        removed = {"articles": 0, "summary_docs": 0, "temp_summaries": 0, "jobs": 0}
+
+        # TinyDB import here to avoid dependency if user doesn't use it
+        from tinydb import TinyDB
+
+        db = TinyDB(self.path)
+        try:
+            # Articles
+            at = db.table("articles")
+            # remove uses a predicate for each row
+            before = len(at)
+            at.remove(
+                lambda r: (
+                    int(r.get("published_ts") or r.get("fetched_at") or 0) < cut_articles
+                )
+            )
+            removed["articles"] = max(0, before - len(at))
+
+            # Temp summaries
+            tt = db.table("temp_summaries")
+            before = len(tt)
+            tt.remove(lambda r: int(r.get("created_at") or 0) < cut_temp)
+            removed["temp_summaries"] = max(0, before - len(tt))
+
+            # Jobs (only done/failed)
+            jt = db.table("jobs")
+            before = len(jt)
+
+            def job_old_finished(r: Dict[str, Any]) -> bool:
+                ts = int(r.get("finished_at") or r.get("created_at") or 0)
+                st = str(r.get("status") or "")
+                return ts < cut_jobs and st in ("done", "failed")
+
+            jt.remove(job_old_finished)
+            removed["jobs"] = max(0, before - len(jt))
+
+            # Summary docs
+            sd = db.table("summary_docs")
+            before = len(sd)
+
+            def sum_should_remove(r: Dict[str, Any]) -> bool:
+                created = int(r.get("created") or 0)
+                # we need prompt_package; in tinydb it is stored inside the doc itself
+                pkg = ""
+                sel = r.get("selection")
+                if isinstance(sel, dict):
+                    pkg = str(sel.get("prompt_package") or "").lower().strip()
+                kind = "other"
+                if "weekly" in pkg:
+                    kind = "weekly"
+                elif "daily" in pkg:
+                    kind = "daily"
+
+                if kind == "daily":
+                    return created < cut_daily
+                if kind == "weekly":
+                    return created < cut_weekly
+                return created < cut_weekly
+
+            sd.remove(sum_should_remove)
+            removed["summary_docs"] = max(0, before - len(sd))
+
+            return removed
+        finally:
+            db.close()
