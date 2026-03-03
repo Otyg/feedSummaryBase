@@ -36,23 +36,13 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
+from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
 from feedsummary_core.persistence.TinyDbStore import TinyDBStore
 from feedsummary_core.persistence.SqliteStore import SqliteStore
 
 
 class StoreError(Exception):
     pass
-
-@dataclass(frozen=True)
-class CleanupPolicy:
-    enabled: bool = True
-    run_every_minutes: int = 60
-
-    articles_days: int = 180
-    daily_summaries_days: int = 7
-    weekly_summaries_days: int = 30
-    temp_summaries_days: int = 30
-    jobs_days: int = 90
 
 class NewsStore(Protocol):
     def get_article(self, article_id: str) -> Optional[Dict[str, Any]]: ...
