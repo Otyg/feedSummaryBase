@@ -302,25 +302,6 @@ def entry_published_ts(entry: feedparser.FeedParserDict) -> Optional[int]:
 # Prompt loader (from config)
 # ----------------------------
 def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[str, str]:
-    """
-    1) NYTT: läsa promptpaket från config/prompts.yaml
-       config.yaml:
-         prompts:
-           path: "config/prompts.yaml"
-           default_package: "standard_sv"
-           selected: ""  (kan sättas av webappen)
-    2) BAKÅTKOMP: om config["prompts"] redan innehåller batch_system/meta_system etc,
-       använd det direkt.
-
-    Viktigt:
-    - Vi returnerar alltid basnycklarna.
-    - Vi tar även med valfria nycklar om de finns i paketet:
-        super_meta_system
-        super_meta_user_template
-        title_system
-        title_user_template
-    """
-
     p_cfg = config.get("prompts") or {}
 
     base_keys = (
@@ -334,6 +315,10 @@ def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[
         "super_meta_user_template",
         "title_system",
         "title_user_template",
+        "proofread_system",
+        "proofread_user_template",
+        "revise_system",
+        "revise_user_template",
     )
 
     # Backward compat: prompts directly embedded in config.yaml

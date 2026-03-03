@@ -32,7 +32,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
@@ -43,6 +42,7 @@ from feedsummary_core.persistence.SqliteStore import SqliteStore
 
 class StoreError(Exception):
     pass
+
 
 class NewsStore(Protocol):
     def get_article(self, article_id: str) -> Optional[Dict[str, Any]]: ...
@@ -88,6 +88,7 @@ class NewsStore(Protocol):
     def get_temp_summary(self, job_id: int) -> Optional[Dict[str, Any]]: ...
 
     def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]: ...
+
 
 def _expand_path(p: str) -> str:
     expanded = os.path.expandvars(os.path.expanduser(p))

@@ -292,6 +292,7 @@ class TinyDBStore:
         rows = t.search(T.job_id == int(job_id))
         db.close()
         return rows[0] if rows else None
+
     def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]:
         """
         Cleanup for TinyDB schema:
@@ -316,9 +317,7 @@ class TinyDBStore:
             # remove uses a predicate for each row
             before = len(at)
             at.remove(
-                lambda r: (
-                    int(r.get("published_ts") or r.get("fetched_at") or 0) < cut_articles
-                )
+                lambda r: int(r.get("published_ts") or r.get("fetched_at") or 0) < cut_articles
             )
             removed["articles"] = max(0, before - len(at))
 

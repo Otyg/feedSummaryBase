@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional
 
 from feedsummary_core.persistence import CleanupPolicy
 from feedsummary_core.persistence.helpers import classify_summary_doc
+
 logger = logging.getLogger(__name__)
 
 
@@ -754,9 +755,7 @@ class SqliteStore:
                         f"DELETE FROM summary_docs WHERE id IN ({placeholders})",
                         tuple(part),
                     )
-                    removed["summary_docs"] += (
-                        cur.rowcount if cur.rowcount is not None else 0
-                    )
+                    removed["summary_docs"] += cur.rowcount if cur.rowcount is not None else 0
 
             con.commit()
             return removed

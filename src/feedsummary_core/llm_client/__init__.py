@@ -35,11 +35,13 @@ from feedsummary_core.llm_client.fallback_client import FallbackLLMClient, Fallb
 
 from typing import Any, Dict, List, Optional, Protocol
 
+
 class LLMRateLimitError(RuntimeError):
     def __init__(self, message: str, retry_after_seconds: Optional[int] = None):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
-        
+
+
 class LLMError(Exception):
     pass
 

@@ -251,6 +251,7 @@ async def _generate_summary_title(
         title = title[:120].rstrip() + "…"
     return title
 
+
 def _budgeted_proofread_user(
     *,
     prompts: Dict[str, Any],
@@ -403,7 +404,9 @@ async def _proofread_and_revise_meta_with_stats(
         if not t:
             continue
         desk_parts.append(f"--- BATCH {idx} ---\n{t}")
-    desk_underlag = ("\n\n".join(desk_parts).strip() + "\n\n--- KÄLLOR (lista) ---\n" + (sources_text or "")).strip()
+    desk_underlag = (
+        "\n\n".join(desk_parts).strip() + "\n\n--- KÄLLOR (lista) ---\n" + (sources_text or "")
+    ).strip()
 
     text = (meta_text or "").strip()
     last_feedback = ""
@@ -461,6 +464,7 @@ async def _proofread_and_revise_meta_with_stats(
         "proofread_rounds": rounds,
         "proofread_last_feedback": clip_text(last_feedback, 1200),
     }
+
 
 def _budgeted_super_meta_user(
     *,
@@ -973,7 +977,7 @@ async def summarize_batches_then_meta_with_stats(
         meta_text=meta,
         batch_summaries=batch_summaries,
         sources_text=sources_text,
-       max_rounds=4,
+        max_rounds=4,
     )
     # checkpoint meta-result
     if cp_enabled and meta_path is not None:
