@@ -430,6 +430,12 @@ async def _proofread_and_revise_meta_with_stats(
             temperature=0.2,
         )
         crit_s = (crit or "").strip()
+        logger.info(
+            "Proofread round %d/%d result:\n%s",
+            r,
+            max_rounds,
+            crit_s,
+        )
         if crit_s.upper().startswith("PASS"):
             return text, {
                 "proofread_enabled": 1,
