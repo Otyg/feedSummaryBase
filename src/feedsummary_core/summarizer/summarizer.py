@@ -35,6 +35,7 @@
 # ----------------------------
 from __future__ import annotations
 
+from collections import defaultdict
 import logging
 import time
 from datetime import datetime
@@ -94,6 +95,60 @@ def _published_ts(a: dict) -> int:
     if isinstance(fa, int) and fa > 0:
         return fa
     return 0
+
+
+def _fmt_dt_hm(ts: int) -> str:
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+
+
+def _build_sources_appendix_markdown(snapshots: List[Dict[str, Any]]) -> str:
+    """
+    Build a deterministic markdown appendix WITHOUT using the LLM.
+    Output:
+      ## Källor
+      ### <Source>
+      - <Title> — <YYYY-MM-DD HH:MM>
+        <URL>
+    """
+    if not snapshots:
+        return ""
+
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for s in snapshots:
+        src = str(s.get("source") or "").strip() or "Okänd källa"
+        url = str(s.get("url") or "").strip()
+        # Deduplicate by URL if possible (keeps first occurrence)
+        if url:
+            # ensure we don't add the exact same url twice within the same source group
+            if any(str(x.get("url") or "").strip() == url for x in groups[src]):
+                continue
+        groups[src].append(s)
+
+    if not groups:
+        return ""
+
+    out: List[str] = []
+    out.append("## Källor")
+    out.append("")
+
+    for src in sorted(groups.keys(), key=lambda x: x.lower()):
+        items = sorted(groups[src], key=lambda x: int(x.get("published_ts") or 0), reverse=True)
+        out.append(f"### {src}")
+        out.append("")
+        for it in items:
+            title = str(it.get("title") or "").strip() or "(utan titel)"
+            url = str(it.get("url") or "").strip()
+            pts = int(it.get("published_ts") or 0)
+            dt = _fmt_dt_hm(pts) if pts else ""
+            line = f"{title} — {dt}" if dt else title
+            out.append(f"- {line}")
+            if url:
+                out.append(f"  {url}")
+        out.append("")
+
+    return "\n".join(out).strip() + "\n"
 
 
 def _sources_snapshots(articles: List[dict]) -> List[dict]:
@@ -875,12 +930,34 @@ async def summarize_batches_then_meta_with_stats(
     # --- META (adaptivt budgeterad) ---
     set_job("Skapar metasammanfattning...", job_id, store)
 
-    sources_list: List[str] = []
-    for a in articles:
-        title = clip_text(a.get("title", ""), meta_sources_clip_chars)
-        url = (a.get("url") or "").strip()
-        sources_list.append(f"- {title} — {url}")
-    sources_text = "\n".join(sources_list)
+    # Build snapshots once (used both for prompt (optional) and for appendix (non-LLM))
+    snaps = [
+        {
+            "id": a.get("id"),
+            "title": a.get("title", ""),
+            "url": a.get("url", ""),
+            "source": a.get("source", ""),
+            "published_ts": _published_ts(a),
+            "content_hash": a.get("content_hash", ""),
+        }
+        for a in articles
+    ]
+
+    # How many sources to include INSIDE the meta prompt (default: 0 = none)
+    # (This reduces token usage a lot; appendix is added deterministically after.)
+    meta_sources_in_prompt = int(
+        (config.get("batching", {}) or {}).get("meta_sources_in_prompt") or 0
+    )
+
+    sources_list_for_prompt: List[str] = []
+    if meta_sources_in_prompt > 0:
+        for s in snaps[:meta_sources_in_prompt]:
+            title = clip_text(s.get("title", ""), meta_sources_clip_chars)
+            url = str(s.get("url") or "").strip()
+            if title or url:
+                sources_list_for_prompt.append(f"- {title} — {url}")
+    sources_text = "\n".join(sources_list_for_prompt)
+    sources_appendix = _build_sources_appendix_markdown(snaps)
 
     # Startbudget enligt config, men vi kommer sänka den om servern klagar
     budget_tokens = max(512, max_ctx - max_out - margin)
@@ -927,6 +1004,11 @@ async def summarize_batches_then_meta_with_stats(
 
         try:
             meta = await llm.chat(meta_messages, temperature=0.2)
+            # Append sources list deterministically (no LLM)
+            meta_s = (meta or "").strip()
+            if sources_appendix:
+                meta_s = meta_s.rstrip() + "\n\n" + sources_appendix.strip()
+            meta = meta_s
             meta_budget_tokens_final = budget_tokens
             break
 

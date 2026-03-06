@@ -343,6 +343,30 @@ def _est_user_tokens(s: str, chars_per_token: float) -> int:
     return max(1, int(len(s) / chars_per_token))
 
 
+def _compact_article_block(a: dict, *, idx: int) -> str:
+    """
+    Token-cheap per-article block.
+    - One-line header with optional source + url
+    - No 'Publicerad:' line (saves tokens)
+    - Keep body as-is (already clipped upstream in batch_articles())
+    """
+    title = str(a.get("title", "") or "").strip()
+    source = str(a.get("source", "") or "").strip()
+    url = str(a.get("url", "") or "").strip()
+    text = str(a.get("text", "") or "").strip()
+
+    head = f"[{idx}] {title}" if title else f"[{idx}] (utan titel)"
+    # Keep header compact but informative
+    if source:
+        head += f" ({source})"
+    if url:
+        head += f" {url}"
+
+    if text:
+        return f"{head}\n{text}"
+    return head
+
+
 def build_messages_for_batch(
     *,
     prompts: Dict[str, str],
@@ -357,13 +381,7 @@ def build_messages_for_batch(
     """
     parts: List[str] = []
     for i, a in enumerate(batch_items, start=1):
-        parts.append(
-            f"[{i}] {a.get('title', '')}\n"
-            f"Källa: {a.get('source', '')}\n"
-            f"Publicerad: {a.get('published', '')}\n"
-            f"URL: {a.get('url', '')}\n\n"
-            f"{a.get('text', '')}"
-        )
+        parts.append(_compact_article_block(a, idx=i))
 
     corpus = "\n\n---\n\n".join(parts)
     user_content = prompts["batch_user_template"].format(
