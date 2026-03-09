@@ -78,9 +78,28 @@ def _checkpoint_dir(config: Dict[str, Any]) -> Path:
 
 
 def _checkpoint_key(job_id: Optional[int], articles: List[dict]) -> str:
-    # Om job_id finns: använd den (bäst). Annars: stabil hash på artikel-id:n.
+    """
+    Checkpoint key strategy:
+
+    - Basnyckel för *jobbet som helhet* (används av resume för att ladda stabil corpus):
+        job_<id>  när job_id finns och articles är tom lista.
+
+    - För checkpoints för delmängder (t.ex. per topic) måste nyckeln vara unik,
+      annars krockar batch/meta-checkpoints mellan topics (extra viktigt vid parallellism).
+      Därför: om job_id finns OCH articles inte är tom => job_<id>_<hash>.
+    """
     if job_id is not None:
-        return f"job_{job_id}"
+        # Whole-job checkpoint (stable corpus): keep old behavior for articles=[]
+        if not articles:
+            return f"job_{job_id}"
+
+        # Subset/topic checkpoint: make unique + stable by hashing article ids
+        ids = [str(a.get("id", "") or "") for a in articles]
+        ids_join = "|".join(ids)
+        h = hashlib.sha256(ids_join.encode("utf-8")).hexdigest()[:12]
+        return f"job_{job_id}_{h}"
+
+    # No job_id: stable hash of article ids
     ids = [a.get("id", "") for a in articles]
     ids_join = "|".join(ids)
     return hashlib.sha256(ids_join.encode("utf-8")).hexdigest()[:16]
@@ -180,204 +199,25 @@ def trim_last_user_word_boundary(
     if target < 0:
         target = 0
 
-    cut_space = content.rfind(" ", 0, target)
-    cut_nl = content.rfind("\n", 0, target)
-    cut_tab = content.rfind("\t", 0, target)
-    cut = max(cut_space, cut_nl, cut_tab)
-    if cut <= 0:
-        cut = target
-
-    out[idx]["content"] = content[:cut].rstrip() + "\n\n[TRUNCATED FOR CONTEXT WINDOW]\n"
+    # move left to a word boundary
+    j = target
+    while j > 0 and content[j - 1].isalnum():
+        j -= 1
+    out[idx]["content"] = content[:j].rstrip() + "\n[TRUNCATED]\n"
     return out
-
-
-def _published_ts(a: dict) -> int:
-    ts = a.get("published_ts")
-    if isinstance(ts, int) and ts > 0:
-        return ts
-    return 0
-
-
-def interleave_by_source_oldest_first(
-    articles: List[dict],
-    *,
-    source_key: str = "source",
-    ts_key_fn: Callable[[dict], int] = _published_ts,
-) -> List[dict]:
-    groups: Dict[str, List[dict]] = defaultdict(list)
-    for a in articles:
-        src = str(a.get(source_key) or "unknown")
-        groups[src].append(a)
-
-    queues: Dict[str, Deque[dict]] = {}
-    for src, items in groups.items():
-        items_sorted = sorted(items, key=ts_key_fn)  # äldst först
-        queues[src] = deque(items_sorted)
-
-    out: List[dict] = []
-
-    while True:
-        active = [(src, q) for src, q in queues.items() if q]
-        if not active:
-            break
-
-        active.sort(key=lambda sq: ts_key_fn(sq[1][0]))
-
-        for src, q in active:
-            if q:
-                out.append(q.popleft())
-
-    return out
-
-
-class RateLimitError(Exception):
-    def __init__(self, status: int, retry_after: Optional[float] = None, body: str = ""):
-        super().__init__(f"HTTP {status} rate-limited")
-        self.status = status
-        self.retry_after = retry_after
-        self.body = body
-
-
-_PROMPT_TOO_LONG_RE = re.compile(r"exceeded max context length by\s+(\d+)\s+tokens", re.IGNORECASE)
-_DURATION_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$", re.IGNORECASE)
-
-
-def _extract_overflow_tokens(err: Exception) -> Optional[int]:
-    m = _PROMPT_TOO_LONG_RE.search(str(err))
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
-def parse_lookback_to_seconds(s: str) -> int:
-    if not s:
-        raise ValueError("lookback är tom")
-    m = _DURATION_RE.match(s)
-    if not m:
-        raise ValueError(f"Ogiltigt lookback-format: {s!r} (förväntar t.ex. 90m, 24h, 3d, 2w)")
-    n = int(m.group(1))
-    unit = m.group(2).lower()
-    HOUR = 60 * 60
-    DAY = HOUR * 24
-    WEEK = DAY * 7
-    MONTH = WEEK * 4
-    if unit == "h":
-        return n * HOUR
-    if unit == "d":
-        return n * DAY
-    if unit == "w":
-        return n * WEEK
-    if unit == "m":
-        return n * MONTH
-    raise ValueError(f"Okänd enhet: {unit}")
-
-
-def entry_published_ts(entry: feedparser.FeedParserDict) -> Optional[int]:
-    for attr in ("published_parsed", "updated_parsed"):
-        st = getattr(entry, attr, None)
-        if st:
-            try:
-                return int(time.mktime(st))
-            except Exception:
-                pass
-
-    for attr in ("published", "updated"):
-        s = getattr(entry, attr, None)
-        if s:
-            try:
-                dt = parsedate_to_datetime(s)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=datetime.timezone.utc)
-                return int(dt.timestamp())
-            except Exception:
-                pass
-
-    return None
 
 
 # ----------------------------
-# Prompt loader (from config)
+# Job helper
 # ----------------------------
-def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[str, str]:
-    p_cfg = config.get("prompts") or {}
-
-    base_keys = (
-        "batch_system",
-        "batch_user_template",
-        "meta_system",
-        "meta_user_template",
-    )
-    optional_keys = (
-        "super_meta_system",
-        "super_meta_user_template",
-        "title_system",
-        "title_user_template",
-        "proofread_system",
-        "proofread_user_template",
-        "revise_system",
-        "revise_user_template",
-    )
-
-    # Backward compat: prompts directly embedded in config.yaml
-    if isinstance(p_cfg, dict) and any(k in p_cfg for k in base_keys):
-        out: Dict[str, str] = {k: str(p_cfg.get(k, "")) for k in base_keys}
-        for k in optional_keys:
-            if k in p_cfg:
-                out[k] = str(p_cfg.get(k, ""))
-        out["_package"] = str(p_cfg.get("_package") or "embedded")
-        return out
-
-    # New: prompts.yaml packages
-    path = "config/prompts.yaml"
-    default_pkg = "default"
-
-    if isinstance(p_cfg, dict):
-        path = str(p_cfg.get("path") or path)
-        default_pkg = str(p_cfg.get("default_package") or default_pkg)
-        selected = str(p_cfg.get("selected") or "").strip()
-    else:
-        selected = ""
-
-    pkg = (package or selected or default_pkg).strip()
-    if not pkg:
-        pkg = default_pkg
-
-    path = os.path.expanduser(os.path.expandvars(path))
-
-    with open(path, "r", encoding="utf-8") as f:
-        all_pkgs = yaml.safe_load(f) or {}
-
-    if pkg not in all_pkgs:
-        if isinstance(all_pkgs, dict) and all_pkgs:
-            pkg = next(iter(all_pkgs.keys()))
-        else:
-            raise RuntimeError(f"Inga prompt-paket hittades i {path}")
-
-    blob = all_pkgs.get(pkg) or {}
-    if not isinstance(blob, dict):
-        raise RuntimeError(f"Prompt-paket '{pkg}' i {path} är inte ett dict-objekt")
-
-    out: Dict[str, str] = {}
-    for k in base_keys:
-        out[k] = str(blob.get(k, ""))
-
-    # include optional keys if present
-    for k in optional_keys:
-        if k in blob:
-            out[k] = str(blob.get(k, ""))
-
-    out["_package"] = pkg
-    return out
-
-
 def set_job(msg: str, job_id, store):
     if job_id is not None:
         store.update_job(job_id, message=msg)
 
 
+# ----------------------------
+# Path + config loading
+# ----------------------------
 def _resolve_path(base_config_path: str, p: str) -> str:
     p2 = os.path.expanduser(os.path.expandvars(p))
     if os.path.isabs(p2):
@@ -427,12 +267,6 @@ def load_feeds_into_config(
 
 
 def lookback_label_from_range(lookback_raw: str, from_ts: int, to_ts: int) -> str:
-    """
-    Builds a human-readable label for the time window.
-
-    If lookback_raw is set (e.g. "24h", "1w") it is included.
-    If from_ts/to_ts are present, we add the date span.
-    """
     lb = (lookback_raw or "").strip()
 
     span = ""
@@ -451,25 +285,54 @@ def lookback_label_from_range(lookback_raw: str, from_ts: int, to_ts: int) -> st
 
 
 def lookback_label_from_articles(lookback_raw: str, articles: List[dict]) -> str:
-    """
-    Derives a label from article timestamps when available.
-
-    - Uses published_ts (fallback fetched_at) to compute min/max.
-    - If lookback_raw is set, returns "lookback_raw (YYYY-MM-DD–YYYY-MM-DD)".
-    - If not, returns just the date span.
-    """
     if not articles:
         return (lookback_raw or "").strip()
 
     ts_list: List[int] = []
     for a in articles:
         ts = a.get("published_ts")
-        if not (isinstance(ts, int) and ts > 0):
-            ts = a.get("fetched_at")
         if isinstance(ts, int) and ts > 0:
             ts_list.append(ts)
+            continue
+        fa = a.get("fetched_at")
+        if isinstance(fa, int) and fa > 0:
+            ts_list.append(fa)
 
     if not ts_list:
         return (lookback_raw or "").strip()
 
-    return lookback_label_from_range(lookback_raw, min(ts_list), max(ts_list))
+    mn = min(ts_list)
+    mx = max(ts_list)
+    span = lookback_label_from_range("", mn, mx)
+
+    lb = (lookback_raw or "").strip()
+    if lb and span:
+        return f"{lb} ({span})"
+    if lb:
+        return lb
+    return span
+
+
+# ----------------------------
+# Lookback parsing
+# ----------------------------
+def parse_lookback_to_seconds(s: str) -> int:
+    s2 = (s or "").strip().lower()
+    if not s2:
+        return 0
+    m = re.match(r"^\s*(\d+)\s*([smhdw])\s*$", s2)
+    if not m:
+        return 0
+    n = int(m.group(1))
+    u = m.group(2)
+    if u == "s":
+        return n
+    if u == "m":
+        return n * 60
+    if u == "h":
+        return n * 3600
+    if u == "d":
+        return n * 86400
+    if u == "w":
+        return n * 7 * 86400
+    return 0

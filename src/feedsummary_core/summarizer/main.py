@@ -53,6 +53,7 @@ from feedsummary_core.summarizer.helpers import (
     _checkpoint_path,
     _meta_ckpt_path,
     _load_checkpoint,
+    _atomic_write_json,
 )
 from feedsummary_core.summarizer.ingest import gather_articles_to_store
 from feedsummary_core.summarizer.summarizer import (
@@ -103,12 +104,6 @@ def _name_of(s: Dict[str, Any]) -> str:
 
 
 def _topics_of(s: Dict[str, Any]) -> List[str]:
-    """
-    Read topics from feed/source dict. Normalizes to a list[str].
-    Supports:
-      topics: ["Cyber", "Sverige"]
-      topic: "Cyber"
-    """
     t = s.get("topics")
     if isinstance(t, list):
         out = [str(x).strip() for x in t if str(x).strip()]
@@ -124,9 +119,6 @@ def _topics_of(s: Dict[str, Any]) -> List[str]:
 
 
 def _source_topics_map(config: Dict[str, Any]) -> Dict[str, List[str]]:
-    """
-    Map from source/feed name -> topics list.
-    """
     out: Dict[str, List[str]] = {}
     for s in _get_config_sources(config):
         n = _name_of(s)
@@ -192,10 +184,6 @@ def _selected_source_names(config: Dict[str, Any]) -> List[str]:
 
 
 def _selected_topics_from_config(config: Dict[str, Any]) -> List[str]:
-    """
-    After overrides, the feeds list already reflects selected sources/topics.
-    We compute the union of topics on the selected feeds to store in selection metadata.
-    """
     topics: List[str] = []
     seen = set()
     for s in _get_config_sources(config):
@@ -280,12 +268,6 @@ def _group_articles_by_primary_topic(
 
 
 def _topic_order(groups: Dict[str, List[dict]]) -> List[str]:
-    """
-    Order topics so smaller topics don't drown:
-    - Put "Okategoriserat" last.
-    - Otherwise sort by (count desc, name asc).
-    """
-
     def key(t: str) -> Tuple[int, int, str]:
         if t == "Okategoriserat":
             return (999999, 1, t.lower())
@@ -301,14 +283,6 @@ def _fmt_dt_hm(ts: int) -> str:
 
 
 def _build_sources_appendix_markdown(snapshots: List[Dict[str, Any]]) -> str:
-    """
-    Builds a markdown appendix grouped by source.
-    Output:
-      ## Källor
-      ### <Source>
-      - <Title> — <YYYY-MM-DD HH:MM>
-        <URL>
-    """
     if not snapshots:
         return ""
 
@@ -358,10 +332,6 @@ def _snapshot_topic_map_for_job(
     selection: Dict[str, Any],
     overrides: Optional[Dict[str, Any]],
 ) -> None:
-    """
-    Sparar job-kontext i store så resume blir stabil även om config ändras efteråt.
-    SqliteStore lägger detta i fields_json; TinyDB lägger som vanliga keys.
-    """
     try:
         store.update_job(
             job_id,
@@ -383,13 +353,34 @@ def _load_job_context(store: NewsStore, job_id: int) -> Dict[str, Any]:
     return {}
 
 
+def _write_job_corpus_checkpoint(config: Dict[str, Any], store: NewsStore, job_id: int, articles: List[dict]) -> None:
+    """
+    Skriv en stabil checkpoint för *hela urvalet* så resume alltid kan läsa samma corpus.
+
+    Den skrivs alltid som:
+      job_<id>.json  (dvs _checkpoint_key(job_id, []) )
+
+    Viktigt eftersom per-topic checkpoints (job_<id>_<hash>.json/.meta.json) annars kan "vinna"
+    och göra resume instabilt.
+    """
+    try:
+        key = _checkpoint_key(job_id, [])
+        cp_path = _checkpoint_path(config, key)
+        payload = {
+            "kind": "job_corpus",
+            "created_at": int(time.time()),
+            "job_id": int(job_id),
+            "checkpoint_key": key,
+            "article_ids": [str(a.get("id") or "") for a in articles if a.get("id")],
+        }
+        _atomic_write_json(cp_path, payload)
+    except Exception as e:
+        logger.warning("Kunde inte skriva job-corpus checkpoint (resume kan bli instabilt): %s", e)
+
+
 def _load_ordered_articles_from_job_checkpoint(
     config: Dict[str, Any], store: NewsStore, job_id: int
 ) -> Tuple[List[str], List[dict]]:
-    """
-    Ladda article_ids från checkpoint (job_<id>.json eller job_<id>.meta.json),
-    hämta artiklar från store och returnera i samma stabila ordning.
-    """
     key = _checkpoint_key(job_id, [])
     cp_path = _checkpoint_path(config, key)
     meta_path = _meta_ckpt_path(config, key)
@@ -435,12 +426,6 @@ async def _generate_summary_title(
     to_ts: int,
     selection: Dict[str, Any],
 ) -> str:
-    """
-    Uses prompt keys (if present in selected prompt package):
-      - title_system
-      - title_user_template  (expects at least {summary}; may also use {lookback}, {from_date}, {to_date})
-    Falls back to a deterministic title if prompts missing or LLM fails.
-    """
     lookback = str((selection or {}).get("lookback") or "").strip()
     fallback = _default_summary_title(lookback=lookback, from_ts=from_ts, to_ts=to_ts)
 
@@ -461,7 +446,6 @@ async def _generate_summary_title(
             to_date=to_date,
         )
     except Exception:
-        # template formatting mismatch -> fallback
         return fallback
 
     try:
@@ -476,7 +460,6 @@ async def _generate_summary_title(
     if not title:
         return fallback
 
-    # normalize: take first line, strip quotes, cap length
     title = title.splitlines()[0].strip().strip('"').strip("'").strip()
     if not title:
         return fallback
@@ -484,6 +467,29 @@ async def _generate_summary_title(
     if len(title) > 120:
         title = title[:120].rstrip() + "…"
     return title
+
+
+def _topic_concurrency(config: Dict[str, Any], topic_count: int) -> int:
+    """
+    Controls how many topic summaries run concurrently.
+
+    Config:
+      batching:
+        topic_max_workers: 4   # default 4 (good for cloud APIs)
+    """
+    b = config.get("batching", {}) or {}
+    raw = b.get("topic_max_workers", b.get("topic_workers", None))
+    try:
+        n = int(raw) if raw is not None else 4
+    except Exception:
+        n = 4
+
+    if n < 1:
+        n = 1
+    if n > 16:
+        n = 16
+    # Never spawn more than number of topics that actually have items
+    return min(n, max(1, int(topic_count)))
 
 
 async def _summarize_and_persist_like_refresh(
@@ -496,11 +502,6 @@ async def _summarize_and_persist_like_refresh(
     topic_map: Dict[str, List[str]],
     selection: Dict[str, Any],
 ) -> Any:
-    """
-    Bygger summary_doc IDENTISKT med refresh-flödet:
-      - single-topic => meta + källappendix + selection
-      - multi-topic  => sections + overview (super-meta) + appendix + selection
-    """
     groups = _group_articles_by_primary_topic(articles, topic_map)
     topics = _topic_order(groups)
     created_ts = int(time.time())
@@ -575,9 +576,8 @@ async def _summarize_and_persist_like_refresh(
         return _persist_summary_doc(store, summary_doc)
 
     # ----------------------------
-    # Multi-topic summary
+    # Multi-topic summary (PARALLEL)
     # ----------------------------
-    sections: List[Dict[str, Any]] = []
     stitched_parts: List[str] = []
     lookback_str = str((config.get("ingest") or {}).get("lookback") or "").strip()
 
@@ -586,58 +586,96 @@ async def _summarize_and_persist_like_refresh(
         stitched_parts.append(f"_Tidsfönster: {lookback_str}_")
     stitched_parts.append("")
 
-    all_ids: List[str] = []
-    all_snaps: List[Dict[str, Any]] = []
-
     pts_all = [_published_ts(a) for a in articles]
     pts_all2 = [p for p in pts_all if p > 0]
     overall_from = min(pts_all2) if pts_all2 else 0
     overall_to = max(pts_all2) if pts_all2 else 0
 
-    topics = _topic_order(groups)
-
+    # topics that actually have items
+    topic_items: List[Tuple[int, str, List[dict]]] = []
     for i, topic in enumerate(topics, start=1):
         items = groups.get(topic) or []
         if not items:
             continue
+        topic_items.append((i, topic, items))
 
-        if job_id is not None:
-            store.update_job(
-                job_id,
-                message=f"Summerar ämnesområde {i}/{len(topics)}: {topic} ({len(items)} artiklar)...",
+    max_workers = _topic_concurrency(config, len(topic_items))
+    sem = asyncio.Semaphore(max_workers)
+
+    async def _run_one_topic(i: int, topic: str, items: List[dict]) -> Dict[str, Any]:
+        async with sem:
+            if job_id is not None:
+                try:
+                    store.update_job(
+                        job_id,
+                        message=f"Summerar ämnesområden parallellt ({max_workers} workers). "
+                                f"Startar {i}/{len(topics)}: {topic} ({len(items)} artiklar)...",
+                    )
+                except Exception:
+                    pass
+
+            topic_meta, topic_stats = await summarize_batches_then_meta_with_stats(
+                config, items, llm=llm, store=store, job_id=job_id
             )
 
-        topic_meta, topic_stats = await summarize_batches_then_meta_with_stats(
-            config, items, llm=llm, store=store, job_id=job_id
-        )
+            ids = [a.get("id") for a in items if a.get("id")]
 
-        ids = [a.get("id") for a in items if a.get("id")]
-        all_ids.extend(ids)
+            snaps = [
+                {
+                    "id": a.get("id"),
+                    "title": a.get("title", ""),
+                    "url": a.get("url", ""),
+                    "source": a.get("source", ""),
+                    "published_ts": _published_ts(a),
+                    "content_hash": a.get("content_hash", ""),
+                    "topic": topic,
+                }
+                for a in items
+            ]
 
-        snaps = [
-            {
-                "id": a.get("id"),
-                "title": a.get("title", ""),
-                "url": a.get("url", ""),
-                "source": a.get("source", ""),
-                "published_ts": _published_ts(a),
-                "content_hash": a.get("content_hash", ""),
+            pts = [_published_ts(a) for a in items]
+            pts2 = [p for p in pts if p > 0]
+            from_ts = min(pts2) if pts2 else 0
+            to_ts = max(pts2) if pts2 else 0
+
+            return {
                 "topic": topic,
+                "order_i": i,
+                "from": from_ts,
+                "to": to_ts,
+                "sources": ids,
+                "sources_snapshots": snaps,
+                "summary": topic_meta,
+                "stats": topic_stats,
             }
-            for a in items
-        ]
-        all_snaps.extend(snaps)
 
-        pts = [_published_ts(a) for a in items]
-        pts2 = [p for p in pts if p > 0]
-        from_ts = min(pts2) if pts2 else 0
-        to_ts = max(pts2) if pts2 else 0
+    tasks = [asyncio.create_task(_run_one_topic(i, topic, items)) for (i, topic, items) in topic_items]
+    results = await asyncio.gather(*tasks)
+
+    # Build deterministic ordering in output
+    by_topic: Dict[str, Dict[str, Any]] = {r["topic"]: r for r in results}
+    sections: List[Dict[str, Any]] = []
+    all_ids: List[str] = []
+    all_snaps: List[Dict[str, Any]] = []
+
+    for topic in topics:
+        r = by_topic.get(topic)
+        if not r:
+            continue
+
+        topic_stats = r.get("stats") or {}
+        ids = r.get("sources") or []
+        snaps = r.get("sources_snapshots") or []
+        topic_meta = r.get("summary") or ""
+
+        all_ids.extend(ids)
+        all_snaps.extend(snaps)
 
         sections.append(
             {
                 "topic": topic,
-                "from": from_ts,
-                "to": to_ts,
+                "from": int(r.get("from") or 0),
+                "to": int(r.get("to") or 0),
                 "sources": ids,
                 "sources_snapshots": snaps,
                 "summary": topic_meta,
@@ -652,7 +690,7 @@ async def _summarize_and_persist_like_refresh(
 
         stitched_parts.append(f"## {topic}")
         stitched_parts.append("")
-        stitched_parts.append((topic_meta or "").strip())
+        stitched_parts.append(str(topic_meta).strip())
         stitched_parts.append("")
 
     stitched_summary = "\n".join(stitched_parts).strip() + "\n"
@@ -725,13 +763,6 @@ async def run_pipeline(
     config_dict: Optional[Dict[str, Any]] = None,
     llm=None,
 ) -> Optional[Any]:
-    """
-    Normal refresh pipeline.
-
-    NEW:
-      - status="failed" + finished_at vid exception
-      - sparar selection/topic_map/overrides i job record för stabil resume
-    """
     try:
         if config_dict is None:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -754,7 +785,6 @@ async def run_pipeline(
                 message="Startar ingest...",
             )
 
-        # Ingest
         ins, upd = await gather_articles_to_store(config, store, job_id=job_id)
 
         if job_id is not None:
@@ -763,7 +793,6 @@ async def run_pipeline(
                 message=f"Ingest klart. Inserted={ins}, Updated={upd}. Förbereder summering...",
             )
 
-        # Selection
         to_sum = _select_articles_for_summary(config, store, limit=2000)
         if not to_sum:
             if job_id is not None:
@@ -787,8 +816,9 @@ async def run_pipeline(
                 selection=selection,
                 overrides=overrides,
             )
+            # NEW: write stable corpus checkpoint for resume
+            _write_job_corpus_checkpoint(config, store, int(job_id), to_sum)
 
-        # Summarize + persist (same structure as refresh)
         summary_doc_id = await _summarize_and_persist_like_refresh(
             config=config,
             store=store,
@@ -811,7 +841,6 @@ async def run_pipeline(
         return summary_doc_id
 
     except Exception as e:
-        # NEW: mark job failed on exception
         if job_id is not None:
             try:
                 store.update_job(
@@ -832,17 +861,8 @@ async def run_resume_job(
     llm,
     job_id: int,
 ) -> str:
-    """
-    Resume som producerar samma summary_doc-struktur som en vanlig refresh.
-
-    - Läser artiklarna från checkpoint (stabil corpus)
-    - Försöker läsa selection/topic_map från job-recorden (stabilt även om config ändrats)
-    - Bygger sections + appendix + selection osv
-    - Sätter job status failed vid exception
-    """
     jid = int(job_id)
     try:
-        # Try load job context (saved during original run)
         ctx = _load_job_context(store, jid)
 
         selection = ctx.get("selection")
@@ -853,12 +873,10 @@ async def run_resume_job(
         if not isinstance(topic_map, dict):
             topic_map = _source_topics_map(config)
 
-        # Load stable ordered articles from checkpoint/meta-checkpoint
         _article_ids, ordered_articles = _load_ordered_articles_from_job_checkpoint(
             config, store, jid
         )
 
-        # Summarize + persist like refresh
         summary_doc_id = await _summarize_and_persist_like_refresh(
             config=config,
             store=store,
@@ -869,7 +887,6 @@ async def run_resume_job(
             selection=selection,
         )
 
-        # Mark job done
         try:
             store.update_job(
                 jid,
