@@ -149,6 +149,42 @@ def _checkpoint_key(job_id: Optional[int], articles: List[dict]) -> str:
     ids_join = "|".join(ids)
     return hashlib.sha256(ids_join.encode("utf-8")).hexdigest()[:16]
 
+def _published_ts(a: dict) -> int:
+    ts = a.get("published_ts")
+    if isinstance(ts, int) and ts > 0:
+        return ts
+    return 0
+
+
+def interleave_by_source_oldest_first(
+    articles: List[dict],
+    *,
+    source_key: str = "source",
+    ts_key_fn: Callable[[dict], int] = _published_ts,
+) -> List[dict]:
+    groups: Dict[str, List[dict]] = defaultdict(list)
+    for a in articles:
+        src = str(a.get(source_key) or "unknown")
+        groups[src].append(a)
+
+    queues: Dict[str, Deque[dict]] = {}
+    for src, items in groups.items():
+        items_sorted = sorted(items, key=ts_key_fn)  # äldst först
+        queues[src] = deque(items_sorted)
+
+    out: List[dict] = []
+
+    while True:
+        active = [(src, q) for src, q in queues.items() if q]
+        if not active:
+            break
+
+        active.sort(key=lambda sq: ts_key_fn(sq[1][0]))
+
+        for src, q in active:
+            if q:
+                out.append(q.popleft())
+
 
 def _checkpoint_path(config: Dict[str, Any], key: str) -> Path:
     d = _checkpoint_dir(config)
