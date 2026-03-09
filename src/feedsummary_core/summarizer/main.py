@@ -353,7 +353,9 @@ def _load_job_context(store: NewsStore, job_id: int) -> Dict[str, Any]:
     return {}
 
 
-def _write_job_corpus_checkpoint(config: Dict[str, Any], store: NewsStore, job_id: int, articles: List[dict]) -> None:
+def _write_job_corpus_checkpoint(
+    config: Dict[str, Any], store: NewsStore, job_id: int, articles: List[dict]
+) -> None:
     """
     Skriv en stabil checkpoint för *hela urvalet* så resume alltid kan läsa samma corpus.
 
@@ -609,7 +611,7 @@ async def _summarize_and_persist_like_refresh(
                     store.update_job(
                         job_id,
                         message=f"Summerar ämnesområden parallellt ({max_workers} workers). "
-                                f"Startar {i}/{len(topics)}: {topic} ({len(items)} artiklar)...",
+                        f"Startar {i}/{len(topics)}: {topic} ({len(items)} artiklar)...",
                     )
                 except Exception:
                     pass
@@ -649,7 +651,9 @@ async def _summarize_and_persist_like_refresh(
                 "stats": topic_stats,
             }
 
-    tasks = [asyncio.create_task(_run_one_topic(i, topic, items)) for (i, topic, items) in topic_items]
+    tasks = [
+        asyncio.create_task(_run_one_topic(i, topic, items)) for (i, topic, items) in topic_items
+    ]
     results = await asyncio.gather(*tasks)
 
     # Build deterministic ordering in output

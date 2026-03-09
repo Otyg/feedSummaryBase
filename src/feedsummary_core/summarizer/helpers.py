@@ -64,6 +64,51 @@ def setup_logging():
 logger = logging.getLogger(__name__)
 
 
+class RateLimitError(Exception):
+    def __init__(self, status: int, retry_after: Optional[float] = None, body: str = ""):
+        super().__init__(f"HTTP {status} rate-limited")
+        self.status = status
+        self.retry_after = retry_after
+        self.body = body
+
+
+_PROMPT_TOO_LONG_RE = re.compile(r"exceeded max context length by\s+(\d+)\s+tokens", re.IGNORECASE)
+_DURATION_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$", re.IGNORECASE)
+
+
+def _extract_overflow_tokens(err: Exception) -> Optional[int]:
+    m = _PROMPT_TOO_LONG_RE.search(str(err))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def entry_published_ts(entry: feedparser.FeedParserDict) -> Optional[int]:
+    for attr in ("published_parsed", "updated_parsed"):
+        st = getattr(entry, attr, None)
+        if st:
+            try:
+                return int(time.mktime(st))
+            except Exception:
+                pass
+
+    for attr in ("published", "updated"):
+        s = getattr(entry, attr, None)
+        if s:
+            try:
+                dt = parsedate_to_datetime(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                return int(dt.timestamp())
+            except Exception:
+                pass
+
+    return None
+
+
 def _expand_path(p: str) -> str:
     return os.path.expandvars(os.path.expanduser(p))
 
@@ -206,10 +251,11 @@ def trim_last_user_word_boundary(
     out[idx]["content"] = content[:j].rstrip() + "\n[TRUNCATED]\n"
     return out
 
- # ----------------------------
+
+# ----------------------------
 # Prompt loader (from config)
 # Job helper
- # ----------------------------
+# ----------------------------
 def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[str, str]:
     p_cfg = config.get("prompts") or {}
 
@@ -280,6 +326,7 @@ def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[
 
     out["_package"] = pkg
     return out
+
 
 # ----------------------------
 # Job helper
