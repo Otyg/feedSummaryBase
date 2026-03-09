@@ -185,6 +185,8 @@ def interleave_by_source_oldest_first(
             if q:
                 out.append(q.popleft())
 
+    return out
+
 
 def _checkpoint_path(config: Dict[str, Any], key: str) -> Path:
     d = _checkpoint_dir(config)
