@@ -206,6 +206,80 @@ def trim_last_user_word_boundary(
     out[idx]["content"] = content[:j].rstrip() + "\n[TRUNCATED]\n"
     return out
 
+ # ----------------------------
+# Prompt loader (from config)
+# Job helper
+ # ----------------------------
+def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[str, str]:
+    p_cfg = config.get("prompts") or {}
+
+    base_keys = (
+        "batch_system",
+        "batch_user_template",
+        "meta_system",
+        "meta_user_template",
+    )
+    optional_keys = (
+        "super_meta_system",
+        "super_meta_user_template",
+        "title_system",
+        "title_user_template",
+        "proofread_system",
+        "proofread_user_template",
+        "revise_system",
+        "revise_user_template",
+    )
+
+    # Backward compat: prompts directly embedded in config.yaml
+    if isinstance(p_cfg, dict) and any(k in p_cfg for k in base_keys):
+        out: Dict[str, str] = {k: str(p_cfg.get(k, "")) for k in base_keys}
+        for k in optional_keys:
+            if k in p_cfg:
+                out[k] = str(p_cfg.get(k, ""))
+        out["_package"] = str(p_cfg.get("_package") or "embedded")
+        return out
+
+    # New: prompts.yaml packages
+    path = "config/prompts.yaml"
+    default_pkg = "default"
+
+    if isinstance(p_cfg, dict):
+        path = str(p_cfg.get("path") or path)
+        default_pkg = str(p_cfg.get("default_package") or default_pkg)
+        selected = str(p_cfg.get("selected") or "").strip()
+    else:
+        selected = ""
+
+    pkg = (package or selected or default_pkg).strip()
+    if not pkg:
+        pkg = default_pkg
+
+    path = os.path.expanduser(os.path.expandvars(path))
+
+    with open(path, "r", encoding="utf-8") as f:
+        all_pkgs = yaml.safe_load(f) or {}
+
+    if pkg not in all_pkgs:
+        if isinstance(all_pkgs, dict) and all_pkgs:
+            pkg = next(iter(all_pkgs.keys()))
+        else:
+            raise RuntimeError(f"Inga prompt-paket hittades i {path}")
+
+    blob = all_pkgs.get(pkg) or {}
+    if not isinstance(blob, dict):
+        raise RuntimeError(f"Prompt-paket '{pkg}' i {path} är inte ett dict-objekt")
+
+    out: Dict[str, str] = {}
+    for k in base_keys:
+        out[k] = str(blob.get(k, ""))
+
+    # include optional keys if present
+    for k in optional_keys:
+        if k in blob:
+            out[k] = str(blob.get(k, ""))
+
+    out["_package"] = pkg
+    return out
 
 # ----------------------------
 # Job helper
