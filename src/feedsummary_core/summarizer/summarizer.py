@@ -35,8 +35,8 @@
 # ----------------------------
 from __future__ import annotations
 
-from collections import defaultdict
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -95,60 +95,6 @@ def _published_ts(a: dict) -> int:
     if isinstance(fa, int) and fa > 0:
         return fa
     return 0
-
-
-def _fmt_dt_hm(ts: int) -> str:
-    if not ts:
-        return ""
-    return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
-
-
-def _build_sources_appendix_markdown(snapshots: List[Dict[str, Any]]) -> str:
-    """
-    Build a deterministic markdown appendix WITHOUT using the LLM.
-    Output:
-      ## Källor
-      ### <Source>
-      - <Title> — <YYYY-MM-DD HH:MM>
-        <URL>
-    """
-    if not snapshots:
-        return ""
-
-    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for s in snapshots:
-        src = str(s.get("source") or "").strip() or "Okänd källa"
-        url = str(s.get("url") or "").strip()
-        # Deduplicate by URL if possible (keeps first occurrence)
-        if url:
-            # ensure we don't add the exact same url twice within the same source group
-            if any(str(x.get("url") or "").strip() == url for x in groups[src]):
-                continue
-        groups[src].append(s)
-
-    if not groups:
-        return ""
-
-    out: List[str] = []
-    out.append("## Källor")
-    out.append("")
-
-    for src in sorted(groups.keys(), key=lambda x: x.lower()):
-        items = sorted(groups[src], key=lambda x: int(x.get("published_ts") or 0), reverse=True)
-        out.append(f"### {src}")
-        out.append("")
-        for it in items:
-            title = str(it.get("title") or "").strip() or "(utan titel)"
-            url = str(it.get("url") or "").strip()
-            pts = int(it.get("published_ts") or 0)
-            dt = _fmt_dt_hm(pts) if pts else ""
-            line = f"{title} — {dt}" if dt else title
-            out.append(f"- {line}")
-            if url:
-                out.append(f"  {url}")
-        out.append("")
-
-    return "\n".join(out).strip() + "\n"
 
 
 def _sources_snapshots(articles: List[dict]) -> List[dict]:
@@ -307,6 +253,32 @@ async def _generate_summary_title(
     return title
 
 
+def _insert_system_note_before_sources(meta_text: str, system_note: str) -> str:
+    """
+    Inserts `system_note` as its own paragraph just before the final paragraph that
+    starts with 'Källor:' (case-insensitive, line-start). If no such paragraph exists,
+    appends the note at the end.
+    """
+    text = (meta_text or "").strip()
+    note = (system_note or "").strip()
+    if not text or not note:
+        return text
+
+    # Find paragraphs that start with "Källor:" (or "Källor :")
+    pattern = re.compile(r"(?im)^(Källor\s*:.*)$")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return f"{text}\n\n{note}\n"
+
+    m = matches[-1]  # insert before last
+    start = m.start()
+
+    before = text[:start].rstrip()
+    after = text[start:].lstrip()
+
+    return f"{before}\n\n{note}\n\n{after}".strip() + "\n"
+
+
 def _budgeted_proofread_user(
     *,
     prompts: Dict[str, Any],
@@ -439,7 +411,7 @@ async def _proofread_and_revise_meta_with_stats(
     rev_user_tmpl = str(prompts.get("revise_user_template") or "").strip()
 
     if not (proof_sys and proof_user_tmpl and rev_sys and rev_user_tmpl):
-        return meta_text, {"proofread_enabled": 0, "proofread_rounds": 0}
+        return meta_text, {"proofread_enabled": 0, "proofread_rounds": 0, "proofread_output": ""}
 
     llm_cfg = config.get("llm") or {}
     max_ctx = int(llm_cfg.get("context_window_tokens", 32768))
@@ -485,16 +457,12 @@ async def _proofread_and_revise_meta_with_stats(
             temperature=0.2,
         )
         crit_s = (crit or "").strip()
-        logger.info(
-            "Proofread round %d/%d result:\n%s",
-            r,
-            max_rounds,
-            crit_s,
-        )
+
         if crit_s.upper().startswith("PASS"):
             return text, {
                 "proofread_enabled": 1,
                 "proofread_rounds": r,
+                "proofread_output": "PASS",
                 "proofread_last_feedback": "",
             }
 
@@ -520,9 +488,11 @@ async def _proofread_and_revise_meta_with_stats(
         if revised_s:
             text = revised_s
 
+    # Reached max rounds; keep last feedback as "output"
     return text, {
         "proofread_enabled": 1,
         "proofread_rounds": rounds,
+        "proofread_output": clip_text(last_feedback, 8000),
         "proofread_last_feedback": clip_text(last_feedback, 1200),
     }
 
@@ -930,34 +900,12 @@ async def summarize_batches_then_meta_with_stats(
     # --- META (adaptivt budgeterad) ---
     set_job("Skapar metasammanfattning...", job_id, store)
 
-    # Build snapshots once (used both for prompt (optional) and for appendix (non-LLM))
-    snaps = [
-        {
-            "id": a.get("id"),
-            "title": a.get("title", ""),
-            "url": a.get("url", ""),
-            "source": a.get("source", ""),
-            "published_ts": _published_ts(a),
-            "content_hash": a.get("content_hash", ""),
-        }
-        for a in articles
-    ]
-
-    # How many sources to include INSIDE the meta prompt (default: 0 = none)
-    # (This reduces token usage a lot; appendix is added deterministically after.)
-    meta_sources_in_prompt = int(
-        (config.get("batching", {}) or {}).get("meta_sources_in_prompt") or 0
-    )
-
-    sources_list_for_prompt: List[str] = []
-    if meta_sources_in_prompt > 0:
-        for s in snaps[:meta_sources_in_prompt]:
-            title = clip_text(s.get("title", ""), meta_sources_clip_chars)
-            url = str(s.get("url") or "").strip()
-            if title or url:
-                sources_list_for_prompt.append(f"- {title} — {url}")
-    sources_text = "\n".join(sources_list_for_prompt)
-    sources_appendix = _build_sources_appendix_markdown(snaps)
+    sources_list: List[str] = []
+    for a in articles:
+        title = clip_text(a.get("title", ""), meta_sources_clip_chars)
+        url = (a.get("url") or "").strip()
+        sources_list.append(f"- {title} — {url}")
+    sources_text = "\n".join(sources_list)
 
     # Startbudget enligt config, men vi kommer sänka den om servern klagar
     budget_tokens = max(512, max_ctx - max_out - margin)
@@ -1004,11 +952,6 @@ async def summarize_batches_then_meta_with_stats(
 
         try:
             meta = await llm.chat(meta_messages, temperature=0.2)
-            # Append sources list deterministically (no LLM)
-            meta_s = (meta or "").strip()
-            if sources_appendix:
-                meta_s = meta_s.rstrip() + "\n\n" + sources_appendix.strip()
-            meta = meta_s
             meta_budget_tokens_final = budget_tokens
             break
 
@@ -1054,7 +997,10 @@ async def summarize_batches_then_meta_with_stats(
             budget_tokens = new_budget
     else:
         raise RuntimeError(f"Meta misslyckades efter {meta_attempts} försök: {last_err}")
+
     meta = (meta or "").strip()
+
+    # --- proofread + revise loop ---
     meta, pr_stats = await _proofread_and_revise_meta_with_stats(
         config=config,
         llm=llm,
@@ -1067,6 +1013,16 @@ async def summarize_batches_then_meta_with_stats(
         sources_text=sources_text,
         max_rounds=4,
     )
+
+    # --- inject system note before "Källor:" ---
+    proof_out = str(pr_stats.get("proofread_output") or "").strip()
+    if proof_out:
+        if proof_out.upper().startswith("PASS"):
+            note = "Korrekturläsning: PASS"
+        else:
+            note = "Korrekturläsning:\n" + proof_out
+        meta = _insert_system_note_before_sources(meta, note)
+
     # checkpoint meta-result
     if cp_enabled and meta_path is not None:
         _atomic_write_json(
@@ -1082,6 +1038,7 @@ async def summarize_batches_then_meta_with_stats(
                 "meta_budget_tokens": meta_budget_tokens_final,
                 "proofread_enabled": int(pr_stats.get("proofread_enabled") or 0),
                 "proofread_rounds": int(pr_stats.get("proofread_rounds") or 0),
+                "proofread_output": str(pr_stats.get("proofread_output") or ""),
                 "proofread_last_feedback": str(pr_stats.get("proofread_last_feedback") or ""),
                 "batch_article_ids": _batch_article_ids_map(batches),
                 "done_batches": _done_batches_payload(done_map, batches),
