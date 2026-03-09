@@ -463,7 +463,7 @@ async def _proofread_and_revise_meta_with_stats(
                 "proofread_enabled": 1,
                 "proofread_rounds": r,
                 "proofread_output": "PASS",
-                "proofread_last_feedback": "",
+                "proofread_last_feedback": last_feedback,
             }
 
         last_feedback = crit_s
@@ -493,7 +493,7 @@ async def _proofread_and_revise_meta_with_stats(
         "proofread_enabled": 1,
         "proofread_rounds": rounds,
         "proofread_output": clip_text(last_feedback, 8000),
-        "proofread_last_feedback": clip_text(last_feedback, 1200),
+        "proofread_last_feedback": last_feedback,
     }
 
 
@@ -1015,13 +1015,10 @@ async def summarize_batches_then_meta_with_stats(
     )
 
     # --- inject system note before "Källor:" ---
-    proof_out = str(pr_stats.get("proofread_output") or "").strip()
+    proof_out = str(pr_stats.get("proofread_last_feedback") or "").strip()
     if proof_out:
-        if proof_out.upper().startswith("PASS"):
-            note = "Korrekturläsning: PASS"
-        else:
-            note = "Korrekturläsning:\n" + proof_out
-        meta = _insert_system_note_before_sources(meta, note)
+        logger.info(proof_out)
+        meta = _insert_system_note_before_sources(meta, proof_out)
 
     # checkpoint meta-result
     if cp_enabled and meta_path is not None:
