@@ -37,7 +37,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol
 
-from feedsummary_core.llm_client.ollama_cloud import LLMRateLimitError
+from feedsummary_core.llm_client.ollama_cloud import LLMRateLimitError, LLMUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +88,30 @@ class FallbackLLMClient:
         while True:
             try:
                 return await self.primary.chat(messages, temperature=temperature)
+            except LLMUnavailableError as e:
+                attempt += 1
+                wait_s = int(self.policy.default_wait_s)
+
+                # Om vi redan testat retry och slår i igen -> fallback
+                if attempt > self.policy.max_quota_retries:
+                    if not self.fallback:
+                        # ingen fallback konfigurerad
+                        raise LLMUnavailableError(e)
+                    log.warning(
+                        "LLM otillgänglig efter %d retry(s). Växlar till fallback.",
+                        self.policy.max_quota_retries,
+                    )
+                    self._force_fallback = True
+                    return await self.fallback.chat(messages, temperature=temperature)
+
+                log.warning(
+                    "LLM otillgänglig, %s.\n (attempt %d/%d) Väntar %ss och retry...",
+                    e,
+                    attempt,
+                    self.policy.max_quota_retries,
+                    wait_s,
+                )
+                await asyncio.sleep(wait_s)
             except LLMRateLimitError as e:
                 attempt += 1
                 wait_s = int(e.retry_after_seconds or self.policy.default_wait_s)

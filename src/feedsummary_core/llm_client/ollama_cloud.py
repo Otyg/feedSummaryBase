@@ -199,6 +199,9 @@ class OllamaCloudClient:
                 pass
             if _is_status(e, 401) or _is_status(e, 403):
                 raise LLMAuthError("Ollama Cloud: auth misslyckades (api_key fel/nekad).") from e
+            if _is_status(e, 500):
+                raise LLMUnavailableError(f"Ollama Cloud: server error 500. Möjlig överbelastning.\n{e}") from e
+
             if _is_status(e, 429):
                 ra = _extract_retry_after_seconds(e)
                 raise LLMRateLimitError("Ollama Cloud: rate limit/quota uppnådd.", ra) from e
