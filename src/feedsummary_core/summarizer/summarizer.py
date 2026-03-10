@@ -398,7 +398,7 @@ async def _proofread_and_revise_meta_with_stats(
     meta_text: str,
     batch_summaries: List[Tuple[int, str]],
     sources_text: str,
-    max_rounds: int = 4,
+    max_rounds: int = 1,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Runs proofread->revise loop max `max_rounds` times.
