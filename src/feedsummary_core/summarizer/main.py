@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 import time
@@ -86,6 +87,157 @@ def _persist_summary_doc(store: NewsStore, doc: Dict[str, Any]) -> Any:
     if not callable(fn):
         raise RuntimeError("Store saknar save_summary_doc() för summary_docs.")
     return fn(doc)
+
+
+def _parse_composed_contents(
+    contents_raw: Any,
+) -> Tuple[List[Dict[str, str]], Optional[str], Optional[str]]:
+    if not isinstance(contents_raw, list) or not contents_raw:
+        return [], None, None
+
+    sections: List[Dict[str, str]] = []
+    title_pkg: Optional[str] = None
+    ingress_pkg: Optional[str] = None
+
+    for i, item in enumerate(contents_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"contents[{i}] måste vara ett objekt")
+
+        tag = str(item.get("tag") or "").strip()
+        prompt_pkg = str(item.get("promptpackage") or "").strip()
+        title = str(item.get("title") or "").strip()
+        ingress = str(item.get("ingress") or "").strip()
+
+        if tag or prompt_pkg:
+            if not tag or not prompt_pkg:
+                raise ValueError(f"contents[{i}] måste innehålla både tag och promptpackage")
+            sections.append({"tag": tag, "promptpackage": prompt_pkg})
+            continue
+
+        if title:
+            if title_pkg is not None:
+                raise ValueError("contents får bara innehålla en title-post")
+            title_pkg = title
+            continue
+
+        if ingress:
+            if ingress_pkg is not None:
+                raise ValueError("contents får bara innehålla en ingress-post")
+            ingress_pkg = ingress
+            continue
+
+        raise ValueError(f"contents[{i}] måste vara tag+promptpackage, title eller ingress")
+
+    if not sections:
+        raise ValueError("contents måste innehålla minst en sektion med tag+promptpackage")
+
+    return sections, title_pkg, ingress_pkg
+
+
+def _render_prompt_template(template_text: str, values: Dict[str, Any]) -> str:
+    out = str(template_text or "")
+    for k, v in values.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+
+async def _run_prompt_package_step_on_text(
+    *,
+    config: Dict[str, Any],
+    llm,
+    package_name: str,
+    step: str,
+    summary_text: str,
+    lookback: str,
+    from_ts: int,
+    to_ts: int,
+) -> str:
+    prompts = load_prompts(config, package=package_name)
+
+    if step == "title":
+        sys_key = "title_system"
+        user_key = "title_user_template"
+    elif step == "ingress":
+        # Primärt super_meta. Om du senare vill särskilja ingresssteg
+        # kan du lägga till ingress_system/ingress_user_template här.
+        sys_key = "super_meta_system"
+        user_key = "super_meta_user_template"
+    else:
+        raise ValueError(f"Okänt promptsteg: {step}")
+
+    sys_p = str(prompts.get(sys_key) or "").strip()
+    user_t = str(prompts.get(user_key) or "").strip()
+    if not sys_p or not user_t:
+        return ""
+
+    from_date = datetime.fromtimestamp(int(from_ts)).strftime("%Y-%m-%d") if from_ts else ""
+    to_date = datetime.fromtimestamp(int(to_ts)).strftime("%Y-%m-%d") if to_ts else ""
+
+    user = _render_prompt_template(
+        user_t,
+        {
+            "summary": summary_text,
+            "batch_summaries": summary_text,
+            "topic_summaries": summary_text,
+            "lookback": lookback,
+            "from_date": from_date,
+            "to_date": to_date,
+        },
+    )
+
+    out = await llm.chat(
+        [{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
+        temperature=0.2,
+    )
+    return str(out or "").strip()
+
+
+def _extract_summary_doc_parts(doc: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(doc.get("id") or ""),
+        "title": str(doc.get("title") or "").strip(),
+        "summary": str(doc.get("summary") or "").strip(),
+        "sources": list(doc.get("sources") or []),
+        "sources_snapshots": list(doc.get("sources_snapshots") or []),
+        "from": int(doc.get("from") or 0),
+        "to": int(doc.get("to") or 0),
+        "selection": dict(doc.get("selection") or {}),
+    }
+
+
+def _build_composed_summary_text(
+    *,
+    sections: List[Dict[str, Any]],
+    ingress: Optional[str],
+) -> str:
+    parts: List[str] = []
+    if ingress and ingress.strip():
+        parts.append(ingress.strip())
+        parts.append("")
+
+    for sec in sections:
+        tag = str(sec.get("tag") or "").strip()
+        body = str(sec.get("summary") or "").strip()
+        if not body:
+            continue
+        parts.append(f"## {tag}")
+        parts.append("")
+        parts.append(body)
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
+def _dedupe_keep_order(items: List[Any]) -> List[Any]:
+    seen = set()
+    out: List[Any] = []
+    for item in items:
+        key = repr(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 def _get_config_sources(config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -164,12 +316,19 @@ def _apply_overrides(config: Dict[str, Any], overrides: Optional[Dict[str, Any]]
             filtered = [s for s in all_sources if has_topic(s)]
             _set_config_sources(cfg, filtered)
 
+    # OBS:
+    # Tag-stöd antas finnas längre ned i stacken enligt nuvarande design.
+    # Om urvalet inte redan hanteras där behöver denna funktion utökas
+    # med motsvarande filtrering för overrides["tags"].
+
     prompt_pkg = overrides.get("prompt_package")
     if isinstance(prompt_pkg, str) and prompt_pkg.strip():
         p = cfg.setdefault("prompts", {})
         if isinstance(p, dict):
             p["selected"] = prompt_pkg.strip()
 
+    # contents ska inte tolkas här; det är ett orchestration-läge som
+    # hanteras i run_pipeline().
     return cfg
 
 
@@ -490,7 +649,6 @@ def _topic_concurrency(config: Dict[str, Any], topic_count: int) -> int:
         n = 1
     if n > 16:
         n = 16
-    # Never spawn more than number of topics that actually have items
     return min(n, max(1, int(topic_count)))
 
 
@@ -593,7 +751,6 @@ async def _summarize_and_persist_like_refresh(
     overall_from = min(pts_all2) if pts_all2 else 0
     overall_to = max(pts_all2) if pts_all2 else 0
 
-    # topics that actually have items
     topic_items: List[Tuple[int, str, List[dict]]] = []
     for i, topic in enumerate(topics, start=1):
         items = groups.get(topic) or []
@@ -656,7 +813,6 @@ async def _summarize_and_persist_like_refresh(
     ]
     results = await asyncio.gather(*tasks)
 
-    # Build deterministic ordering in output
     by_topic: Dict[str, Dict[str, Any]] = {r["topic"]: r for r in results}
     sections: List[Dict[str, Any]] = []
     all_ids: List[str] = []
@@ -699,7 +855,6 @@ async def _summarize_and_persist_like_refresh(
 
     stitched_summary = "\n".join(stitched_parts).strip() + "\n"
 
-    # Super-meta overview (optional, prompt-driven)
     overview_text = ""
     overview_stats: Dict[str, Any] = {
         "super_meta_budget_tokens": 0,
@@ -760,6 +915,153 @@ async def _summarize_and_persist_like_refresh(
     return _persist_summary_doc(store, summary_doc)
 
 
+async def _run_composed_contents_pipeline(
+    *,
+    config_path: str,
+    config: Dict[str, Any],
+    store: NewsStore,
+    llm,
+    job_id: Optional[int],
+    overrides: Dict[str, Any],
+) -> Optional[Any]:
+    contents = overrides.get("contents")
+    sections_cfg, title_pkg, ingress_pkg = _parse_composed_contents(contents)
+    if not sections_cfg:
+        return None
+
+    lookback = str(((config.get("ingest") or {}).get("lookback") or "")).strip()
+
+    async def _run_section(section: Dict[str, str]) -> Dict[str, Any]:
+        # Återanvänd baslagrets befintliga pipeline.
+        # Skicka inte med contents vidare för att undvika rekursion.
+        section_overrides: Dict[str, Any] = {
+            "lookback": overrides.get("lookback") or lookback,
+            "prompt_package": section["promptpackage"],
+            "tags": [section["tag"]],
+        }
+        if isinstance(overrides.get("sources"), list):
+            section_overrides["sources"] = list(overrides["sources"])
+
+        child_summary_id = await run_pipeline(
+            config_path=config_path,
+            job_id=None,
+            overrides=section_overrides,
+            config_dict=config,
+            llm=llm,
+        )
+        if not child_summary_id:
+            return {
+                "tag": section["tag"],
+                "promptpackage": section["promptpackage"],
+                "summary_id": None,
+                "summary": "",
+                "sources": [],
+                "sources_snapshots": [],
+                "from": 0,
+                "to": 0,
+            }
+
+        get_doc = getattr(store, "get_summary_doc", None)
+        if not callable(get_doc):
+            raise RuntimeError("Store saknar get_summary_doc()")
+        child_doc = get_doc(child_summary_id)
+        if not isinstance(child_doc, dict):
+            raise RuntimeError(f"Kunde inte läsa summary_doc {child_summary_id}")
+
+        out = _extract_summary_doc_parts(child_doc)
+        out["tag"] = section["tag"]
+        out["promptpackage"] = section["promptpackage"]
+        out["summary_id"] = str(child_summary_id)
+        return out
+
+    results = await asyncio.gather(*[_run_section(s) for s in sections_cfg])
+
+    all_sources: List[str] = []
+    all_snaps: List[Dict[str, Any]] = []
+    from_candidates: List[int] = []
+    to_candidates: List[int] = []
+
+    for r in results:
+        all_sources.extend(list(r.get("sources") or []))
+        all_snaps.extend(list(r.get("sources_snapshots") or []))
+        if int(r.get("from") or 0) > 0:
+            from_candidates.append(int(r["from"]))
+        if int(r.get("to") or 0) > 0:
+            to_candidates.append(int(r["to"]))
+
+    overall_from = min(from_candidates) if from_candidates else 0
+    overall_to = max(to_candidates) if to_candidates else 0
+
+    summary_wo_ingress = _build_composed_summary_text(sections=results, ingress=None)
+
+    ingress_text = ""
+    if ingress_pkg:
+        with contextlib.suppress(Exception):
+            ingress_text = await _run_prompt_package_step_on_text(
+                config=config,
+                llm=llm,
+                package_name=ingress_pkg,
+                step="ingress",
+                summary_text=summary_wo_ingress,
+                lookback=lookback,
+                from_ts=overall_from,
+                to_ts=overall_to,
+            )
+
+    final_summary = _build_composed_summary_text(
+        sections=results,
+        ingress=ingress_text or None,
+    )
+
+    title_text = ""
+    if title_pkg:
+        with contextlib.suppress(Exception):
+            title_text = await _run_prompt_package_step_on_text(
+                config=config,
+                llm=llm,
+                package_name=title_pkg,
+                step="title",
+                summary_text=final_summary,
+                lookback=lookback,
+                from_ts=overall_from,
+                to_ts=overall_to,
+            )
+
+    summary_doc = {
+        "id": _summary_doc_id(int(time.time()), job_id),
+        "title": title_text
+        or _default_summary_title(
+            lookback=lookback,
+            from_ts=overall_from,
+            to_ts=overall_to,
+        ),
+        "created": int(time.time()),
+        "kind": "summary",
+        "summary": final_summary,
+        "overview": ingress_text or "",
+        "from": overall_from,
+        "to": overall_to,
+        "sources": _dedupe_keep_order([x for x in all_sources if x]),
+        "sources_snapshots": _dedupe_keep_order(all_snaps),
+        "sections": [
+            {
+                "tag": r["tag"],
+                "promptpackage": r["promptpackage"],
+                "summary_id": r["summary_id"],
+            }
+            for r in results
+        ],
+        "selection": {
+            "lookback": lookback,
+            "prompt_package": "",
+            "contents": list(contents or []),
+        },
+        "prompts": {"_package": "composed"},
+        "meta": {"composed": True},
+    }
+    return _persist_summary_doc(store, summary_doc)
+
+
 async def run_pipeline(
     config_path: str = "config.yaml",
     job_id: Optional[int] = None,
@@ -780,6 +1082,34 @@ async def run_pipeline(
         store = create_store(config.get("store", {}))
         if llm is None:
             llm = create_llm_client(config)
+
+        if overrides and isinstance(overrides.get("contents"), list) and overrides["contents"]:
+            if job_id is not None:
+                store.update_job(
+                    job_id,
+                    status="running",
+                    started_at=int(time.time()),
+                    message="Startar komponerad sammanfattning...",
+                )
+
+            summary_doc_id = await _run_composed_contents_pipeline(
+                config_path=config_path,
+                config=config,
+                store=store,
+                llm=llm,
+                job_id=job_id,
+                overrides=overrides,
+            )
+
+            if job_id is not None:
+                store.update_job(
+                    job_id,
+                    status="done",
+                    finished_at=int(time.time()),
+                    message="Klart: komponerad sammanfattning skapad.",
+                    summary_id=str(summary_doc_id) if summary_doc_id is not None else None,
+                )
+            return summary_doc_id
 
         if job_id is not None:
             store.update_job(
@@ -811,7 +1141,6 @@ async def run_pipeline(
         topic_map = _source_topics_map(config)
         selection = _selection_doc(config)
 
-        # Save job context for stable resume
         if job_id is not None:
             _snapshot_topic_map_for_job(
                 store,
@@ -820,8 +1149,7 @@ async def run_pipeline(
                 selection=selection,
                 overrides=overrides,
             )
-            # NEW: write stable corpus checkpoint for resume
-            _write_job_corpus_checkpoint(config, store, int(job_id), to_sum)
+            _write_job_corpus_checkpoint(config, store, int(job_id), to_sum)  # type: ignore[arg-type]
 
         summary_doc_id = await _summarize_and_persist_like_refresh(
             config=config,
