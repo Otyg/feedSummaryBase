@@ -32,7 +32,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 import logging
 from collections import defaultdict
@@ -41,10 +40,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
-
 from feedsummary_core.llm_client import create_llm_client
 from feedsummary_core.persistence import NewsStore
+from feedsummary_core.prompts.loader import (
+    DEFAULT_PROMPTS_PATH,
+    list_prompt_packages as list_prompt_packages_from_root,
+    load_prompt_package as load_prompt_package_from_root,
+    resolve_prompt_root,
+    save_prompt_package as save_prompt_package_to_root,
+)
 from feedsummary_core.summarizer.summarizer import (
     summarize_batches_then_meta_with_stats,
     super_meta_from_topic_sections_with_stats,
@@ -145,46 +149,26 @@ def _apply_promptset_to_config(cfg: Dict[str, Any], ps: PromptSet) -> Dict[str, 
     return cfg2
 
 
-def _load_prompts_yaml(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        obj = yaml.safe_load(f) or {}
-    return obj if isinstance(obj, dict) else {}
-
-
-def _save_prompts_yaml(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
-
-
 def resolve_prompts_path(cfg: Dict[str, Any], *, config_path: str) -> Path:
-    raw = "config/prompts.yaml"
+    raw = DEFAULT_PROMPTS_PATH
     p = cfg.get("prompts")
     if isinstance(p, dict) and p.get("path"):
         raw = str(p.get("path"))
-
-    base_dir = Path(os.path.abspath(config_path)).parent
-    raw2 = os.path.expanduser(os.path.expandvars(raw))
-    if os.path.isabs(raw2):
-        return Path(raw2)
-    return (base_dir / raw2).resolve()
+    return resolve_prompt_root(raw, base_config_path=config_path)
 
 
 def list_prompt_packages(cfg: Dict[str, Any], *, config_path: str) -> List[str]:
     path = resolve_prompts_path(cfg, config_path=config_path)
-    data = _load_prompts_yaml(path)
-    return sorted([str(k) for k in data.keys()])
+    return list_prompt_packages_from_root(path)
 
 
 def load_prompt_package(
     cfg: Dict[str, Any], *, config_path: str, package_name: str
 ) -> Optional[PromptSet]:
     path = resolve_prompts_path(cfg, config_path=config_path)
-    data = _load_prompts_yaml(path)
-    pkg = data.get(package_name)
-    if not isinstance(pkg, dict):
+    try:
+        pkg = load_prompt_package_from_root(path, package_name)
+    except KeyError:
         return None
     return PromptSet(
         batch_system=str(pkg.get("batch_system") or ""),
@@ -200,18 +184,18 @@ def save_prompt_package(
     cfg: Dict[str, Any], *, config_path: str, package_name: str, promptset: PromptSet
 ) -> Path:
     path = resolve_prompts_path(cfg, config_path=config_path)
-    data = _load_prompts_yaml(path)
-    data[str(package_name)] = {
-        "batch_system": promptset.batch_system,
-        "batch_user_template": promptset.batch_user_template,
-        "meta_system": promptset.meta_system,
-        "meta_user_template": promptset.meta_user_template,
-        # NEW: persist super-meta fields too
-        "super_meta_system": promptset.super_meta_system,
-        "super_meta_user_template": promptset.super_meta_user_template,
-    }
-    _save_prompts_yaml(path, data)
-    return path
+    return save_prompt_package_to_root(
+        path,
+        package_name,
+        {
+            "batch_system": promptset.batch_system,
+            "batch_user_template": promptset.batch_user_template,
+            "meta_system": promptset.meta_system,
+            "meta_user_template": promptset.meta_user_template,
+            "super_meta_system": promptset.super_meta_system,
+            "super_meta_user_template": promptset.super_meta_user_template,
+        },
+    )
 
 
 def _topic_from_snapshot(s: Dict[str, Any]) -> str:

@@ -47,6 +47,13 @@ from collections import defaultdict, deque
 import feedparser
 import yaml
 
+from feedsummary_core.prompts.loader import (
+    DEFAULT_PROMPTS_PATH,
+    list_prompt_packages as list_prompt_packages_from_root,
+    load_prompt_package as load_prompt_package_from_root,
+    resolve_prompt_root,
+)
+
 
 def setup_logging():
     root = logging.getLogger()
@@ -149,6 +156,7 @@ def _checkpoint_key(job_id: Optional[int], articles: List[dict]) -> str:
     ids_join = "|".join(ids)
     return hashlib.sha256(ids_join.encode("utf-8")).hexdigest()[:16]
 
+
 def _published_ts(a: dict) -> int:
     ts = a.get("published_ts")
     if isinstance(ts, int) and ts > 0:
@@ -184,7 +192,6 @@ def interleave_by_source_oldest_first(
         for src, q in active:
             if q:
                 out.append(q.popleft())
-
     return out
 
 
@@ -318,13 +325,12 @@ def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[
     if isinstance(p_cfg, dict) and any(k in p_cfg for k in base_keys):
         out: Dict[str, str] = {k: str(p_cfg.get(k, "")) for k in base_keys}
         for k in optional_keys:
-            if k in p_cfg:
-                out[k] = str(p_cfg.get(k, ""))
+            out[k] = str(p_cfg.get(k, ""))
         out["_package"] = str(p_cfg.get("_package") or "embedded")
         return out
 
-    # New: prompts.yaml packages
-    path = "config/prompts.yaml"
+    # New: prompt packages from directory or legacy single file
+    path = DEFAULT_PROMPTS_PATH
     default_pkg = "default"
 
     if isinstance(p_cfg, dict):
@@ -338,29 +344,24 @@ def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[
     if not pkg:
         pkg = default_pkg
 
-    path = os.path.expanduser(os.path.expandvars(path))
+    prompt_root = resolve_prompt_root(path, base_config_path="config.yaml")
 
-    with open(path, "r", encoding="utf-8") as f:
-        all_pkgs = yaml.safe_load(f) or {}
-
-    if pkg not in all_pkgs:
-        if isinstance(all_pkgs, dict) and all_pkgs:
-            pkg = next(iter(all_pkgs.keys()))
+    try:
+        blob = load_prompt_package_from_root(prompt_root, pkg)
+    except KeyError:
+        packages = list_prompt_packages_from_root(prompt_root)
+        if packages:
+            pkg = packages[0]
+            blob = load_prompt_package_from_root(prompt_root, pkg)
         else:
-            raise RuntimeError(f"Inga prompt-paket hittades i {path}")
-
-    blob = all_pkgs.get(pkg) or {}
-    if not isinstance(blob, dict):
-        raise RuntimeError(f"Prompt-paket '{pkg}' i {path} är inte ett dict-objekt")
+            raise RuntimeError(f"Inga prompt-paket hittades i {prompt_root}") from None
 
     out: Dict[str, str] = {}
     for k in base_keys:
         out[k] = str(blob.get(k, ""))
 
-    # include optional keys if present
     for k in optional_keys:
-        if k in blob:
-            out[k] = str(blob.get(k, ""))
+        out[k] = str(blob.get(k, ""))
 
     out["_package"] = pkg
     return out
