@@ -38,9 +38,16 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import logging
+
 from ollama import AsyncClient
 
 logger = logging.getLogger(__name__)
+
+# Delat tillstånd mellan klientinstanser för samma host/model/api-key.
+_GLOBAL_THROTTLE_LOCKS: Dict[str, asyncio.Lock] = {}
+_GLOBAL_LAST_CALL_TS: Dict[str, float] = {}
+_GLOBAL_PREFLIGHT_OK_TS: Dict[str, float] = {}
+_GLOBAL_CONCURRENCY: Dict[str, asyncio.Semaphore] = {}
 
 
 class LLMRateLimitError(RuntimeError):
@@ -66,6 +73,7 @@ class OllamaCloudConfig:
     preflight: bool = True
     min_interval_seconds: float = 1.0
     timeout_seconds: float = 180.0
+    max_concurrency: int = 1
 
 
 def _resolve_env(value: str) -> str:
@@ -80,10 +88,7 @@ def _resolve_env(value: str) -> str:
 def _extract_retry_after_seconds(exc: Exception) -> Optional[int]:
     """
     Försök läsa Retry-After från exception/response om biblioteket exponerar det.
-    (Ollama-python’s exceptions kan variera mellan versioner.)
     """
-    # ResponseError i ollama-python brukar ha status_code + error, men inte alltid headers.
-    # Vi gör därför "best effort".
     for attr in ("retry_after", "retry_after_seconds"):
         v = getattr(exc, attr, None)
         if isinstance(v, int):
@@ -95,20 +100,24 @@ def _is_status(exc: Exception, code: int) -> bool:
     sc = getattr(exc, "status_code", None)
     if isinstance(sc, int) and sc == code:
         return True
-    # vissa varianter använder .status
     st = getattr(exc, "status", None)
     return isinstance(st, int) and st == code
 
 
+def _client_key(cfg: OllamaCloudConfig) -> str:
+    # Inkludera auth i nyckeln för att inte dela state mellan olika konton.
+    # Vi loggar inte hela nyckeln, bara använder den internt.
+    return f"{cfg.host.rstrip('/')}|{cfg.model}|{cfg.api_key}"
+
+
 class OllamaCloudClient:
     """
-    LLMClient-implementation för Ollama Cloud API med gemma3:270m.
+    LLMClient-implementation för Ollama Cloud API.
 
-    Använder officiella 'ollama' AsyncClient och kör mot host=https://ollama.com
-    med Authorization Bearer API key. :contentReference[oaicite:3]{index=3}
-
-    "Quota check" görs via preflight call till /api/tags (client.list()).
-    Det ger tidig signal för 401/429 innan vi drar igång stora prompts.
+    Viktiga egenskaper i denna version:
+    - global throttle mellan klientinstanser
+    - global preflight-cache mellan klientinstanser
+    - global samtidighetsgräns mellan klientinstanser
     """
 
     def __init__(self, cfg: Dict[str, Any]):
@@ -122,6 +131,7 @@ class OllamaCloudClient:
             preflight=bool(quota_cfg.get("preflight", True)),
             min_interval_seconds=float(quota_cfg.get("min_interval_seconds", 1.0)),
             timeout_seconds=float(llm_cfg.get("timeout_seconds", 360.0)),
+            max_concurrency=max(1, int(quota_cfg.get("max_concurrency", 1))),
         )
 
         if not self.cfg.api_key:
@@ -133,82 +143,105 @@ class OllamaCloudClient:
             timeout=self.cfg.timeout_seconds,
         )
         self.log = logging.getLogger(__name__)
-        self._last_call_ts: float = 0.0
-        self._preflight_ok_ts: float = 0.0
+
+        self._key = _client_key(self.cfg)
+
+        if self._key not in _GLOBAL_THROTTLE_LOCKS:
+            _GLOBAL_THROTTLE_LOCKS[self._key] = asyncio.Lock()
+        if self._key not in _GLOBAL_LAST_CALL_TS:
+            _GLOBAL_LAST_CALL_TS[self._key] = 0.0
+        if self._key not in _GLOBAL_PREFLIGHT_OK_TS:
+            _GLOBAL_PREFLIGHT_OK_TS[self._key] = 0.0
+        if self._key not in _GLOBAL_CONCURRENCY:
+            _GLOBAL_CONCURRENCY[self._key] = asyncio.Semaphore(self.cfg.max_concurrency)
+
+        self._throttle_lock = _GLOBAL_THROTTLE_LOCKS[self._key]
+        self._concurrency_sem = _GLOBAL_CONCURRENCY[self._key]
 
     async def _throttle(self) -> None:
-        now = time.time()
-        dt = now - self._last_call_ts
-        if dt < self.cfg.min_interval_seconds:
-            await asyncio.sleep(self.cfg.min_interval_seconds - dt)
-        self._last_call_ts = time.time()
+        async with self._throttle_lock:
+            now = time.time()
+            dt = now - _GLOBAL_LAST_CALL_TS[self._key]
+            if dt < self.cfg.min_interval_seconds:
+                await asyncio.sleep(self.cfg.min_interval_seconds - dt)
+            _GLOBAL_LAST_CALL_TS[self._key] = time.time()
 
     async def _preflight_quota_check(self) -> None:
         if not self.cfg.preflight:
             return
 
-        # Kör inte preflight onödigt ofta
         now = time.time()
-        if (now - self._preflight_ok_ts) < 10.0:
+        if (now - _GLOBAL_PREFLIGHT_OK_TS[self._key]) < 10.0:
             return
 
         try:
-            # list() motsvarar /api/tags och kräver auth på ollama.com
-            # :contentReference[oaicite:4]{index=4}
             await self._client.list()
-            self._preflight_ok_ts = time.time()
+            _GLOBAL_PREFLIGHT_OK_TS[self._key] = time.time()
         except Exception as e:
             if _is_status(e, 401) or _is_status(e, 403):
                 raise LLMAuthError("Ollama Cloud auth misslyckades (api_key fel/nekad).") from e
             if _is_status(e, 429):
                 ra = _extract_retry_after_seconds(e)
                 raise LLMRateLimitError(
-                    "Ollama Cloud: rate limit/quota uppnådd (preflight).", ra
+                    "Ollama Cloud: rate limit/quota uppnådd (preflight).",
+                    ra,
                 ) from e
             raise LLMUnavailableError(f"Ollama Cloud preflight misslyckades: {e}") from e
 
     async def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
         """
-        Returnerar en enda textsträng (sammanfogad content).
-        Hanterar preflight quota-check och 429/timeout tydligt.
+        Returnerar en enda textsträng.
+        Hanterar:
+        - global samtidighetsgräns
+        - global throttle
+        - optional preflight
+        - tydlig 429/auth/server-timeout-hantering
         """
-        await self._throttle()
-        await self._preflight_quota_check()
-        self.log.info("LLM request start (model=%s)", self.cfg.model)
-        # Ollama API använder "options" för parametrar.
-        # (temperature är ett standard-alternativ i Ollama.)
-        payload_options = {"temperature": temperature}
+        async with self._concurrency_sem:
+            await self._throttle()
+            await self._preflight_quota_check()
 
-        try:
-            resp = await self._client.chat(
-                model=self.cfg.model,
-                messages=messages,
-                stream=False,
-                options=payload_options,
-            )
-            # resp kan vara dict-lik eller typed; vi stödjer båda:
-            if isinstance(resp, dict):
-                return (resp.get("message") or {}).get("content", "") or ""
-            return getattr(resp.message, "content", "") or ""
-        except Exception as e:
+            self.log.info("LLM request start (model=%s)", self.cfg.model)
+            payload_options = {"temperature": temperature}
+
             try:
-                body = getattr(e, "error", None) or getattr(e, "message", None) or str(e)
-                if isinstance(body, str) and body.strip():
-                    self.log.error("Ollama Cloud error response/body:\n%s", body[:12000])
-            except Exception:
-                pass
-            if _is_status(e, 401) or _is_status(e, 403):
-                raise LLMAuthError("Ollama Cloud: auth misslyckades (api_key fel/nekad).") from e
-            if _is_status(e, 500):
-                raise LLMUnavailableError(
-                    f"Ollama Cloud: server error 500. Möjlig överbelastning.\n{e}"
-                ) from e
+                resp = await self._client.chat(
+                    model=self.cfg.model,
+                    messages=messages,
+                    stream=False,
+                    options=payload_options,
+                )
+                if isinstance(resp, dict):
+                    return (resp.get("message") or {}).get("content", "") or ""
+                return getattr(resp.message, "content", "") or ""
 
-            if _is_status(e, 429):
-                ra = _extract_retry_after_seconds(e)
-                raise LLMRateLimitError("Ollama Cloud: rate limit/quota uppnådd.", ra) from e
-            # timeouts kan komma som httpx.TimeoutException under huven
-            name = e.__class__.__name__.lower()
-            if "timeout" in name:
-                raise LLMUnavailableError(f"Ollama Cloud: timeout: {e}") from e
-            raise LLMUnavailableError(f"Ollama Cloud: chat misslyckades: {e}") from e
+            except Exception as e:
+                try:
+                    body = getattr(e, "error", None) or getattr(e, "message", None) or str(e)
+                    if isinstance(body, str) and body.strip():
+                        self.log.error("Ollama Cloud error response/body:\n%s", body[:12000])
+                except Exception:
+                    pass
+
+                if _is_status(e, 401) or _is_status(e, 403):
+                    raise LLMAuthError(
+                        "Ollama Cloud: auth misslyckades (api_key fel/nekad)."
+                    ) from e
+
+                if _is_status(e, 429):
+                    ra = _extract_retry_after_seconds(e)
+                    raise LLMRateLimitError(
+                        "Ollama Cloud: rate limit/quota uppnådd.",
+                        ra,
+                    ) from e
+
+                if _is_status(e, 500):
+                    raise LLMUnavailableError(
+                        f"Ollama Cloud: server error 500. Möjlig överbelastning.\n{e}"
+                    ) from e
+
+                name = e.__class__.__name__.lower()
+                if "timeout" in name:
+                    raise LLMUnavailableError(f"Ollama Cloud: timeout: {e}") from e
+
+                raise LLMUnavailableError(f"Ollama Cloud: chat misslyckades: {e}") from e
