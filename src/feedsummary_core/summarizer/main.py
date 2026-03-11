@@ -441,6 +441,26 @@ def _build_sources_appendix_markdown(snapshots: List[Dict[str, Any]]) -> str:
     return "\n".join(out).strip() + "\n"
 
 
+def _strip_sources_appendix_from_summary(summary_text: str) -> str:
+    """
+    Tar bort den lokala källsektionen från ett summary-dokument.
+
+    Vi utgår från att källappendix byggs deterministiskt sist i dokumentet
+    med rubriken '## Källor'.
+    """
+    text = str(summary_text or "").rstrip()
+
+    marker = "\n## Källor\n"
+    idx = text.find(marker)
+    if idx >= 0:
+        return text[:idx].rstrip()
+
+    if text.startswith("## Källor\n"):
+        return ""
+
+    return text
+
+
 def _snapshot_topic_map_for_job(
     store: NewsStore,
     job_id: int,
@@ -899,13 +919,15 @@ async def compose_summary_docs(
             or str(spec.get("promptpackage") or "").strip()
         )
 
+        body_text = _strip_sources_appendix_from_summary(str(parts.get("summary") or ""))
+
         loaded_sections.append(
             {
                 "tag": heading,
                 "summary_id": summary_id,
                 "schedule": str(spec.get("schedule") or "").strip(),
                 "promptpackage": str(spec.get("promptpackage") or "").strip(),
-                "summary": parts["summary"],
+                "summary": body_text,
             }
         )
 
@@ -942,7 +964,7 @@ async def compose_summary_docs(
                 to_ts=overall_to,
             )
 
-    final_summary = _build_composed_summary_text(
+    final_summary_body = _build_composed_summary_text(
         sections=loaded_sections,
         ingress=ingress_text or None,
     )
@@ -955,12 +977,11 @@ async def compose_summary_docs(
                 llm=llm,
                 package_name=title_package,
                 step="title",
-                summary_text=final_summary,
+                summary_text=final_summary_body,
                 lookback=lookback,
                 from_ts=overall_from,
                 to_ts=overall_to,
             )
-
     if not title_text:
         title_text = _default_summary_title(
             lookback=lookback,
@@ -969,7 +990,11 @@ async def compose_summary_docs(
         )
 
     created_ts = int(time.time())
+    appendix = _build_sources_appendix_markdown(_dedupe_keep_order(all_snapshots))
 
+    final_summary = final_summary_body
+    if appendix:
+        final_summary = final_summary.rstrip() + "\n\n" + appendix
     summary_doc: Dict[str, Any] = {
         "id": _summary_doc_id(created_ts, job_id),
         "title": title_text,
