@@ -38,16 +38,25 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import logging
+import weakref
 
 from ollama import AsyncClient
 
 logger = logging.getLogger(__name__)
 
 # Delat tillstånd mellan klientinstanser för samma host/model/api-key.
-_GLOBAL_THROTTLE_LOCKS: Dict[str, asyncio.Lock] = {}
 _GLOBAL_LAST_CALL_TS: Dict[str, float] = {}
 _GLOBAL_PREFLIGHT_OK_TS: Dict[str, float] = {}
-_GLOBAL_CONCURRENCY: Dict[str, asyncio.Semaphore] = {}
+
+
+@dataclass
+class _LoopSyncPrimitives:
+    throttle_lock: asyncio.Lock
+    concurrency_sem: asyncio.Semaphore
+
+
+# asyncio-primitiver är loop-bundna, så de måste vara per event loop.
+_GLOBAL_LOOP_SYNCS: Dict[str, weakref.WeakKeyDictionary] = {}
 
 
 class LLMRateLimitError(RuntimeError):
@@ -146,20 +155,31 @@ class OllamaCloudClient:
 
         self._key = _client_key(self.cfg)
 
-        if self._key not in _GLOBAL_THROTTLE_LOCKS:
-            _GLOBAL_THROTTLE_LOCKS[self._key] = asyncio.Lock()
         if self._key not in _GLOBAL_LAST_CALL_TS:
             _GLOBAL_LAST_CALL_TS[self._key] = 0.0
         if self._key not in _GLOBAL_PREFLIGHT_OK_TS:
             _GLOBAL_PREFLIGHT_OK_TS[self._key] = 0.0
-        if self._key not in _GLOBAL_CONCURRENCY:
-            _GLOBAL_CONCURRENCY[self._key] = asyncio.Semaphore(self.cfg.max_concurrency)
 
-        self._throttle_lock = _GLOBAL_THROTTLE_LOCKS[self._key]
-        self._concurrency_sem = _GLOBAL_CONCURRENCY[self._key]
+    def _get_loop_sync(self) -> _LoopSyncPrimitives:
+        loop = asyncio.get_running_loop()
+
+        by_loop = _GLOBAL_LOOP_SYNCS.get(self._key)
+        if by_loop is None:
+            by_loop = weakref.WeakKeyDictionary()
+            _GLOBAL_LOOP_SYNCS[self._key] = by_loop
+
+        sync = by_loop.get(loop)
+        if sync is None:
+            sync = _LoopSyncPrimitives(
+                throttle_lock=asyncio.Lock(),
+                concurrency_sem=asyncio.Semaphore(self.cfg.max_concurrency),
+            )
+            by_loop[loop] = sync
+        return sync
 
     async def _throttle(self) -> None:
-        async with self._throttle_lock:
+        sync = self._get_loop_sync()
+        async with sync.throttle_lock:
             now = time.time()
             dt = now - _GLOBAL_LAST_CALL_TS[self._key]
             if dt < self.cfg.min_interval_seconds:
@@ -197,7 +217,8 @@ class OllamaCloudClient:
         - optional preflight
         - tydlig 429/auth/server-timeout-hantering
         """
-        async with self._concurrency_sem:
+        sync = self._get_loop_sync()
+        async with sync.concurrency_sem:
             await self._throttle()
             await self._preflight_quota_check()
 
