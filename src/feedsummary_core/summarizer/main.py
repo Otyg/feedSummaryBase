@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from feedsummary_core.llm_client import create_llm_client
+from feedsummary_core.llm_client import create_llm_client, get_primary_llm_config
 from feedsummary_core.persistence import NewsStore, create_store
 from feedsummary_core.summarizer.helpers import (
     setup_logging,
@@ -74,6 +74,11 @@ def _published_ts(a: dict) -> int:
     if isinstance(fa, int) and fa > 0:
         return fa
     return 0
+
+
+def _primary_llm_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = get_primary_llm_config(config)
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def _summary_doc_id(created_ts: int, job_id: Optional[int]) -> str:
@@ -671,10 +676,10 @@ async def _summarize_and_persist_like_refresh(
             "created": created_ts,
             "kind": "summary",
             "llm": {
-                "provider": (config.get("llm") or {}).get("provider", "unknown"),
-                "model": (config.get("llm") or {}).get("model", "unknown"),
+                "provider": _primary_llm_cfg(config).get("provider", "unknown"),
+                "model": _primary_llm_cfg(config).get("model", "unknown"),
                 "temperature": 0.2,
-                "max_output_tokens": int((config.get("llm") or {}).get("max_output_tokens") or 0),
+                "max_output_tokens": int(_primary_llm_cfg(config).get("max_output_tokens") or 0),
             },
             "prompts": load_prompts(config),
             "batching": config.get("batching", {}) or {},
@@ -847,10 +852,10 @@ async def _summarize_and_persist_like_refresh(
         "created": created_ts,
         "kind": "summary",
         "llm": {
-            "provider": (config.get("llm") or {}).get("provider", "unknown"),
-            "model": (config.get("llm") or {}).get("model", "unknown"),
+            "provider": _primary_llm_cfg(config).get("provider", "unknown"),
+            "model": _primary_llm_cfg(config).get("model", "unknown"),
             "temperature": 0.2,
-            "max_output_tokens": int((config.get("llm") or {}).get("max_output_tokens") or 0),
+            "max_output_tokens": int(_primary_llm_cfg(config).get("max_output_tokens") or 0),
         },
         "prompts": load_prompts(config),
         "batching": config.get("batching", {}) or {},
@@ -1001,10 +1006,10 @@ async def compose_summary_docs(
         "created": created_ts,
         "kind": "summary",
         "llm": {
-            "provider": (config.get("llm") or {}).get("provider", "unknown"),
-            "model": (config.get("llm") or {}).get("model", "unknown"),
+            "provider": _primary_llm_cfg(config).get("provider", "unknown"),
+            "model": _primary_llm_cfg(config).get("model", "unknown"),
             "temperature": 0.2,
-            "max_output_tokens": int((config.get("llm") or {}).get("max_output_tokens") or 0),
+            "max_output_tokens": int(_primary_llm_cfg(config).get("max_output_tokens") or 0),
         },
         "prompts": {"_package": "composed"},
         "batching": config.get("batching", {}) or {},

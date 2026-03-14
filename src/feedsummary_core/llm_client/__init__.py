@@ -32,8 +32,11 @@
 from __future__ import annotations
 
 from feedsummary_core.llm_client.fallback_client import FallbackLLMClient, FallbackPolicy
+import logging
 
 from typing import Any, Dict, List, Optional, Protocol
+
+log = logging.getLogger(__name__)
 
 
 class LLMRateLimitError(RuntimeError):
@@ -75,26 +78,72 @@ def _create_single_llm(llm_cfg: Dict[str, Any]):
     raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
+def get_primary_llm_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returnerar första LLM-konfigurationen (dict) oavsett om config['llm']
+    är dict eller lista av dict.
+    """
+    llm_cfg = config.get("llm")
+    if isinstance(llm_cfg, dict):
+        return llm_cfg
+    if isinstance(llm_cfg, list):
+        for item in llm_cfg:
+            if isinstance(item, dict):
+                return item
+        return {}
+    return {}
+
+
+def _collect_llm_chain_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    llm_raw = config.get("llm")
+    chain_cfgs: List[Dict[str, Any]] = []
+
+    if isinstance(llm_raw, dict):
+        chain_cfgs.append(llm_raw)
+    elif isinstance(llm_raw, list):
+        for i, item in enumerate(llm_raw, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"config['llm'][{i}] måste vara ett objekt/dict.")
+            chain_cfgs.append(item)
+    elif llm_raw is None:
+        chain_cfgs = []
+    else:
+        raise ValueError("config['llm'] måste vara dict eller lista av dict.")
+
+    # Bakåtkompatibilitet: appenda legacy llm_fallback sist om den finns.
+    fallback_cfg = config.get("llm_fallback")
+    if isinstance(fallback_cfg, dict):
+        chain_cfgs.append(fallback_cfg)
+        if isinstance(llm_raw, list):
+            log.warning(
+                "Både config['llm'] (lista) och legacy config['llm_fallback'] finns. "
+                "Appenderar llm_fallback sist i fallback-kedjan."
+            )
+    elif fallback_cfg is not None:
+        raise ValueError("config['llm_fallback'] måste vara dict om den anges.")
+
+    return chain_cfgs
+
+
 def create_llm_client(config: Dict[str, Any]):
     """
-    Bygger primary från config['llm'] och (om finns) fallback från config['llm_fallback'].
-
-    Fallback triggas när cloud slår i quota igen efter retry.
+    Bygger LLM-kedja från config['llm'].
+    - dict: en primär provider (ev + legacy llm_fallback)
+    - list: providers i prioriterad ordning (0..n), fallback till nästa vid trigger
     """
-    llm_cfg = config.get("llm") or {}
-    primary = _create_single_llm(llm_cfg)
+    chain_cfgs = _collect_llm_chain_configs(config)
+    if not chain_cfgs:
+        raise ValueError("Saknar LLM-konfiguration: config['llm'] är tom.")
 
-    fallback_cfg: Optional[Dict[str, Any]] = config.get("llm_fallback")
-    fallback = _create_single_llm(fallback_cfg) if isinstance(fallback_cfg, dict) else None
+    clients = [_create_single_llm(c) for c in chain_cfgs]
 
-    # policy kan ligga under llm.quota eller llm_fallback_policy – välj det du gillar
-    quota_cfg = llm_cfg.get("quota") or {}
+    # Policy tas från primär (första) config.
+    quota_cfg = (chain_cfgs[0].get("quota") or {}) if chain_cfgs else {}
     policy = FallbackPolicy(
         max_quota_retries=int(quota_cfg.get("max_quota_retries", 1)),
         default_wait_s=int(quota_cfg.get("default_wait_s", 30)),
     )
 
-    if fallback:
-        return FallbackLLMClient(primary=primary, fallback=fallback, policy=policy)
-
-    return primary
+    if len(clients) == 1:
+        return clients[0]
+    return FallbackLLMClient(clients=clients, policy=policy)

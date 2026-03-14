@@ -37,9 +37,15 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from feedsummary_core.llm_client import get_primary_llm_config
 from feedsummary_core.summarizer.helpers import trim_text_tail_by_words
 
 logger = logging.getLogger("FeedSummarizer")
+
+def _primary_llm_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = get_primary_llm_config(config)
+    return cfg if isinstance(cfg, dict) else {}
+
 
 _PROMPT_TOO_LONG_RE = re.compile(r"exceeded max context length by\s+(\d+)\s+tokens", re.IGNORECASE)
 
@@ -158,7 +164,7 @@ async def chat_guarded(
     - small overflow: word-trim här
     - medium/large: signalera structural till batch-loopen
     """
-    llm_cfg = config.get("llm") or {}
+    llm_cfg = _primary_llm_cfg(config)
     chars_per_token = float(llm_cfg.get("token_chars_per_token", 2.4))
     max_attempts = int(llm_cfg.get("prompt_too_long_max_attempts", 6))
     structural_threshold = int(llm_cfg.get("prompt_too_long_structural_threshold_tokens", 1200))
@@ -232,7 +238,7 @@ async def run_promptlab_summarization(
     meta_batch_clip_chars = int(batching.get("meta_batch_clip_chars", 2500))
     meta_sources_clip_chars = int(batching.get("meta_sources_clip_chars", 140))
 
-    llm_cfg = config.get("llm") or {}
+    llm_cfg = _primary_llm_cfg(config)
     chars_per_token = float(llm_cfg.get("token_chars_per_token", 2.4))
     structural_threshold = int(llm_cfg.get("prompt_too_long_structural_threshold_tokens", 1200))
 

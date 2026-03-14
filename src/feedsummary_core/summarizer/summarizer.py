@@ -42,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from feedsummary_core.llm_client import LLMClient
+from feedsummary_core.llm_client import LLMClient, get_primary_llm_config
 from feedsummary_core.persistence import NewsStore
 from feedsummary_core.summarizer.batching import (
     PromptTooLongStructural,
@@ -76,6 +76,11 @@ from feedsummary_core.summarizer.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _primary_llm_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = get_primary_llm_config(config)
+    return cfg if isinstance(cfg, dict) else {}
 
 
 # ----------------------------
@@ -121,7 +126,7 @@ def _persist_summary_doc(store: NewsStore, doc: Dict[str, Any]) -> Any:
 
 
 def _extract_llm_doc(config: Dict[str, Any], llm: LLMClient, temperature: float) -> Dict[str, Any]:
-    llm_cfg = config.get("llm") or {}
+    llm_cfg = _primary_llm_cfg(config)
     provider = str(llm_cfg.get("provider") or llm_cfg.get("type") or "")
     model = str(llm_cfg.get("model") or llm_cfg.get("name") or "")
 
@@ -413,7 +418,7 @@ async def _proofread_and_revise_meta_with_stats(
     if not (proof_sys and proof_user_tmpl and rev_sys and rev_user_tmpl):
         return meta_text, {"proofread_enabled": 0, "proofread_rounds": 0, "proofread_output": ""}
 
-    llm_cfg = config.get("llm") or {}
+    llm_cfg = _primary_llm_cfg(config)
     max_ctx = int(llm_cfg.get("context_window_tokens", 32768))
     max_out = int(llm_cfg.get("max_output_tokens", 700))
     margin = int(llm_cfg.get("prompt_safety_margin", 1024))
@@ -559,7 +564,7 @@ async def super_meta_from_topic_sections_with_stats(
         return "", {"super_meta_budget_tokens": 0, "super_meta_enabled": 0}
 
     batching = config.get("batching", {}) or {}
-    llm_cfg = config.get("llm") or {}
+    llm_cfg = _primary_llm_cfg(config)
     max_ctx = int(llm_cfg.get("context_window_tokens", 32768))
     max_out = int(llm_cfg.get("max_output_tokens", 700))
     margin = int(llm_cfg.get("prompt_safety_margin", 1024))
@@ -693,7 +698,7 @@ async def summarize_batches_then_meta_with_stats(
     article_clip_chars = int(batching.get("article_clip_chars", 6000))
     meta_sources_clip_chars = int(batching.get("meta_sources_clip_chars", 140))
 
-    llm_cfg = config.get("llm") or {}
+    llm_cfg = _primary_llm_cfg(config)
     max_ctx = int(llm_cfg.get("context_window_tokens", 32768))
     max_out = int(llm_cfg.get("max_output_tokens", 700))
     margin = int(llm_cfg.get("prompt_safety_margin", 1024))

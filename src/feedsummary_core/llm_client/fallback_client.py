@@ -55,83 +55,90 @@ class FallbackPolicy:
 
 class FallbackLLMClient:
     """
-    Wrapper som kör primary, men om quota/rate-limit kvarstår efter retry -> fallback.
+    Wrapper som kör providers i prioritetsordning.
 
     Beteende:
-      - Får vi LLMRateLimitError:
-          * vänta retry_after (eller default_wait_s)
-          * försök igen upp till max_quota_retries
-      - Om fortfarande rate limited:
-          * växla permanent till fallback (för resten av processen)
+      - Kör första provider i listan.
+      - Vid LLMRateLimitError/LLMUnavailableError:
+          * vänta + retry upp till max_quota_retries
+          * om problemet kvarstår, växla permanent till nästa provider i listan
+      - Finns ingen nästa provider: bubbla felet.
     """
 
-    def __init__(
-        self,
-        primary: LLMClient,
-        fallback: Optional[LLMClient],
-        policy: Optional[FallbackPolicy] = None,
-    ):
-        self.primary = primary
-        self.fallback = fallback
+    def __init__(self, clients: List[LLMClient], policy: Optional[FallbackPolicy] = None):
+        if not clients:
+            raise ValueError("FallbackLLMClient kräver minst en LLM-klient.")
+        self.clients = clients
         self.policy = policy or FallbackPolicy()
-        self._force_fallback = False
+        self._active_idx = 0
+
+    def _try_advance_provider(self, reason: str) -> bool:
+        if self._active_idx >= (len(self.clients) - 1):
+            return False
+        old_i = self._active_idx
+        self._active_idx += 1
+        log.warning(
+            "LLM %s efter %d retry(s). Växlar provider %d/%d -> %d/%d.",
+            reason,
+            self.policy.max_quota_retries,
+            old_i + 1,
+            len(self.clients),
+            self._active_idx + 1,
+            len(self.clients),
+        )
+        return True
 
     async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str:
-        # Om vi redan växlat till fallback
-        if self._force_fallback:
-            if not self.fallback:
-                raise RuntimeError("Fallback aktiverad men llm_fallback saknas i config.")
-            return await self.fallback.chat(messages, temperature=temperature)
-
-        # Försök primary med quota-retries
-        attempt = 0
         while True:
-            try:
-                return await self.primary.chat(messages, temperature=temperature)
-            except LLMUnavailableError as e:
-                attempt += 1
-                wait_s = int(self.policy.default_wait_s)
+            active_idx = min(self._active_idx, len(self.clients) - 1)
+            active = self.clients[active_idx]
 
-                # Om vi redan testat retry och slår i igen -> fallback
-                if attempt > self.policy.max_quota_retries:
-                    if not self.fallback:
-                        # ingen fallback konfigurerad
-                        raise LLMUnavailableError(e)
-                    log.warning(
-                        "LLM otillgänglig efter %d retry(s). Växlar till fallback.",
-                        self.policy.max_quota_retries,
-                    )
-                    self._force_fallback = True
-                    return await self.fallback.chat(messages, temperature=temperature)
+            attempt = 0
+            while True:
+                try:
+                    return await active.chat(messages, temperature=temperature)
+                except LLMUnavailableError as e:
+                    attempt += 1
+                    wait_s = int(self.policy.default_wait_s)
 
-                log.warning(
-                    "LLM otillgänglig, %s.\n (attempt %d/%d) Väntar %ss och retry...",
-                    e,
-                    attempt,
-                    self.policy.max_quota_retries,
-                    wait_s,
-                )
-                await asyncio.sleep(wait_s)
-            except LLMRateLimitError as e:
-                attempt += 1
-                wait_s = int(e.retry_after_seconds or self.policy.default_wait_s)
-
-                # Om vi redan testat retry och slår i igen -> fallback
-                if attempt > self.policy.max_quota_retries:
-                    if not self.fallback:
-                        # ingen fallback konfigurerad
+                    if attempt > self.policy.max_quota_retries:
+                        # Växla endast om vi fortfarande är på samma provider.
+                        if self._active_idx == active_idx and self._try_advance_provider("otillgänglig"):
+                            break
+                        if self._active_idx > active_idx:
+                            break
                         raise
-                    log.warning(
-                        "LLM quota/rate-limit kvarstår efter %d retry(s). Växlar till fallback.",
-                        self.policy.max_quota_retries,
-                    )
-                    self._force_fallback = True
-                    return await self.fallback.chat(messages, temperature=temperature)
 
-                log.warning(
-                    "LLM rate-limited (attempt %d/%d). Väntar %ss och retry...",
-                    attempt,
-                    self.policy.max_quota_retries,
-                    wait_s,
-                )
-                await asyncio.sleep(wait_s)
+                    log.warning(
+                        "LLM provider %d/%d otillgänglig, %s.\n (attempt %d/%d) Väntar %ss och retry...",
+                        active_idx + 1,
+                        len(self.clients),
+                        e,
+                        attempt,
+                        self.policy.max_quota_retries,
+                        wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
+                except LLMRateLimitError as e:
+                    attempt += 1
+                    wait_s = int(e.retry_after_seconds or self.policy.default_wait_s)
+
+                    if attempt > self.policy.max_quota_retries:
+                        # Växla endast om vi fortfarande är på samma provider.
+                        if self._active_idx == active_idx and self._try_advance_provider(
+                            "quota/rate-limit"
+                        ):
+                            break
+                        if self._active_idx > active_idx:
+                            break
+                        raise
+
+                    log.warning(
+                        "LLM provider %d/%d rate-limited (attempt %d/%d). Väntar %ss och retry...",
+                        active_idx + 1,
+                        len(self.clients),
+                        attempt,
+                        self.policy.max_quota_retries,
+                        wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
