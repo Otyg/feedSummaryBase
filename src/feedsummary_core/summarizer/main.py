@@ -116,8 +116,10 @@ async def _run_prompt_package_step_on_text(
     Befintlig helper som återanvänds av compose_summary_docs().
 
     Stöd:
-      - step='title'   => title_system + title_user_template
-      - step='ingress' => super_meta_system + super_meta_user_template
+      - step='title'      => title_system + title_user_template
+      - step='ingress'    => super_meta_system + super_meta_user_template
+      - step='proofread'  => proofread_system + proofread_user_template
+      - step='revise'     => revise_system + revise_user_template
     """
     prompts = load_prompts(config, package=package_name)
 
@@ -127,6 +129,12 @@ async def _run_prompt_package_step_on_text(
     elif step == "ingress":
         sys_key = "super_meta_system"
         user_key = "super_meta_user_template"
+    elif step == "proofread":
+        sys_key = "proofread_system"
+        user_key = "proofread_user_template"
+    elif step == "revise":
+        sys_key = "revise_system"
+        user_key = "revise_user_template"
     else:
         raise ValueError(f"Okänt promptsteg: {step}")
 
@@ -191,6 +199,16 @@ def _build_composed_summary_text(
         parts.append("")
 
     return "\n".join(parts).strip()
+
+
+def _prepend_ingress(summary_text: str, ingress: Optional[str]) -> str:
+    body = str(summary_text or "").strip()
+    intro = str(ingress or "").strip()
+    if intro and body:
+        return f"{intro}\n\n{body}"
+    if intro:
+        return intro
+    return body
 
 
 def _dedupe_keep_order(items: List[Any]) -> List[Any]:
@@ -894,6 +912,7 @@ async def compose_summary_docs(
     job_id: Optional[int],
     name: str,
     sections: List[Dict[str, str]],
+    proofread_package: Optional[str] = None,
     ingress_package: Optional[str] = None,
     title_package: Optional[str] = None,
 ) -> str:
@@ -955,6 +974,42 @@ async def compose_summary_docs(
         ingress=None,
     )
 
+    revised_summary_body = merged_without_ingress
+    proofread_applied = False
+    revise_applied = False
+    if proofread_package:
+        proofread_text = ""
+        with contextlib.suppress(Exception):
+            proofread_text = await _run_prompt_package_step_on_text(
+                config=config,
+                llm=llm,
+                package_name=proofread_package,
+                step="proofread",
+                summary_text=revised_summary_body,
+                lookback=lookback,
+                from_ts=overall_from,
+                to_ts=overall_to,
+            )
+        if proofread_text:
+            revised_summary_body = proofread_text
+            proofread_applied = True
+
+        revised_text = ""
+        with contextlib.suppress(Exception):
+            revised_text = await _run_prompt_package_step_on_text(
+                config=config,
+                llm=llm,
+                package_name=proofread_package,
+                step="revise",
+                summary_text=revised_summary_body,
+                lookback=lookback,
+                from_ts=overall_from,
+                to_ts=overall_to,
+            )
+        if revised_text:
+            revised_summary_body = revised_text
+            revise_applied = True
+
     ingress_text = ""
     if ingress_package:
         with contextlib.suppress(Exception):
@@ -963,16 +1018,13 @@ async def compose_summary_docs(
                 llm=llm,
                 package_name=ingress_package,
                 step="ingress",
-                summary_text=merged_without_ingress,
+                summary_text=revised_summary_body,
                 lookback=lookback,
                 from_ts=overall_from,
                 to_ts=overall_to,
             )
 
-    final_summary_body = _build_composed_summary_text(
-        sections=loaded_sections,
-        ingress=ingress_text or None,
-    )
+    final_summary_body = _prepend_ingress(revised_summary_body, ingress_text or None)
 
     title_text = ""
     if title_package:
@@ -1030,8 +1082,11 @@ async def compose_summary_docs(
         ],
         "meta": {
             "composed": True,
+            "proofread_package": proofread_package or "",
             "ingress_package": ingress_package or "",
             "title_package": title_package or "",
+            "proofread_applied": int(proofread_applied),
+            "revise_applied": int(revise_applied),
         },
         "selection": {
             "name": name,
