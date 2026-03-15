@@ -35,11 +35,15 @@ from typing import Dict, List, Tuple
 
 
 def estimate_tokens(text: str) -> int:
+    """Estimate token count from raw text using a conservative character heuristic."""
+
     # konservativ approximation (svenska/URL/markup tenderar att bli fler tokens)
     return max(1, int(len(text) / 3.6))
 
 
 def messages_to_text(messages: List[Dict[str, str]]) -> str:
+    """Flatten chat messages into one string for rough budget estimation."""
+
     # grov approximation av chat-format overhead
     out = []
     for m in messages:

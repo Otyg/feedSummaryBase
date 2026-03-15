@@ -43,11 +43,15 @@ log = logging.getLogger(__name__)
 
 
 class LLMClient(Protocol):
+    """Minimal async chat contract used by the fallback wrapper."""
+
     async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str: ...
 
 
 @dataclass
 class FallbackPolicy:
+    """Retry and wait settings for quota-triggered provider fallback."""
+
     max_quota_retries: int = 1  # "vid retry" -> om det slår i igen efter 1 retry: fallback
     default_wait_s: int = 30  # om retry_after saknas
     jitter_s: float = 0.0  # håll 0 om du vill vara deterministisk

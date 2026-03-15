@@ -70,6 +70,13 @@ def _published_ts(doc: Dict[str, Any]) -> int:
     return 0
 
 
+def _normalize_summary_id(value: Any) -> Optional[str]:
+    summary_id = str(value or "").strip()
+    if summary_id.lower() in {"", "none", "null"}:
+        return None
+    return summary_id
+
+
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
@@ -521,6 +528,9 @@ class SqliteStore:
             extra = _json_loads(row["fields_json"]) if row else {}
             if not isinstance(extra, dict):
                 extra = {}
+
+            if "summary_id" in fields:
+                fields["summary_id"] = _normalize_summary_id(fields.get("summary_id"))
 
             set_parts: List[str] = []
             params: List[Any] = []

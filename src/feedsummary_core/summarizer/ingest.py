@@ -132,6 +132,8 @@ def _passes_category_filter(entry: feedparser.FeedParserDict, feed_cfg: Dict[str
 
 
 async def fetch_rss(feed_url: str, session: aiohttp.ClientSession) -> feedparser.FeedParserDict:
+    """Download and parse one RSS or Atom feed."""
+
     async with session.get(feed_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
         resp.raise_for_status()
         content = await resp.read()
@@ -140,11 +142,15 @@ async def fetch_rss(feed_url: str, session: aiohttp.ClientSession) -> feedparser
 
 
 def extract_text_from_html(html: str, url: str) -> str:
+    """Extract readable article text from raw HTML using Trafilatura."""
+
     extracted = trafilatura.extract(html, url=url, include_comments=False, include_tables=False)
     return (extracted or "").strip()
 
 
 async def fetch_article_html(url: str, session: aiohttp.ClientSession, timeout_s: int) -> str:
+    """Fetch raw article HTML and raise :class:`RateLimitError` on HTTP 429."""
+
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
         if resp.status == 429:
             ra = resp.headers.get("Retry-After")
@@ -165,6 +171,8 @@ async def fetch_article_html(url: str, session: aiohttp.ClientSession, timeout_s
     ),
 )
 async def guarded_fetch_article(url: str, session: aiohttp.ClientSession, timeout_s: int) -> str:
+    """Fetch an article with retry handling for rate limits and transient HTTP issues."""
+
     try:
         return await fetch_article_html(url, session, timeout_s)
     except RateLimitError as e:

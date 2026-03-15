@@ -83,6 +83,20 @@ def _primary_llm_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _normalize_summary_doc_id(value: Any) -> str:
+    summary_id = str(value or "").strip()
+    if summary_id.lower() in {"", "none", "null"}:
+        return ""
+    return summary_id
+
+
+def _require_summary_doc_id(value: Any, *, context: str) -> str:
+    summary_id = _normalize_summary_doc_id(value)
+    if not summary_id:
+        raise RuntimeError(f"{context}: summary_doc_id saknas eller är ogiltigt")
+    return summary_id
+
+
 # ----------------------------
 # Small helpers for summary_doc persistence (used by resume persist)
 # ----------------------------
@@ -1195,7 +1209,10 @@ async def run_resume_and_persist_summary(
         },
     }
 
-    summary_doc_id = str(_persist_summary_doc(store, summary_doc))
+    summary_doc_id = _require_summary_doc_id(
+        _persist_summary_doc(store, summary_doc),
+        context="run_resume_job",
+    )
 
     try:
         store.mark_articles_summarized(sources)

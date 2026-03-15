@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PromptSet:
+    """Serializable bundle of prompt texts used by replay and prompt-lab flows."""
+
     batch_system: str
     batch_user_template: str
     meta_system: str
@@ -150,6 +152,8 @@ def _apply_promptset_to_config(cfg: Dict[str, Any], ps: PromptSet) -> Dict[str, 
 
 
 def resolve_prompts_path(cfg: Dict[str, Any], *, config_path: str) -> Path:
+    """Resolve the prompt package root for a config, honoring ``prompts.path``."""
+
     raw = DEFAULT_PROMPTS_PATH
     p = cfg.get("prompts")
     if isinstance(p, dict) and p.get("path"):
@@ -158,6 +162,8 @@ def resolve_prompts_path(cfg: Dict[str, Any], *, config_path: str) -> Path:
 
 
 def list_prompt_packages(cfg: Dict[str, Any], *, config_path: str) -> List[str]:
+    """List available prompt packages for the supplied configuration."""
+
     path = resolve_prompts_path(cfg, config_path=config_path)
     return list_prompt_packages_from_root(path)
 
@@ -165,6 +171,8 @@ def list_prompt_packages(cfg: Dict[str, Any], *, config_path: str) -> List[str]:
 def load_prompt_package(
     cfg: Dict[str, Any], *, config_path: str, package_name: str
 ) -> Optional[PromptSet]:
+    """Load a named prompt package and convert it into a :class:`PromptSet`."""
+
     path = resolve_prompts_path(cfg, config_path=config_path)
     try:
         pkg = load_prompt_package_from_root(path, package_name)
@@ -183,6 +191,8 @@ def load_prompt_package(
 def save_prompt_package(
     cfg: Dict[str, Any], *, config_path: str, package_name: str, promptset: PromptSet
 ) -> Path:
+    """Persist a :class:`PromptSet` to the configured prompt package directory."""
+
     path = resolve_prompts_path(cfg, config_path=config_path)
     return save_prompt_package_to_root(
         path,
@@ -485,6 +495,8 @@ async def rerun_summary_from_existing(
 
 
 def get_promptset_for_summary(store: NewsStore, summary_id: str) -> PromptSet:
+    """Extract the prompt set embedded in a previously saved summary document."""
+
     sdoc = store.get_summary_doc(str(summary_id))
     if not sdoc:
         raise RuntimeError(f"Summary not found: {summary_id}")

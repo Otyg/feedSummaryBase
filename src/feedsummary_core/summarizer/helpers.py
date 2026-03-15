@@ -56,6 +56,8 @@ from feedsummary_core.prompts.loader import (
 
 
 def setup_logging():
+    """Configure a simple root logger that writes INFO logs to stdout."""
+
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     for h in list(root.handlers):
@@ -72,6 +74,8 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimitError(Exception):
+    """HTTP-oriented rate-limit error carrying retry hints from a remote source."""
+
     def __init__(self, status: int, retry_after: Optional[float] = None, body: str = ""):
         super().__init__(f"HTTP {status} rate-limited")
         self.status = status
@@ -94,6 +98,8 @@ def _extract_overflow_tokens(err: Exception) -> Optional[int]:
 
 
 def entry_published_ts(entry: feedparser.FeedParserDict) -> Optional[int]:
+    """Extract a publication timestamp from common RSS/Atom date fields."""
+
     for attr in ("published_parsed", "updated_parsed"):
         st = getattr(entry, attr, None)
         if st:
@@ -170,6 +176,8 @@ def interleave_by_source_oldest_first(
     source_key: str = "source",
     ts_key_fn: Callable[[dict], int] = _published_ts,
 ) -> List[dict]:
+    """Round-robin articles by source while preserving oldest-first order per source."""
+
     groups: Dict[str, List[dict]] = defaultdict(list)
     for a in articles:
         src = str(a.get(source_key) or "unknown")
@@ -226,34 +234,48 @@ def _meta_ckpt_path(config: Dict[str, Any], key: str) -> Path:
 # Hash helpers
 # ----------------------------
 def normalize_text(s: str) -> str:
+    """Lowercase and whitespace-normalize text before hashing or comparison."""
+
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
 
 
 def compute_content_hash(title: str, url: str, text: str) -> str:
+    """Build a stable content hash from title, URL, and normalized article text."""
+
     base = f"{(title or '').strip()}|{(url or '').strip()}|{normalize_text(text)}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
 def stable_id(url: str) -> str:
+    """Return a deterministic identifier for a URL."""
+
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
 def text_clip(s: str, max_chars: int) -> str:
+    """Convenience wrapper around :func:`clip_text` with an explicit length name."""
+
     return clip_text(s=s, n=max_chars)
 
 
 def clip_text(s: str, n: int = 5000) -> str:
+    """Trim text to at most ``n`` characters and append an ellipsis if clipped."""
+
     s = (s or "").strip()
     return s if len(s) <= n else s[:n] + "…"
 
 
 def clip_line(s: str, n: int = 200) -> str:
+    """Clip one line of text to a shorter preview-friendly length."""
+
     return clip_text(s=s, n=n)
 
 
 def trim_text_tail_by_words(text: str, remove_tokens: int, *, chars_per_token: float) -> str:
+    """Shorten text near the tail while trying to preserve word boundaries."""
+
     return trim_last_user_word_boundary(
         messages=[{"foo": text}],
         remove_tokens=remove_tokens,
@@ -267,6 +289,8 @@ def trim_last_user_word_boundary(
     *,
     chars_per_token: float,
 ) -> List[Dict[str, str]]:
+    """Trim the last user message in a chat payload without cutting mid-word."""
+
     out = [dict(m) for m in messages]
     idx = None
     for i in range(len(out) - 1, -1, -1):
@@ -302,6 +326,8 @@ def trim_last_user_word_boundary(
 # Job helper
 # ----------------------------
 def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[str, str]:
+    """Load prompt texts from embedded config or from the configured prompt package store."""
+
     p_cfg = config.get("prompts") or {}
 
     base_keys = (
@@ -371,6 +397,8 @@ def load_prompts(config: Dict[str, Any], package: Optional[str] = None) -> Dict[
 # Job helper
 # ----------------------------
 def set_job(msg: str, job_id, store):
+    """Update a job status message when a job id is available."""
+
     if job_id is not None:
         store.update_job(job_id, message=msg)
 
@@ -389,6 +417,8 @@ def _resolve_path(base_config_path: str, p: str) -> str:
 def load_feeds_into_config(
     config: Dict[str, Any], *, base_config_path: str = "config.yaml"
 ) -> Dict[str, Any]:
+    """Populate ``config['feeds']`` from an external YAML file when needed."""
+
     logger.info("Reading feed-configs")
     feeds = config.get("feeds")
     if isinstance(feeds, list):
@@ -427,6 +457,8 @@ def load_feeds_into_config(
 
 
 def lookback_label_from_range(lookback_raw: str, from_ts: int, to_ts: int) -> str:
+    """Format a human-readable lookback label from explicit timestamps."""
+
     lb = (lookback_raw or "").strip()
 
     span = ""
@@ -445,6 +477,8 @@ def lookback_label_from_range(lookback_raw: str, from_ts: int, to_ts: int) -> st
 
 
 def lookback_label_from_articles(lookback_raw: str, articles: List[dict]) -> str:
+    """Derive a lookback label from the timestamps present in a set of articles."""
+
     if not articles:
         return (lookback_raw or "").strip()
 
@@ -477,6 +511,8 @@ def lookback_label_from_articles(lookback_raw: str, articles: List[dict]) -> str
 # Lookback parsing
 # ----------------------------
 def parse_lookback_to_seconds(s: str) -> int:
+    """Parse duration strings like ``24h`` or ``7d`` into seconds."""
+
     s2 = (s or "").strip().lower()
     if not s2:
         return 0

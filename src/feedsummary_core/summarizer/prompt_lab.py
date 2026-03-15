@@ -147,6 +147,8 @@ def _choose_trim_action(overflow_tokens: int, structural_threshold: int) -> str:
 
 
 class PromptTooLongStructural(Exception):
+    """Raised when prompt-lab overflow requires dropping articles instead of trimming."""
+
     def __init__(self, overflow_tokens: int):
         super().__init__(f"prompt too long (structural), overflow={overflow_tokens}")
         self.overflow_tokens = overflow_tokens

@@ -46,6 +46,8 @@ def batch_articles(
     max_articles_per_batch: int,
     article_clip_chars: int = 2500,
 ) -> List[List[dict]]:
+    """Split article docs into bounded batches after clipping each article body."""
+
     batches: List[List[dict]] = []
     current: List[dict] = []
     current_chars = 0
@@ -77,6 +79,8 @@ def batch_articles(
 # Prompt-too-long helpers + stable resume helpers
 # ----------------------------
 class PromptTooLongStructural(Exception):
+    """Raised when a prompt overflow requires structural batch changes, not trimming."""
+
     def __init__(self, overflow_tokens: int):
         super().__init__(f"prompt too long (structural), overflow={overflow_tokens}")
         self.overflow_tokens = overflow_tokens

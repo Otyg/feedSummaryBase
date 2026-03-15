@@ -41,10 +41,14 @@ from feedsummary_core.persistence.SqliteStore import SqliteStore
 
 
 class StoreError(Exception):
+    """Base exception for persistence-layer failures."""
+
     pass
 
 
 class NewsStore(Protocol):
+    """Protocol that all article and summary stores must implement."""
+
     def get_article(self, article_id: str) -> Optional[Dict[str, Any]]: ...
 
     def upsert_article(self, article_doc: Dict[str, Any]) -> None: ...
@@ -96,6 +100,8 @@ def _expand_path(p: str) -> str:
 
 
 def create_store(cfg: Dict[str, Any]) -> NewsStore:
+    """Instantiate the configured storage backend and ensure its parent path exists."""
+
     provider = (cfg.get("provider") or "tinydb").lower()
 
     if provider == "tinydb":

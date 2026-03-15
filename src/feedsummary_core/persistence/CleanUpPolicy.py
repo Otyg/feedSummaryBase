@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CleanupPolicy:
+    """Retention windows and scheduling flags for store cleanup jobs."""
+
     enabled: bool = True
     run_every_minutes: int = 60
 

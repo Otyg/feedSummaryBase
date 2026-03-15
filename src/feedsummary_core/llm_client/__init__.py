@@ -40,16 +40,22 @@ log = logging.getLogger(__name__)
 
 
 class LLMRateLimitError(RuntimeError):
+    """Signal that an LLM provider rejected a request due to quota or rate limiting."""
+
     def __init__(self, message: str, retry_after_seconds: Optional[int] = None):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
 
 
 class LLMError(Exception):
+    """Base exception for generic LLM client failures."""
+
     pass
 
 
 class LLMClient(Protocol):
+    """Protocol implemented by asynchronous chat-oriented LLM clients."""
+
     async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str: ...
 
 

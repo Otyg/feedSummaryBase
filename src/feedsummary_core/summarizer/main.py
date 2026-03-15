@@ -904,6 +904,20 @@ def _load_summary_doc(store: NewsStore, summary_id: str) -> Dict[str, Any]:
     return doc
 
 
+def _normalize_summary_doc_id(value: Any) -> str:
+    summary_id = str(value or "").strip()
+    if summary_id.lower() in {"", "none", "null"}:
+        return ""
+    return summary_id
+
+
+def _require_summary_doc_id(value: Any, *, context: str) -> str:
+    summary_id = _normalize_summary_doc_id(value)
+    if not summary_id:
+        raise RuntimeError(f"{context}: summary_doc_id saknas eller är ogiltigt")
+    return summary_id
+
+
 async def compose_summary_docs(
     *,
     config: Dict[str, Any],
@@ -930,8 +944,16 @@ async def compose_summary_docs(
     lookback = str((config.get("ingest") or {}).get("lookback") or "").strip()
 
     for spec in sections:
-        summary_id = str(spec.get("summary_id") or "").strip()
+        summary_id = _normalize_summary_doc_id(spec.get("summary_id"))
         if not summary_id:
+            logger.warning(
+                "compose_summary_docs: hoppar over sektion utan giltigt summary_id: "
+                "schedule=%r tag=%r promptpackage=%r raw_summary_id=%r",
+                spec.get("schedule"),
+                spec.get("tag"),
+                spec.get("promptpackage"),
+                spec.get("summary_id"),
+            )
             continue
 
         doc = _load_summary_doc(store, summary_id)
@@ -964,7 +986,10 @@ async def compose_summary_docs(
             to_candidates.append(int(parts["to"]))
 
     if not loaded_sections:
-        raise RuntimeError("compose_summary_docs: inga summary docs att sammanfoga")
+        raise RuntimeError(
+            "compose_summary_docs: inga giltiga summary docs att sammanfoga "
+            "(saknade eller ogiltiga summary_id i alla sektioner)"
+        )
 
     overall_from = min(from_candidates) if from_candidates else 0
     overall_to = max(to_candidates) if to_candidates else 0
@@ -1095,7 +1120,10 @@ async def compose_summary_docs(
         },
     }
 
-    return str(_persist_summary_doc(store, summary_doc))
+    return _require_summary_doc_id(
+        _persist_summary_doc(store, summary_doc),
+        context="compose_summary_docs",
+    )
 
 
 async def run_pipeline(
@@ -1105,6 +1133,8 @@ async def run_pipeline(
     config_dict: Optional[Dict[str, Any]] = None,
     llm=None,
 ) -> Optional[Any]:
+    """Run the full ingest-and-summarize pipeline and optionally bind it to a job."""
+
     try:
         if config_dict is None:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -1169,14 +1199,17 @@ async def run_pipeline(
             selection=selection,
         )
 
+        summary_doc_id = _normalize_summary_doc_id(summary_doc_id)
+
         if job_id is not None:
-            store.update_job(
-                job_id,
-                status="done",
-                finished_at=int(time.time()),
-                message=f"Klart: summerade {len(to_sum)} artiklar.",
-                summary_id=str(summary_doc_id),
-            )
+            job_fields: Dict[str, Any] = {
+                "status": "done",
+                "finished_at": int(time.time()),
+                "message": f"Klart: summerade {len(to_sum)} artiklar.",
+            }
+            if summary_doc_id:
+                job_fields["summary_id"] = summary_doc_id
+            store.update_job(job_id, **job_fields)
 
         return summary_doc_id
 
@@ -1201,6 +1234,8 @@ async def run_resume_job(
     llm,
     job_id: int,
 ) -> str:
+    """Resume a previously checkpointed summarization job and persist the final summary."""
+
     jid = int(job_id)
     try:
         ctx = _load_job_context(store, jid)
@@ -1227,18 +1262,21 @@ async def run_resume_job(
             selection=selection,
         )
 
+        summary_doc_id = _normalize_summary_doc_id(summary_doc_id)
+
         try:
-            store.update_job(
-                jid,
-                status="done",
-                finished_at=int(time.time()),
-                message=f"Resume klart: summerade {len(ordered_articles)} artiklar.",
-                summary_id=str(summary_doc_id),
-            )
+            job_fields: Dict[str, Any] = {
+                "status": "done",
+                "finished_at": int(time.time()),
+                "message": f"Resume klart: summerade {len(ordered_articles)} artiklar.",
+            }
+            if summary_doc_id:
+                job_fields["summary_id"] = summary_doc_id
+            store.update_job(jid, **job_fields)
         except Exception:
             pass
 
-        return str(summary_doc_id)
+        return summary_doc_id
 
     except Exception as e:
         try:

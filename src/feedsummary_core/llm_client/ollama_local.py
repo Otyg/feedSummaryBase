@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OllamaConfig:
+    """Connection, timeout, and retry settings for the local Ollama client."""
+
     base_url: str = "http://localhost:11434"
     model: str = "gemma3:1b"
     max_rps: float = 1.0

@@ -42,6 +42,8 @@ DEFAULT_PROMPTS_PATH = "config/prompts"
 
 
 def resolve_prompt_root(raw_path: str, *, base_config_path: str) -> Path:
+    """Resolve a prompt root relative to the config file when needed."""
+
     raw2 = os.path.expanduser(os.path.expandvars(raw_path))
     if os.path.isabs(raw2):
         return Path(raw2)
@@ -50,6 +52,8 @@ def resolve_prompt_root(raw_path: str, *, base_config_path: str) -> Path:
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge nested mappings while letting override win on conflicts."""
+
     out: Dict[str, Any] = dict(base)
     for key, value in override.items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict):
@@ -86,6 +90,8 @@ def _normalize_includes(raw: Any, *, path: Path) -> List[str]:
 
 
 def resolve_prompt_file(path: Path, *, visited: Iterable[Path] | None = None) -> Dict[str, Any]:
+    """Load one prompt file and recursively inline any declared includes."""
+
     resolved = path.resolve()
     seen = set(visited or [])
     if resolved in seen:
@@ -131,6 +137,8 @@ def _iter_package_files(root: Path) -> List[Path]:
 
 
 def load_prompt_package_map(prompt_root: Path) -> Dict[str, Dict[str, Any]]:
+    """Load all prompt packages from a directory or from a legacy single YAML file."""
+
     if prompt_root.is_file():
         return _load_legacy_prompt_package_map(prompt_root)
 
@@ -147,10 +155,14 @@ def load_prompt_package_map(prompt_root: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def list_prompt_packages(prompt_root: Path) -> List[str]:
+    """Return available prompt package names sorted alphabetically."""
+
     return sorted(load_prompt_package_map(prompt_root).keys())
 
 
 def load_prompt_package(prompt_root: Path, package_name: str) -> Dict[str, Any]:
+    """Load one prompt package by name and return it as a plain mapping."""
+
     packages = load_prompt_package_map(prompt_root)
     pkg = packages.get(str(package_name).strip())
     if not isinstance(pkg, dict):
@@ -159,6 +171,8 @@ def load_prompt_package(prompt_root: Path, package_name: str) -> Dict[str, Any]:
 
 
 def save_prompt_package(prompt_root: Path, package_name: str, data: Dict[str, Any]) -> Path:
+    """Persist a prompt package into a directory-based prompt store."""
+
     if prompt_root.is_file():
         raise ValueError(
             "Cannot save a single package into legacy prompts YAML. "

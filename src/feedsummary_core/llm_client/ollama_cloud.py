@@ -51,6 +51,8 @@ _GLOBAL_PREFLIGHT_OK_TS: Dict[str, float] = {}
 
 @dataclass
 class _LoopSyncPrimitives:
+    """Per-event-loop synchronization primitives shared by cloud client instances."""
+
     throttle_lock: asyncio.Lock
     concurrency_sem: asyncio.Semaphore
 
@@ -60,21 +62,29 @@ _GLOBAL_LOOP_SYNCS: Dict[str, weakref.WeakKeyDictionary] = {}
 
 
 class LLMRateLimitError(RuntimeError):
+    """Raised when Ollama Cloud reports a retryable quota or rate-limit issue."""
+
     def __init__(self, message: str, retry_after_seconds: Optional[int] = None):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
 
 
 class LLMAuthError(RuntimeError):
+    """Raised when the configured Ollama Cloud credentials are rejected."""
+
     pass
 
 
 class LLMUnavailableError(RuntimeError):
+    """Raised when Ollama Cloud is temporarily unreachable or unhealthy."""
+
     pass
 
 
 @dataclass
 class OllamaCloudConfig:
+    """Normalized runtime settings for an Ollama Cloud client instance."""
+
     host: str = "https://ollama.com"
     model: str = "gemma3:270m"
     api_key: str = ""

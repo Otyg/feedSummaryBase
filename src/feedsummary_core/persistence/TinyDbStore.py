@@ -43,6 +43,13 @@ from feedsummary_core.persistence import CleanupPolicy
 logger = logging.getLogger(__name__)
 
 
+def _normalize_summary_id(value: Any) -> Optional[str]:
+    summary_id = str(value or "").strip()
+    if summary_id.lower() in {"", "none", "null"}:
+        return None
+    return summary_id
+
+
 class TinyDBStore:
     """
     TinyDB-backed store (JSON file).
@@ -202,6 +209,8 @@ class TinyDBStore:
         return int(jid)
 
     def update_job(self, job_id: int, **fields) -> None:
+        if "summary_id" in fields:
+            fields["summary_id"] = _normalize_summary_id(fields.get("summary_id"))
         db = self._db()
         db.table("jobs").update(fields, doc_ids=[int(job_id)])
         logger.info("Job %s updated: %s", job_id, fields)
