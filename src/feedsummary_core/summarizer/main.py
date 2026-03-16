@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 import copy
 import logging
+import re
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -60,6 +61,7 @@ from feedsummary_core.summarizer.ingest import gather_articles_to_store
 from feedsummary_core.summarizer.summarizer import (
     summarize_batches_then_meta_with_stats,
     super_meta_from_topic_sections_with_stats,
+    _proofread_and_revise_meta_with_stats,
 )
 
 setup_logging()
@@ -209,6 +211,75 @@ def _prepend_ingress(summary_text: str, ingress: Optional[str]) -> str:
     if intro:
         return intro
     return body
+
+
+_PLACEHOLDER_BRACKET_RE = re.compile(r"\[[^\]\n]{3,120}\]")
+_PLACEHOLDER_LABEL_RE = re.compile(
+    r"(?im)^(rubrik|ingress|brödtext)\s*:\s*(.+)$"
+)
+
+
+def _looks_like_placeholder_template(text: str) -> bool:
+    """
+    Detect generic template outputs where the model echoes editorial scaffolding
+    instead of rewriting the actual composed summary.
+    """
+
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+
+    placeholder_hits = _PLACEHOLDER_BRACKET_RE.findall(stripped)
+    if len(placeholder_hits) >= 3:
+        return True
+
+    label_lines = _PLACEHOLDER_LABEL_RE.findall(stripped)
+    if label_lines and sum(1 for _, value in label_lines if "[" in value and "]" in value) >= 2:
+        return True
+
+    normalized = stripped.casefold()
+    if "reviderad sammanfattning" in normalized and len(placeholder_hits) >= 1:
+        return True
+
+    return False
+
+
+def _log_excerpt(text: str, max_len: int = 220) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= max_len:
+        return normalized
+    return normalized[: max_len - 3].rstrip() + "..."
+
+
+def _validate_composed_rewrite(previous_text: str, rewritten_text: str) -> Tuple[bool, str]:
+    """
+    Guard against accidental collapses where a proofread/revise step returns only
+    a short intro and drops the stitched section content.
+
+    The guard is intentionally lightweight:
+      - rewritten text must not be dramatically shorter than the previous text
+      - if previous text contains section headings, rewritten text should keep at
+        least one heading marker
+    """
+
+    prev = str(previous_text or "").strip()
+    new = str(rewritten_text or "").strip()
+    if not new:
+        return False, "empty_response"
+    if not prev:
+        return True, "accepted_no_previous_text"
+
+    if _looks_like_placeholder_template(new):
+        return False, "placeholder_template"
+
+    # Prevent extreme truncation (e.g. only ingress returned after revise).
+    if len(new) < max(200, int(len(prev) * 0.35)):
+        return False, "extreme_truncation"
+
+    if "## " in prev and "## " not in new:
+        return False, "missing_section_headings"
+
+    return True, "accepted"
 
 
 def _dedupe_keep_order(items: List[Any]) -> List[Any]:
@@ -1002,38 +1073,54 @@ async def compose_summary_docs(
     revised_summary_body = merged_without_ingress
     proofread_applied = False
     revise_applied = False
+    proofread_output = ""
     if proofread_package:
-        proofread_text = ""
-        with contextlib.suppress(Exception):
-            proofread_text = await _run_prompt_package_step_on_text(
-                config=config,
-                llm=llm,
-                package_name=proofread_package,
-                step="proofread",
-                summary_text=revised_summary_body,
-                lookback=lookback,
-                from_ts=overall_from,
-                to_ts=overall_to,
-            )
-        if proofread_text:
-            revised_summary_body = proofread_text
-            proofread_applied = True
+        prompts = load_prompts(config, package=proofread_package)
+        batch_summaries = [
+            (idx, str(section.get("summary") or "").strip())
+            for idx, section in enumerate(loaded_sections, start=1)
+            if str(section.get("summary") or "").strip()
+        ]
+        source_lines: List[str] = []
+        for snap in _dedupe_keep_order(all_snapshots):
+            title = str(snap.get("title") or "").strip() or "(utan titel)"
+            url = str(snap.get("url") or "").strip()
+            if url:
+                source_lines.append(f"- {title} — {url}")
+            else:
+                source_lines.append(f"- {title}")
+        sources_text = "\n".join(source_lines)
 
-        revised_text = ""
         with contextlib.suppress(Exception):
-            revised_text = await _run_prompt_package_step_on_text(
+            revised_candidate, pr_stats = await _proofread_and_revise_meta_with_stats(
                 config=config,
                 llm=llm,
-                package_name=proofread_package,
-                step="revise",
-                summary_text=revised_summary_body,
+                store=store,
+                job_id=job_id,
+                prompts=prompts,
                 lookback=lookback,
-                from_ts=overall_from,
-                to_ts=overall_to,
+                meta_text=merged_without_ingress,
+                batch_summaries=batch_summaries,
+                sources_text=sources_text,
+                max_rounds=1,
             )
-        if revised_text:
-            revised_summary_body = revised_text
-            revise_applied = True
+            proofread_output = str(pr_stats.get("proofread_output") or "").strip()
+            proofread_applied = int(bool(proofread_output)) > 0
+            is_valid, reason = _validate_composed_rewrite(
+                merged_without_ingress, revised_candidate
+            )
+            if is_valid:
+                revised_summary_body = revised_candidate
+                revise_applied = (
+                    (revised_summary_body or "").strip()
+                    != merged_without_ingress.strip()
+                )
+            else:
+                logger.warning(
+                    "compose_summary_docs: ignorerar proofread/revise-resultat (%s): %r",
+                    reason,
+                    _log_excerpt(revised_candidate),
+                )
 
     ingress_text = ""
     if ingress_package:
@@ -1112,6 +1199,7 @@ async def compose_summary_docs(
             "title_package": title_package or "",
             "proofread_applied": int(proofread_applied),
             "revise_applied": int(revise_applied),
+            "proofread_output": proofread_output,
         },
         "selection": {
             "name": name,
