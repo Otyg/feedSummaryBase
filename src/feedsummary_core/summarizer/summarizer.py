@@ -430,7 +430,13 @@ async def _proofread_and_revise_meta_with_stats(
     rev_user_tmpl = str(prompts.get("revise_user_template") or "").strip()
 
     if not (proof_sys and proof_user_tmpl and rev_sys and rev_user_tmpl):
-        return meta_text, {"proofread_enabled": 0, "proofread_rounds": 0, "proofread_output": ""}
+        return meta_text, {
+            "proofread_enabled": 0,
+            "proofread_rounds": 0,
+            "proofread_output": "",
+            "proofread_feedback": "",
+            "revised_summary": "",
+        }
 
     llm_cfg = _primary_llm_cfg(config)
     max_ctx = int(llm_cfg.get("context_window_tokens", 32768))
@@ -456,6 +462,7 @@ async def _proofread_and_revise_meta_with_stats(
 
     text = (meta_text or "").strip()
     last_feedback = ""
+    last_revised = ""
     rounds = 0
 
     for r in range(1, max_rounds + 1):
@@ -482,7 +489,9 @@ async def _proofread_and_revise_meta_with_stats(
                 "proofread_enabled": 1,
                 "proofread_rounds": r,
                 "proofread_output": "PASS",
+                "proofread_feedback": clip_text(last_feedback, 8000),
                 "proofread_last_feedback": last_feedback,
+                "revised_summary": last_revised,
             }
 
         last_feedback = crit_s
@@ -505,6 +514,7 @@ async def _proofread_and_revise_meta_with_stats(
         )
         revised_s = (revised or "").strip()
         if revised_s:
+            last_revised = revised_s
             text = revised_s
 
     # Reached max rounds; keep last feedback as "output"
@@ -512,7 +522,9 @@ async def _proofread_and_revise_meta_with_stats(
         "proofread_enabled": 1,
         "proofread_rounds": rounds,
         "proofread_output": clip_text(last_feedback, 8000),
+        "proofread_feedback": clip_text(last_feedback, 8000),
         "proofread_last_feedback": last_feedback,
+        "revised_summary": last_revised,
     }
 
 
@@ -1055,7 +1067,9 @@ async def summarize_batches_then_meta_with_stats(
                 "proofread_enabled": int(pr_stats.get("proofread_enabled") or 0),
                 "proofread_rounds": int(pr_stats.get("proofread_rounds") or 0),
                 "proofread_output": str(pr_stats.get("proofread_output") or ""),
+                "proofread_feedback": str(pr_stats.get("proofread_feedback") or ""),
                 "proofread_last_feedback": str(pr_stats.get("proofread_last_feedback") or ""),
+                "revised_summary": str(pr_stats.get("revised_summary") or ""),
                 "batch_article_ids": _batch_article_ids_map(batches),
                 "done_batches": _done_batches_payload(done_map, batches),
                 "trims": trims_count,
@@ -1084,6 +1098,8 @@ async def summarize_batches_then_meta_with_stats(
         "meta_budget_tokens": meta_budget_tokens_final,
         "proofread_enabled": int(pr_stats.get("proofread_enabled") or 0),
         "proofread_rounds": int(pr_stats.get("proofread_rounds") or 0),
+        "proofread_feedback": str(pr_stats.get("proofread_feedback") or ""),
+        "revised_summary": str(pr_stats.get("revised_summary") or ""),
     }
     return meta, stats
 
@@ -1201,6 +1217,7 @@ async def run_resume_and_persist_summary(
         "from": from_ts,
         "to": to_ts,
         "summary": meta_text,
+        "proofread_feedback": str(stats.get("proofread_feedback") or ""),
         "meta": {
             "batch_total": int(stats.get("batch_total") or 0),
             "trims": int(stats.get("trims") or 0),

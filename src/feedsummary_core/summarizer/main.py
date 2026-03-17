@@ -1074,6 +1074,8 @@ async def compose_summary_docs(
     proofread_applied = False
     revise_applied = False
     proofread_output = ""
+    proofread_feedback = ""
+    ignored_revised_summary = ""
     if proofread_package:
         prompts = load_prompts(config, package=proofread_package)
         batch_summaries = [
@@ -1105,6 +1107,7 @@ async def compose_summary_docs(
                 max_rounds=1,
             )
             proofread_output = str(pr_stats.get("proofread_output") or "").strip()
+            proofread_feedback = str(pr_stats.get("proofread_feedback") or "").strip()
             proofread_applied = int(bool(proofread_output)) > 0
             is_valid, reason = _validate_composed_rewrite(
                 merged_without_ingress, revised_candidate
@@ -1116,6 +1119,7 @@ async def compose_summary_docs(
                     != merged_without_ingress.strip()
                 )
             else:
+                ignored_revised_summary = str(revised_candidate or "").strip()
                 logger.warning(
                     "compose_summary_docs: ignorerar proofread/revise-resultat (%s): %r",
                     reason,
@@ -1183,6 +1187,7 @@ async def compose_summary_docs(
         "to": overall_to,
         "overview": ingress_text or "",
         "summary": final_summary,
+        "proofread_feedback": proofread_feedback,
         "sections": [
             {
                 "tag": s["tag"],
@@ -1207,6 +1212,8 @@ async def compose_summary_docs(
             "lookback": lookback,
         },
     }
+    if ignored_revised_summary:
+        summary_doc["revised_summary"] = ignored_revised_summary
 
     return _require_summary_doc_id(
         _persist_summary_doc(store, summary_doc),
