@@ -65,7 +65,8 @@ class FallbackLLMClient:
       - Kör första provider i listan.
       - Vid LLMRateLimitError/LLMUnavailableError:
           * vänta + retry upp till max_quota_retries
-          * om problemet kvarstår, växla permanent till nästa provider i listan
+          * vid LLMUnavailableError: prova nästa provider endast för aktuellt anrop
+          * vid LLMRateLimitError: växla permanent till nästa provider i listan
       - Finns ingen nästa provider: bubbla felet.
     """
 
@@ -75,27 +76,42 @@ class FallbackLLMClient:
         self.clients = clients
         self.policy = policy or FallbackPolicy()
         self._active_idx = 0
+        self._blocked_indices: set[int] = set()
 
-    def _try_advance_provider(self, reason: str) -> bool:
-        if self._active_idx >= (len(self.clients) - 1):
-            return False
-        old_i = self._active_idx
-        self._active_idx += 1
+    def _next_provider_idx(self, start_idx: int) -> Optional[int]:
+        for idx in range(max(0, start_idx), len(self.clients)):
+            if idx not in self._blocked_indices:
+                return idx
+        return None
+
+    def _try_advance_provider_permanently(self, current_idx: int, reason: str) -> Optional[int]:
+        self._blocked_indices.add(current_idx)
+        next_idx = self._next_provider_idx(current_idx + 1)
+
+        if next_idx is None:
+            return None
+
+        old_i = current_idx
+        if self._active_idx == current_idx:
+            self._active_idx = next_idx
         log.warning(
-            "LLM %s efter %d retry(s). Växlar provider %d/%d -> %d/%d.",
+            "LLM %s efter %d retry(s). Växlar permanent provider %d/%d -> %d/%d.",
             reason,
             self.policy.max_quota_retries,
             old_i + 1,
             len(self.clients),
-            self._active_idx + 1,
+            next_idx + 1,
             len(self.clients),
         )
-        return True
+        return next_idx
 
     async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str:
+        provider_idx = self._next_provider_idx(self._active_idx)
+        if provider_idx is None:
+            raise RuntimeError("Ingen LLM-provider tillgänglig; samtliga providers är permanent blockerade.")
+
         while True:
-            active_idx = min(self._active_idx, len(self.clients) - 1)
-            active = self.clients[active_idx]
+            active = self.clients[provider_idx]
 
             attempt = 0
             while True:
@@ -106,16 +122,24 @@ class FallbackLLMClient:
                     wait_s = int(self.policy.default_wait_s)
 
                     if attempt > self.policy.max_quota_retries:
-                        # Växla endast om vi fortfarande är på samma provider.
-                        if self._active_idx == active_idx and self._try_advance_provider("otillgänglig"):
-                            break
-                        if self._active_idx > active_idx:
+                        next_idx = self._next_provider_idx(provider_idx + 1)
+                        if next_idx is not None:
+                            log.warning(
+                                "LLM otillgänglig efter %d retry(s). "
+                                "Provar nästa provider %d/%d -> %d/%d för aktuellt anrop.",
+                                self.policy.max_quota_retries,
+                                provider_idx + 1,
+                                len(self.clients),
+                                next_idx + 1,
+                                len(self.clients),
+                            )
+                            provider_idx = next_idx
                             break
                         raise
 
                     log.warning(
                         "LLM provider %d/%d otillgänglig, %s.\n (attempt %d/%d) Väntar %ss och retry...",
-                        active_idx + 1,
+                        provider_idx + 1,
                         len(self.clients),
                         e,
                         attempt,
@@ -128,18 +152,17 @@ class FallbackLLMClient:
                     wait_s = int(e.retry_after_seconds or self.policy.default_wait_s)
 
                     if attempt > self.policy.max_quota_retries:
-                        # Växla endast om vi fortfarande är på samma provider.
-                        if self._active_idx == active_idx and self._try_advance_provider(
-                            "quota/rate-limit"
-                        ):
-                            break
-                        if self._active_idx > active_idx:
+                        next_idx = self._try_advance_provider_permanently(
+                            provider_idx, "quota/rate-limit"
+                        )
+                        if next_idx is not None:
+                            provider_idx = next_idx
                             break
                         raise
 
                     log.warning(
                         "LLM provider %d/%d rate-limited (attempt %d/%d). Väntar %ss och retry...",
-                        active_idx + 1,
+                        provider_idx + 1,
                         len(self.clients),
                         attempt,
                         self.policy.max_quota_retries,
