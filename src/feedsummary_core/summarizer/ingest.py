@@ -39,7 +39,9 @@ import feedparser
 import trafilatura
 from aiolimiter import AsyncLimiter
 from tenacity import (
+    RetryError,
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential_jitter,
@@ -157,18 +159,38 @@ async def fetch_article_html(url: str, session: aiohttp.ClientSession, timeout_s
             retry_after = float(ra) if ra and ra.isdigit() else None
             body = await resp.text(errors="ignore")
             raise RateLimitError(429, retry_after=retry_after, body=body[:500])
+
+        # Non-retriable client errors should be skipped immediately to avoid wasted retries
+        if 400 <= resp.status < 500:
+            body = await resp.text(errors="ignore")
+            raise aiohttp.ClientResponseError(
+                request_info=resp.request_info,
+                history=resp.history,
+                status=resp.status,
+                message=f"HTTP {resp.status} client error",
+                headers=resp.headers,
+            )
+
         resp.raise_for_status()
         return await resp.text(errors="ignore")
+
+
+def _is_transient_article_error(exc: BaseException) -> bool:
+    """Retry only on transient fetch errors, not permanent client errors like 404."""
+    if isinstance(exc, RateLimitError):
+        return True
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return 500 <= exc.status < 600
+    return isinstance(exc, aiohttp.ClientError)
 
 
 @retry(
     wait=wait_exponential_jitter(initial=1, max=30),
     stop=stop_after_attempt(6),
-    retry=(
-        retry_if_exception_type(RateLimitError)
-        | retry_if_exception_type(aiohttp.ClientError)
-        | retry_if_exception_type(asyncio.TimeoutError)
-    ),
+    retry=retry_if_exception(_is_transient_article_error),
+    reraise=True,
 )
 async def guarded_fetch_article(url: str, session: aiohttp.ClientSession, timeout_s: int) -> str:
     """Fetch an article with retry handling for rate limits and transient HTTP issues."""
@@ -329,6 +351,15 @@ async def gather_articles_to_store(
                             updated += 1
 
                 except Exception as e:
-                    logger.warning(f"Artikel misslyckades: {link} -> {e}")
+                    if isinstance(e, RetryError) and e.last_attempt:
+                        last = e.last_attempt.exception()
+                        logger.warning(
+                            "Artikel misslyckades: %s -> %s (efter flera försök, sista=%s)",
+                            link,
+                            e,
+                            last,
+                        )
+                    else:
+                        logger.warning("Artikel misslyckades: %s -> %s", link, e)
     logger.info(f"Articles: {str(inserted)} inserted, {str(updated)} updated")
     return inserted, updated
