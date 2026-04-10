@@ -42,6 +42,7 @@ from feedsummary_core.summarizer.helpers import trim_text_tail_by_words
 
 logger = logging.getLogger("FeedSummarizer")
 
+
 def _primary_llm_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = get_primary_llm_config(config)
     return cfg if isinstance(cfg, dict) else {}

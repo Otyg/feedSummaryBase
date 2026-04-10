@@ -214,9 +214,7 @@ def _prepend_ingress(summary_text: str, ingress: Optional[str]) -> str:
 
 
 _PLACEHOLDER_BRACKET_RE = re.compile(r"\[[^\]\n]{3,120}\]")
-_PLACEHOLDER_LABEL_RE = re.compile(
-    r"(?im)^(rubrik|ingress|brödtext)\s*:\s*(.+)$"
-)
+_PLACEHOLDER_LABEL_RE = re.compile(r"(?im)^(rubrik|ingress|brödtext)\s*:\s*(.+)$")
 
 
 def _looks_like_placeholder_template(text: str) -> bool:
@@ -782,6 +780,13 @@ async def _summarize_and_persist_like_refresh(
                 "trims": int(stats.get("trims") or 0),
                 "drops": int(stats.get("drops") or 0),
                 "meta_budget_tokens": int(stats.get("meta_budget_tokens") or 0),
+                "proofread_rounds": int(stats.get("proofread_rounds") or 0),
+                "proofread_round_metrics": list(stats.get("proofread_round_metrics") or []),
+                "revise_operations_requested": int(stats.get("revise_operations_requested") or 0),
+                "revise_operations_applied": int(stats.get("revise_operations_applied") or 0),
+                "revise_operations_skipped": int(stats.get("revise_operations_skipped") or 0),
+                "revise_blocked_count": int(stats.get("revise_blocked_count") or 0),
+                "retention_ratio": float(stats.get("retention_ratio") or 1.0),
             },
             "selection": dict(selection or {}),
         }
@@ -894,6 +899,21 @@ async def _summarize_and_persist_like_refresh(
                     "trims": int(topic_stats.get("trims") or 0),
                     "drops": int(topic_stats.get("drops") or 0),
                     "meta_budget_tokens": int(topic_stats.get("meta_budget_tokens") or 0),
+                    "proofread_rounds": int(topic_stats.get("proofread_rounds") or 0),
+                    "proofread_round_metrics": list(
+                        topic_stats.get("proofread_round_metrics") or []
+                    ),
+                    "revise_operations_requested": int(
+                        topic_stats.get("revise_operations_requested") or 0
+                    ),
+                    "revise_operations_applied": int(
+                        topic_stats.get("revise_operations_applied") or 0
+                    ),
+                    "revise_operations_skipped": int(
+                        topic_stats.get("revise_operations_skipped") or 0
+                    ),
+                    "revise_blocked_count": int(topic_stats.get("revise_blocked_count") or 0),
+                    "retention_ratio": float(topic_stats.get("retention_ratio") or 1.0),
                 },
             }
         )
@@ -1109,15 +1129,12 @@ async def compose_summary_docs(
             proofread_output = str(pr_stats.get("proofread_output") or "").strip()
             proofread_feedback = str(pr_stats.get("proofread_feedback") or "").strip()
             proofread_applied = int(bool(proofread_output)) > 0
-            is_valid, reason = _validate_composed_rewrite(
-                merged_without_ingress, revised_candidate
-            )
+            is_valid, reason = _validate_composed_rewrite(merged_without_ingress, revised_candidate)
             if is_valid:
                 revised_summary_body = revised_candidate
                 revise_applied = (
-                    (revised_summary_body or "").strip()
-                    != merged_without_ingress.strip()
-                )
+                    revised_summary_body or ""
+                ).strip() != merged_without_ingress.strip()
             else:
                 ignored_revised_summary = str(revised_candidate or "").strip()
                 logger.warning(

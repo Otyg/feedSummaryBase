@@ -35,6 +35,7 @@
 # ----------------------------
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -76,6 +77,8 @@ from feedsummary_core.summarizer.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
 
 def _primary_llm_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -298,42 +301,300 @@ def _insert_system_note_before_sources(meta_text: str, system_note: str) -> str:
     return f"{before}\n\n{note}\n\n{after}".strip() + "\n"
 
 
+def _extract_json_payload(raw: str) -> Optional[Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    with_fence = _JSON_FENCE_RE.findall(text)
+    candidates = [*with_fence, text]
+    for c in candidates:
+        candidate = str(c or "").strip()
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # Best-effort: parse the broadest JSON object/array in the response.
+    starts = [i for i, ch in enumerate(text) if ch in "[{"]
+    ends = [i for i, ch in enumerate(text) if ch in "]}"]
+    if not starts or not ends:
+        return None
+    for s in starts:
+        for e in reversed(ends):
+            if e <= s:
+                continue
+            snippet = text[s : e + 1]
+            try:
+                return json.loads(snippet)
+            except Exception:
+                continue
+    return None
+
+
+def _coverage_ratio(total_text: str, included_text: str) -> float:
+    total_len = len(str(total_text or ""))
+    if total_len <= 0:
+        return 1.0
+    inc_len = len(str(included_text or ""))
+    return max(0.0, min(1.0, float(inc_len) / float(total_len)))
+
+
+def _coerce_issue(raw_issue: Any, idx: int) -> Dict[str, str]:
+    issue = raw_issue if isinstance(raw_issue, dict) else {}
+    issue_id = str(issue.get("issue_id") or f"issue_{idx}").strip() or f"issue_{idx}"
+    issue_type = str(issue.get("type") or "unspecified").strip() or "unspecified"
+    target_quote = str(issue.get("target_quote") or "").strip()
+    action = str(issue.get("action") or "").strip()
+    preserve_requirement = str(issue.get("preserve_requirement") or "").strip()
+    return {
+        "issue_id": issue_id,
+        "type": issue_type,
+        "target_quote": target_quote,
+        "action": action,
+        "preserve_requirement": preserve_requirement,
+    }
+
+
+def _parse_proofread_feedback(raw: str) -> Dict[str, Any]:
+    parsed = _extract_json_payload(raw)
+    fallback = {
+        "status": "REVISE",
+        "issues": [],
+        "raw": str(raw or "").strip(),
+        "is_structured": False,
+    }
+    if isinstance(parsed, list):
+        issues = [_coerce_issue(x, i) for i, x in enumerate(parsed, start=1)]
+        fallback["issues"] = issues
+        fallback["is_structured"] = True
+        return fallback
+
+    if not isinstance(parsed, dict):
+        txt = str(raw or "").strip()
+        if txt.upper().startswith("PASS"):
+            return {
+                "status": "PASS",
+                "issues": [],
+                "raw": txt,
+                "is_structured": False,
+            }
+        return fallback
+
+    status = str(parsed.get("status") or parsed.get("result") or "REVISE").strip().upper()
+    if status not in {"PASS", "REVISE"}:
+        status = "REVISE"
+    raw_issues = parsed.get("issues")
+    issues: List[Dict[str, str]] = []
+    if isinstance(raw_issues, list):
+        issues = [_coerce_issue(x, i) for i, x in enumerate(raw_issues, start=1)]
+    return {
+        "status": status,
+        "issues": issues,
+        "raw": str(raw or "").strip(),
+        "is_structured": True,
+    }
+
+
+def _coerce_op(raw_op: Any, idx: int) -> Dict[str, str]:
+    op = raw_op if isinstance(raw_op, dict) else {}
+    op_type = str(op.get("op") or op.get("operation") or "").strip().lower()
+    if op_type not in {"replace", "delete", "insert_after"}:
+        op_type = "replace"
+    issue_id = str(op.get("issue_id") or f"issue_{idx}").strip() or f"issue_{idx}"
+    target_quote = str(op.get("target_quote") or "").strip()
+    text_value = str(op.get("text") or op.get("replacement") or op.get("content") or "").strip()
+    return {
+        "op": op_type,
+        "issue_id": issue_id,
+        "target_quote": target_quote,
+        "text": text_value,
+    }
+
+
+def _parse_revise_ops(raw: str) -> Dict[str, Any]:
+    parsed = _extract_json_payload(raw)
+    out = {
+        "operations": [],
+        "raw": str(raw or "").strip(),
+        "is_structured": False,
+    }
+    if isinstance(parsed, list):
+        out["operations"] = [_coerce_op(x, i) for i, x in enumerate(parsed, start=1)]
+        out["is_structured"] = True
+        return out
+    if not isinstance(parsed, dict):
+        return out
+
+    raw_ops = parsed.get("operations")
+    if isinstance(raw_ops, list):
+        out["operations"] = [_coerce_op(x, i) for i, x in enumerate(raw_ops, start=1)]
+        out["is_structured"] = True
+    return out
+
+
+def _apply_revise_operations(base_text: str, operations: List[Dict[str, str]]) -> Dict[str, Any]:
+    text = str(base_text or "")
+    applied = 0
+    skipped = 0
+    explicit_delete_chars = 0
+    for op in operations:
+        target = str(op.get("target_quote") or "")
+        op_type = str(op.get("op") or "")
+        replacement = str(op.get("text") or "")
+        if not target:
+            skipped += 1
+            continue
+        idx = text.find(target)
+        if idx < 0:
+            skipped += 1
+            continue
+        end = idx + len(target)
+
+        if op_type == "replace":
+            text = text[:idx] + replacement + text[end:]
+            applied += 1
+        elif op_type == "delete":
+            text = text[:idx] + text[end:]
+            applied += 1
+            explicit_delete_chars += len(target)
+        elif op_type == "insert_after":
+            if replacement:
+                text = text[:end] + replacement + text[end:]
+                applied += 1
+            else:
+                skipped += 1
+        else:
+            skipped += 1
+
+    return {
+        "text": text.strip(),
+        "applied_count": applied,
+        "skipped_count": skipped,
+        "explicit_delete_chars": explicit_delete_chars,
+    }
+
+
+def _retention_guard(
+    *,
+    previous_text: str,
+    candidate_text: str,
+    explicit_delete_chars: int,
+    min_retention_ratio: float,
+) -> Dict[str, Any]:
+    prev = str(previous_text or "")
+    cand = str(candidate_text or "")
+    prev_len = len(prev)
+    cand_len = len(cand)
+    if prev_len <= 0:
+        return {
+            "accepted": True,
+            "retention_ratio": 1.0,
+            "lost_chars": 0,
+            "explicit_delete_chars": int(explicit_delete_chars or 0),
+            "reason": "accepted_no_previous_text",
+        }
+
+    lost_chars = max(0, prev_len - cand_len)
+    ratio = max(0.0, min(1.0, float(cand_len) / float(prev_len)))
+
+    if ratio >= min_retention_ratio:
+        return {
+            "accepted": True,
+            "retention_ratio": ratio,
+            "lost_chars": lost_chars,
+            "explicit_delete_chars": int(explicit_delete_chars or 0),
+            "reason": "accepted_ratio",
+        }
+
+    # If we lost a lot of text, require explicit delete coverage for the loss.
+    required_explicit_deletes = int(lost_chars * 0.5)
+    if int(explicit_delete_chars or 0) < required_explicit_deletes:
+        return {
+            "accepted": False,
+            "retention_ratio": ratio,
+            "lost_chars": lost_chars,
+            "explicit_delete_chars": int(explicit_delete_chars or 0),
+            "reason": "blocked_large_loss_without_delete_ops",
+        }
+
+    return {
+        "accepted": True,
+        "retention_ratio": ratio,
+        "lost_chars": lost_chars,
+        "explicit_delete_chars": int(explicit_delete_chars or 0),
+        "reason": "accepted_delete_justified",
+    }
+
+
 def _budgeted_proofread_user(
     *,
     prompts: Dict[str, Any],
     draft_summary: str,
     desk_underlag: str,
+    feedback: str,
     lookback: str,
     budget_tokens: int,
     chars_per_token: float,
-) -> str:
+) -> Tuple[str, Dict[str, Any]]:
     """
     Build proofread user prompt using prompts['proofread_user_template'].
     Template must accept:
       - {lookback}
       - {draft_summary}
       - {desk_underlag}
-    We budget by trimming desk_underlag first, then (if needed) draft_summary.
+    We budget by trimming desk_underlag first, then feedback, then draft_summary last.
     """
     tmpl = str(prompts.get("proofread_user_template") or "").strip()
     if not tmpl:
         raise KeyError("proofread_user_template")
 
+    min_cov = float(((prompts.get("_runtime") or {}).get("proofread_min_draft_coverage") or 0.8))
+    min_cov = max(0.1, min(1.0, min_cov))
+
     d_under = desk_underlag or ""
     d_draft = (draft_summary or "").strip()
+    d_fb = (feedback or "").strip()
+    est = 0
 
-    for _ in range(10):
-        user = tmpl.format(lookback=lookback, draft_summary=d_draft, desk_underlag=d_under)
+    for _ in range(14):
+        user = tmpl.format(
+            lookback=lookback,
+            draft_summary=d_draft,
+            desk_underlag=d_under,
+            feedback=d_fb,
+        )
         est = _est_user_tokens(user, chars_per_token)
         if est <= budget_tokens:
-            return user
+            return user, {
+                "est_tokens": est,
+                "draft_total_chars": len(str(draft_summary or "")),
+                "draft_included_chars": len(d_draft),
+                "draft_coverage": _coverage_ratio(draft_summary, d_draft),
+                "desk_total_chars": len(str(desk_underlag or "")),
+                "desk_included_chars": len(d_under),
+                "feedback_total_chars": len(str(feedback or "")),
+                "feedback_included_chars": len(d_fb),
+            }
 
         # trim desk_underlag first
-        if len(d_under) > 2000:
+        if len(d_under) > 1200:
             d_under = d_under[: max(1200, int(len(d_under) * 0.85))]
             continue
 
-        # then trim draft
+        # then trim feedback
+        if len(d_fb) > 600:
+            d_fb = d_fb[: max(600, int(len(d_fb) * 0.85))]
+            continue
+
+        # and draft only as last resort, with coverage floor
+        if len(d_draft) > 600:
+            next_len = max(600, int(len(d_draft) * 0.9))
+            if _coverage_ratio(draft_summary, d_draft[:next_len]) >= min_cov:
+                d_draft = d_draft[:next_len]
+                continue
+
         if len(d_draft) > 1200:
             d_draft = d_draft[: max(800, int(len(d_draft) * 0.85))]
             continue
@@ -341,9 +602,31 @@ def _budgeted_proofread_user(
         break
 
     # last resort hard truncate
-    d_under = d_under[:2000]
-    d_draft = d_draft[:1200]
-    return tmpl.format(lookback=lookback, draft_summary=d_draft, desk_underlag=d_under)
+    d_under = d_under[:1200]
+    d_fb = d_fb[:600]
+    if _coverage_ratio(draft_summary, d_draft) < min_cov and len(d_draft) > 600:
+        # Keep as much draft as possible; if this still exceeds budget, caller can decide
+        # whether a weak-coverage round should be accepted.
+        d_draft = d_draft[: max(600, int(len(d_draft) * 0.95))]
+    else:
+        d_draft = d_draft[:1200]
+    user = tmpl.format(
+        lookback=lookback,
+        draft_summary=d_draft,
+        desk_underlag=d_under,
+        feedback=d_fb,
+    )
+    est = _est_user_tokens(user, chars_per_token)
+    return user, {
+        "est_tokens": est,
+        "draft_total_chars": len(str(draft_summary or "")),
+        "draft_included_chars": len(d_draft),
+        "draft_coverage": _coverage_ratio(draft_summary, d_draft),
+        "desk_total_chars": len(str(desk_underlag or "")),
+        "desk_included_chars": len(d_under),
+        "feedback_total_chars": len(str(feedback or "")),
+        "feedback_included_chars": len(d_fb),
+    }
 
 
 def _budgeted_revise_user(
@@ -355,7 +638,7 @@ def _budgeted_revise_user(
     lookback: str,
     budget_tokens: int,
     chars_per_token: float,
-) -> str:
+) -> Tuple[str, Dict[str, Any]]:
     """
     Build revise user prompt using prompts['revise_user_template'].
     Template must accept:
@@ -363,17 +646,21 @@ def _budgeted_revise_user(
       - {draft_summary}
       - {desk_underlag}
       - {feedback}
-    Budget by trimming desk_underlag first, then draft_summary, then feedback.
+    Budget by trimming desk_underlag first, then feedback, then draft_summary last.
     """
     tmpl = str(prompts.get("revise_user_template") or "").strip()
     if not tmpl:
         raise KeyError("revise_user_template")
 
+    min_cov = float(((prompts.get("_runtime") or {}).get("revise_min_draft_coverage") or 1.0))
+    min_cov = max(0.1, min(1.0, min_cov))
+
     d_under = desk_underlag or ""
     d_draft = (draft_summary or "").strip()
     d_fb = (feedback or "").strip()
+    est = 0
 
-    for _ in range(10):
+    for _ in range(14):
         user = tmpl.format(
             lookback=lookback,
             draft_summary=d_draft,
@@ -382,28 +669,53 @@ def _budgeted_revise_user(
         )
         est = _est_user_tokens(user, chars_per_token)
         if est <= budget_tokens:
-            return user
+            return user, {
+                "est_tokens": est,
+                "draft_total_chars": len(str(draft_summary or "")),
+                "draft_included_chars": len(d_draft),
+                "draft_coverage": _coverage_ratio(draft_summary, d_draft),
+                "desk_total_chars": len(str(desk_underlag or "")),
+                "desk_included_chars": len(d_under),
+                "feedback_total_chars": len(str(feedback or "")),
+                "feedback_included_chars": len(d_fb),
+            }
 
-        if len(d_under) > 2000:
+        if len(d_under) > 1200:
             d_under = d_under[: max(1200, int(len(d_under) * 0.85))]
             continue
+        if len(d_fb) > 600:
+            d_fb = d_fb[: max(600, int(len(d_fb) * 0.85))]
+            continue
+        if len(d_draft) > 600:
+            next_len = max(600, int(len(d_draft) * 0.92))
+            if _coverage_ratio(draft_summary, d_draft[:next_len]) >= min_cov:
+                d_draft = d_draft[:next_len]
+                continue
         if len(d_draft) > 1200:
             d_draft = d_draft[: max(800, int(len(d_draft) * 0.85))]
             continue
-        if len(d_fb) > 1000:
-            d_fb = d_fb[: max(600, int(len(d_fb) * 0.85))]
-            continue
         break
 
-    d_under = d_under[:2000]
+    d_under = d_under[:1200]
+    d_fb = d_fb[:600]
     d_draft = d_draft[:1200]
-    d_fb = d_fb[:800]
-    return tmpl.format(
+    user = tmpl.format(
         lookback=lookback,
         draft_summary=d_draft,
         desk_underlag=d_under,
         feedback=d_fb,
     )
+    est = _est_user_tokens(user, chars_per_token)
+    return user, {
+        "est_tokens": est,
+        "draft_total_chars": len(str(draft_summary or "")),
+        "draft_included_chars": len(d_draft),
+        "draft_coverage": _coverage_ratio(draft_summary, d_draft),
+        "desk_total_chars": len(str(desk_underlag or "")),
+        "desk_included_chars": len(d_under),
+        "feedback_total_chars": len(str(feedback or "")),
+        "feedback_included_chars": len(d_fb),
+    }
 
 
 async def _proofread_and_revise_meta_with_stats(
@@ -447,6 +759,34 @@ async def _proofread_and_revise_meta_with_stats(
     batching = config.get("batching", {}) or {}
     pr_budget_cfg = int(batching.get("proofread_budget_tokens") or 0)
     budget_tokens = pr_budget_cfg if pr_budget_cfg > 0 else max(512, max_ctx - max_out - margin)
+    proofread_min_cov = float(batching.get("proofread_min_draft_coverage") or 0.8)
+    revise_min_cov = float(batching.get("revise_min_draft_coverage") or 1.0)
+    min_pass_cov = float(batching.get("proofread_pass_min_coverage") or proofread_min_cov)
+    min_retention_ratio = float(batching.get("revise_min_retention_ratio") or 0.7)
+    proofread_min_cov = max(0.1, min(1.0, proofread_min_cov))
+    revise_min_cov = max(0.1, min(1.0, revise_min_cov))
+    min_pass_cov = max(0.1, min(1.0, min_pass_cov))
+    min_retention_ratio = max(0.1, min(1.0, min_retention_ratio))
+
+    prompts_runtime = dict(prompts)
+    prompts_runtime["_runtime"] = {
+        "proofread_min_draft_coverage": proofread_min_cov,
+        "revise_min_draft_coverage": revise_min_cov,
+    }
+
+    proof_sys = (
+        proof_sys.strip() + "\n\nDu MASTE svara med JSON (inga forklaringar utanfor JSON). "
+        'Schema: {"status":"PASS|REVISE","issues":[{"issue_id":"...",'
+        '"type":"...","target_quote":"...","action":"...",'
+        '"preserve_requirement":"..."}]}. '
+        "Anvand issue_id for varje issue."
+    )
+    rev_sys = (
+        rev_sys.strip() + "\n\nDu MASTE svara med JSON (inga forklaringar utanfor JSON). "
+        'Schema: {"operations":[{"op":"replace|delete|insert_after",'
+        '"issue_id":"...","target_quote":"...","text":"..."}]}. '
+        "Lamna operations tom om inga andringar kravs."
+    )
 
     # Desk-underlag: batch-summaries + (valfritt) källor-lista
     # (batch_summaries innehåller redan SOURCES-rader; sources_text är en kompletterande lista)
@@ -462,17 +802,23 @@ async def _proofread_and_revise_meta_with_stats(
 
     text = (meta_text or "").strip()
     last_feedback = ""
-    last_revised = ""
+    last_revised = text
+    proofread_round_metrics: List[Dict[str, Any]] = []
+    total_ops_applied = 0
+    total_ops_requested = 0
+    total_ops_skipped = 0
+    blocked_revisions = 0
     rounds = 0
 
     for r in range(1, max_rounds + 1):
         rounds = r
         set_job(f"Korrekturläser sammanfattning ({r}/{max_rounds})...", job_id, store)
 
-        user = _budgeted_proofread_user(
-            prompts=prompts,
+        user, proof_budget = _budgeted_proofread_user(
+            prompts=prompts_runtime,
             draft_summary=text,
             desk_underlag=desk_underlag,
+            feedback=last_feedback,
             lookback=lookback,
             budget_tokens=budget_tokens,
             chars_per_token=chars_per_token,
@@ -482,42 +828,163 @@ async def _proofread_and_revise_meta_with_stats(
             [{"role": "system", "content": proof_sys}, {"role": "user", "content": user}],
             temperature=0.2,
         )
-        crit_s = (crit or "").strip()
+        crit_s = str(crit or "").strip()
+        parsed_feedback = _parse_proofread_feedback(crit_s)
+        status = str(parsed_feedback.get("status") or "REVISE").upper()
+        issues = parsed_feedback.get("issues") or []
+        if not isinstance(issues, list):
+            issues = []
+        last_feedback = json.dumps(
+            {"status": status, "issues": issues},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        proof_cov = float(proof_budget.get("draft_coverage") or 0.0)
 
-        if crit_s.upper().startswith("PASS"):
-            return text, {
-                "proofread_enabled": 1,
-                "proofread_rounds": r,
-                "proofread_output": "PASS",
-                "proofread_feedback": clip_text(last_feedback, 8000),
-                "proofread_last_feedback": last_feedback,
-                "revised_summary": last_revised,
-            }
+        round_metric: Dict[str, Any] = {
+            "round": r,
+            "proofread_input_est_tokens": int(proof_budget.get("est_tokens") or 0),
+            "proofread_draft_coverage": proof_cov,
+            "proofread_draft_included_chars": int(proof_budget.get("draft_included_chars") or 0),
+            "proofread_draft_total_chars": int(proof_budget.get("draft_total_chars") or 0),
+            "proofread_feedback_structured": int(bool(parsed_feedback.get("is_structured"))),
+            "proofread_status": status,
+        }
 
-        last_feedback = crit_s
+        if status == "PASS":
+            if proof_cov >= min_pass_cov:
+                proofread_round_metrics.append(round_metric)
+                return text, {
+                    "proofread_enabled": 1,
+                    "proofread_rounds": r,
+                    "proofread_output": "PASS",
+                    "proofread_feedback": clip_text(last_feedback, 8000),
+                    "proofread_last_feedback": last_feedback,
+                    "revised_summary": last_revised,
+                    "proofread_round_metrics": proofread_round_metrics,
+                    "revise_operations_requested": int(total_ops_requested),
+                    "revise_operations_applied": int(total_ops_applied),
+                    "revise_operations_skipped": int(total_ops_skipped),
+                    "revise_blocked_count": int(blocked_revisions),
+                    "retention_ratio": _retention_guard(
+                        previous_text=meta_text,
+                        candidate_text=text,
+                        explicit_delete_chars=0,
+                        min_retention_ratio=0.0,
+                    ).get("retention_ratio", 1.0),
+                }
+            # Weak PASS due to low draft coverage: treat as non-pass and continue.
+            parsed_feedback["issues"] = [
+                {
+                    "issue_id": f"coverage_{r}",
+                    "type": "coverage",
+                    "target_quote": "",
+                    "action": (
+                        "Coverage too low for safe PASS. Return structured issues or request "
+                        "no-op revise operations."
+                    ),
+                    "preserve_requirement": "Do not omit unmentioned draft content.",
+                }
+            ]
+            last_feedback = json.dumps(
+                {"status": "REVISE", "issues": parsed_feedback["issues"]},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            round_metric["proofread_status"] = "PASS_REJECTED_LOW_COVERAGE"
+            round_metric["proofread_pass_min_coverage"] = min_pass_cov
 
         set_job(f"Reviderar sammanfattning ({r}/{max_rounds})...", job_id, store)
 
-        user2 = _budgeted_revise_user(
-            prompts=prompts,
+        user2, revise_budget = _budgeted_revise_user(
+            prompts=prompts_runtime,
             draft_summary=text,
             desk_underlag=desk_underlag,
-            feedback=crit_s,
+            feedback=last_feedback,
             lookback=lookback,
             budget_tokens=budget_tokens,
             chars_per_token=chars_per_token,
         )
 
-        revised = await llm.chat(
+        revised_raw = await llm.chat(
             [{"role": "system", "content": rev_sys}, {"role": "user", "content": user2}],
             temperature=0.2,
         )
-        revised_s = (revised or "").strip()
-        if revised_s:
-            last_revised = revised_s
-            text = revised_s
+        revised_s = str(revised_raw or "").strip()
+        parsed_ops = _parse_revise_ops(revised_s)
+        ops = parsed_ops.get("operations") or []
+        if not isinstance(ops, list):
+            ops = []
+        total_ops_requested += len(ops)
+
+        patched = _apply_revise_operations(text, ops)
+        candidate_text = str(patched.get("text") or "").strip()
+        ops_applied = int(patched.get("applied_count") or 0)
+        ops_skipped = int(patched.get("skipped_count") or 0)
+        explicit_delete_chars = int(patched.get("explicit_delete_chars") or 0)
+
+        total_ops_applied += ops_applied
+        total_ops_skipped += ops_skipped
+
+        guard = _retention_guard(
+            previous_text=text,
+            candidate_text=candidate_text,
+            explicit_delete_chars=explicit_delete_chars,
+            min_retention_ratio=min_retention_ratio,
+        )
+
+        revise_cov = float(revise_budget.get("draft_coverage") or 0.0)
+        round_metric.update(
+            {
+                "revise_input_est_tokens": int(revise_budget.get("est_tokens") or 0),
+                "revise_draft_coverage": revise_cov,
+                "revise_draft_included_chars": int(revise_budget.get("draft_included_chars") or 0),
+                "revise_draft_total_chars": int(revise_budget.get("draft_total_chars") or 0),
+                "revise_ops_requested": len(ops),
+                "revise_ops_applied": ops_applied,
+                "revise_ops_skipped": ops_skipped,
+                "revise_structured": int(bool(parsed_ops.get("is_structured"))),
+                "retention_ratio": float(guard.get("retention_ratio") or 0.0),
+                "lost_chars": int(guard.get("lost_chars") or 0),
+                "explicit_delete_chars": int(guard.get("explicit_delete_chars") or 0),
+                "retention_reason": str(guard.get("reason") or ""),
+            }
+        )
+
+        coverage_ok = revise_cov >= revise_min_cov
+        guard_ok = bool(guard.get("accepted"))
+        if candidate_text and coverage_ok and guard_ok:
+            last_revised = candidate_text
+            text = candidate_text
+        else:
+            blocked_revisions += 1
+            if not coverage_ok:
+                round_metric["revise_blocked"] = "low_draft_coverage"
+                round_metric["revise_required_min_coverage"] = revise_min_cov
+            elif not guard_ok:
+                round_metric["revise_blocked"] = str(guard.get("reason") or "retention_guard")
+            else:
+                round_metric["revise_blocked"] = "empty_candidate"
+
+        proofread_round_metrics.append(round_metric)
+
+        logger.info(
+            "Proofread/revise round %s: proof_cov=%.3f revise_cov=%.3f ops=%s/%s retention=%.3f",
+            r,
+            proof_cov,
+            revise_cov,
+            ops_applied,
+            len(ops),
+            float(round_metric.get("retention_ratio") or 0.0),
+        )
 
     # Reached max rounds; keep last feedback as "output"
+    final_retention = _retention_guard(
+        previous_text=meta_text,
+        candidate_text=text,
+        explicit_delete_chars=0,
+        min_retention_ratio=0.0,
+    )
     return text, {
         "proofread_enabled": 1,
         "proofread_rounds": rounds,
@@ -525,6 +992,12 @@ async def _proofread_and_revise_meta_with_stats(
         "proofread_feedback": clip_text(last_feedback, 8000),
         "proofread_last_feedback": last_feedback,
         "revised_summary": last_revised,
+        "proofread_round_metrics": proofread_round_metrics,
+        "revise_operations_requested": int(total_ops_requested),
+        "revise_operations_applied": int(total_ops_applied),
+        "revise_operations_skipped": int(total_ops_skipped),
+        "revise_blocked_count": int(blocked_revisions),
+        "retention_ratio": float(final_retention.get("retention_ratio") or 1.0),
     }
 
 
@@ -1070,6 +1543,14 @@ async def summarize_batches_then_meta_with_stats(
                 "proofread_feedback": str(pr_stats.get("proofread_feedback") or ""),
                 "proofread_last_feedback": str(pr_stats.get("proofread_last_feedback") or ""),
                 "revised_summary": str(pr_stats.get("revised_summary") or ""),
+                "proofread_round_metrics": list(pr_stats.get("proofread_round_metrics") or []),
+                "revise_operations_requested": int(
+                    pr_stats.get("revise_operations_requested") or 0
+                ),
+                "revise_operations_applied": int(pr_stats.get("revise_operations_applied") or 0),
+                "revise_operations_skipped": int(pr_stats.get("revise_operations_skipped") or 0),
+                "revise_blocked_count": int(pr_stats.get("revise_blocked_count") or 0),
+                "retention_ratio": float(pr_stats.get("retention_ratio") or 1.0),
                 "batch_article_ids": _batch_article_ids_map(batches),
                 "done_batches": _done_batches_payload(done_map, batches),
                 "trims": trims_count,
@@ -1100,6 +1581,12 @@ async def summarize_batches_then_meta_with_stats(
         "proofread_rounds": int(pr_stats.get("proofread_rounds") or 0),
         "proofread_feedback": str(pr_stats.get("proofread_feedback") or ""),
         "revised_summary": str(pr_stats.get("revised_summary") or ""),
+        "proofread_round_metrics": list(pr_stats.get("proofread_round_metrics") or []),
+        "revise_operations_requested": int(pr_stats.get("revise_operations_requested") or 0),
+        "revise_operations_applied": int(pr_stats.get("revise_operations_applied") or 0),
+        "revise_operations_skipped": int(pr_stats.get("revise_operations_skipped") or 0),
+        "revise_blocked_count": int(pr_stats.get("revise_blocked_count") or 0),
+        "retention_ratio": float(pr_stats.get("retention_ratio") or 1.0),
     }
     return meta, stats
 
@@ -1223,6 +1710,13 @@ async def run_resume_and_persist_summary(
             "trims": int(stats.get("trims") or 0),
             "drops": int(stats.get("drops") or 0),
             "meta_budget_tokens": int(stats.get("meta_budget_tokens") or 0),
+            "proofread_rounds": int(stats.get("proofread_rounds") or 0),
+            "proofread_round_metrics": list(stats.get("proofread_round_metrics") or []),
+            "revise_operations_requested": int(stats.get("revise_operations_requested") or 0),
+            "revise_operations_applied": int(stats.get("revise_operations_applied") or 0),
+            "revise_operations_skipped": int(stats.get("revise_operations_skipped") or 0),
+            "revise_blocked_count": int(stats.get("revise_blocked_count") or 0),
+            "retention_ratio": float(stats.get("retention_ratio") or 1.0),
         },
     }
 

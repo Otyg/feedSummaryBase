@@ -108,7 +108,9 @@ class FallbackLLMClient:
     async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str:
         provider_idx = self._next_provider_idx(self._active_idx)
         if provider_idx is None:
-            raise RuntimeError("Ingen LLM-provider tillgänglig; samtliga providers är permanent blockerade.")
+            raise RuntimeError(
+                "Ingen LLM-provider tillgänglig; samtliga providers är permanent blockerade."
+            )
 
         while True:
             active = self.clients[provider_idx]
