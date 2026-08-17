@@ -37,7 +37,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from feedsummary_core.persistence import CleanupPolicy
 from feedsummary_core.persistence.helpers import classify_summary_doc
@@ -183,6 +183,38 @@ class SqliteStore:
                     summary    TEXT,
                     meta_json  TEXT
                 );
+                
+                CREATE TABLE IF NOT EXISTS tags (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT UNIQUE NOT NULL,
+                    category        TEXT DEFAULT 'GENERAL',
+                    description     TEXT,
+                    embedding_vector TEXT,
+                    created_at      INTEGER,
+                    updated_at      INTEGER
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_tags_name
+                    ON tags(name);
+                
+                CREATE INDEX IF NOT EXISTS idx_tags_category
+                    ON tags(category);
+                
+                CREATE TABLE IF NOT EXISTS article_tags (
+                    article_id TEXT NOT NULL,
+                    tag_id     INTEGER NOT NULL,
+                    created_at INTEGER,
+                    motivering TEXT,
+                    PRIMARY KEY (article_id, tag_id),
+                    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_article_tags_article
+                    ON article_tags(article_id);
+                
+                CREATE INDEX IF NOT EXISTS idx_article_tags_tag
+                    ON article_tags(tag_id);
+                
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_articles_url
                     ON articles(url)
                     WHERE url IS NOT NULL AND url != '';
@@ -769,5 +801,600 @@ class SqliteStore:
 
             con.commit()
             return removed
+        finally:
+            con.close()
+
+    # ============================================================================
+    # Tag management methods
+    # ============================================================================
+
+    def add_tag(
+        self,
+        name: str,
+        category: str = "GENERAL",
+        description: Optional[str] = None,
+    ) -> Optional[int]:
+        """Add a new tag (returns tag ID or None if it already exists)."""
+        if not name or not isinstance(name, str):
+            return None
+
+        name = name.strip().lower()
+        if not name:
+            return None
+
+        con = self._connect()
+        try:
+            # Try to insert
+            try:
+                cur = con.execute(
+                    """
+                    INSERT INTO tags (name, category, description, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (name, category, description, _now_ts(), _now_ts()),
+                )
+                con.commit()
+                return int(cur.lastrowid)  # type: ignore
+            except sqlite3.IntegrityError:
+                # Tag already exists, fetch and return its ID
+                row = con.execute(
+                    "SELECT id FROM tags WHERE name = ?",
+                    (name,),
+                ).fetchone()
+                if row:
+                    return int(row["id"])
+                return None
+        finally:
+            con.close()
+
+    def get_tag_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get a tag by name (case-insensitive)."""
+        if not name or not isinstance(name, str):
+            return None
+
+        name = name.strip().lower()
+        if not name:
+            return None
+
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT id, name, category, description, embedding_vector, created_at FROM tags WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if row:
+                tag_dict = {
+                    "id": int(row["id"]),
+                    "name": row["name"],
+                    "category": row["category"],
+                    "description": row["description"],
+                    "created_at": row["created_at"],
+                }
+                # Parse embedding_vector if present
+                embedding_str = row.get("embedding_vector")
+                if embedding_str:
+                    try:
+                        import json
+                        tag_dict["embedding_vector"] = json.loads(embedding_str)
+                    except Exception:
+                        pass
+                return tag_dict
+            return None
+        finally:
+            con.close()
+
+    def get_all_tags(self) -> List[Dict[str, Any]]:
+        """Get all tags."""
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT id, name, category, description, embedding_vector, created_at FROM tags ORDER BY name"
+            ).fetchall()
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                tag_dict = {
+                    "id": int(row["id"]),
+                    "name": row["name"],
+                    "category": row["category"],
+                    "description": row["description"],
+                    "created_at": row["created_at"],
+                }
+                # Parse embedding_vector if present
+                embedding_str = row.get("embedding_vector")
+                if embedding_str:
+                    try:
+                        import json
+                        tag_dict["embedding_vector"] = json.loads(embedding_str)
+                    except Exception:
+                        pass
+                out.append(tag_dict)
+            return out
+        finally:
+            con.close()
+
+    def add_article_tags(
+        self,
+        article_id: str,
+        tag_ids: List,  # Can be List[int] or List[Dict] with 'tag_id' and optional 'reasoning'
+    ) -> None:
+        """Add tags to an article (removes existing tags first).
+        
+        Args:
+            article_id: Article ID
+            tag_ids: List of tag IDs (int) or list of dicts with 'tag_id' and optional 'reasoning'
+        """
+        if not article_id or not tag_ids:
+            return
+
+        article_id = str(article_id).strip()
+        if not article_id:
+            return
+
+        con = self._connect()
+        try:
+            # Remove existing tags for this article
+            con.execute("DELETE FROM article_tags WHERE article_id = ?", (article_id,))
+
+            # Add new tags
+            now_ts = _now_ts()
+            for tag_entry in tag_ids:
+                # Handle both int (backward compatibility) and dict formats
+                if isinstance(tag_entry, dict):
+                    tag_id = tag_entry.get("tag_id") or tag_entry.get("id")
+                    reasoning = tag_entry.get("reasoning", "")
+                else:
+                    tag_id = int(tag_entry)
+                    reasoning = ""
+                
+                if not isinstance(tag_id, int) or tag_id <= 0:
+                    continue
+                
+                con.execute(
+                    """
+                    INSERT INTO article_tags (article_id, tag_id, created_at, motivering)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(article_id, tag_id) DO UPDATE SET motivering = excluded.motivering
+                    """,
+                    (article_id, tag_id, now_ts, reasoning if reasoning else None),
+                )
+
+            con.commit()
+        finally:
+            con.close()
+
+    def get_article_tags(self, article_id: str) -> List[Dict[str, Any]]:
+        """Get all tags for an article."""
+        if not article_id:
+            return []
+
+        article_id = str(article_id).strip()
+        con = self._connect()
+        try:
+            rows = con.execute(
+                """
+                SELECT t.id, t.name, t.category, t.description, t.created_at
+                FROM tags t
+                JOIN article_tags at ON t.id = at.tag_id
+                WHERE at.article_id = ?
+                ORDER BY t.name
+                """,
+                (article_id,),
+            ).fetchall()
+
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                out.append({
+                    "id": int(row["id"]),
+                    "name": row["name"],
+                    "category": row["category"],
+                    "description": row["description"],
+                    "created_at": row["created_at"],
+                })
+            return out
+        finally:
+            con.close()
+
+    def remove_article_tag(self, article_id: str, tag_id: int) -> bool:
+        """Remove a specific tag from an article.
+        
+        Args:
+            article_id: Article ID
+            tag_id: Tag ID to remove
+            
+        Returns:
+            True if tag was removed, False otherwise
+        """
+        if not article_id or not tag_id:
+            return False
+
+        article_id = str(article_id).strip()
+        con = self._connect()
+        try:
+            cursor = con.execute(
+                "DELETE FROM article_tags WHERE article_id = ? AND tag_id = ?",
+                (article_id, int(tag_id)),
+            )
+            con.commit()
+            return cursor.rowcount > 0
+        finally:
+            con.close()
+
+    def add_tag_to_article(self, article_id: str, tag_id: int) -> bool:
+        """Add a tag to an article without removing existing tags.
+        
+        Args:
+            article_id: Article ID
+            tag_id: Tag ID to add
+            
+        Returns:
+            True if tag was added, False if already associated
+        """
+        if not article_id or not tag_id:
+            return False
+
+        article_id = str(article_id).strip()
+        tag_id = int(tag_id)
+        con = self._connect()
+        try:
+            now_ts = _now_ts()
+            con.execute(
+                """
+                INSERT INTO article_tags (article_id, tag_id, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(article_id, tag_id) DO NOTHING
+                """,
+                (article_id, tag_id, now_ts),
+            )
+            con.commit()
+            return con.total_changes > 0
+        finally:
+            con.close()
+
+    def create_tag(
+        self, name: str, category: str = "GENERAL", description: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new tag.
+        
+        Args:
+            name: Tag name
+            category: Tag category (GENERAL, DOMAIN_ENTITY, etc.)
+            description: Optional description
+            
+        Returns:
+            Created tag dict, or None if tag already exists
+        """
+        if not name:
+            return None
+
+        name = name.strip()
+        category = category.strip() or "GENERAL"
+        description = description.strip() if description else ""
+
+        con = self._connect()
+        try:
+            # Check if tag already exists
+            existing = con.execute(
+                "SELECT id FROM tags WHERE name = ?", (name,)
+            ).fetchone()
+            if existing:
+                return None
+
+            now_ts = _now_ts()
+            cursor = con.execute(
+                """
+                INSERT INTO tags (name, category, description, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, category, description, now_ts),
+            )
+            con.commit()
+
+            tag_id = cursor.lastrowid
+            return {
+                "id": int(tag_id),
+                "name": name,
+                "category": category,
+                "description": description,
+                "created_at": now_ts,
+            }
+        finally:
+            con.close()
+
+    def update_tag(
+        self, tag_id: int, name: str = None, category: str = None, description: str = None
+    ) -> Optional[Dict[str, Any]]:
+        """Update an existing tag.
+        
+        Args:
+            tag_id: Tag ID to update
+            name: New name (optional)
+            category: New category (optional)
+            description: New description (optional)
+            
+        Returns:
+            Updated tag dict, or None if tag not found
+        """
+        if not tag_id:
+            return None
+
+        con = self._connect()
+        try:
+            # Get current tag
+            row = con.execute("SELECT * FROM tags WHERE id = ?", (int(tag_id),)).fetchone()
+            if not row:
+                return None
+
+            # Prepare updates
+            updates = {}
+            if name is not None:
+                updates["name"] = name.strip()
+            if category is not None:
+                updates["category"] = category.strip() or "GENERAL"
+            if description is not None:
+                updates["description"] = description.strip() if description else ""
+
+            if not updates:
+                # No changes
+                return {
+                    "id": int(row["id"]),
+                    "name": row["name"],
+                    "category": row["category"],
+                    "description": row["description"],
+                    "created_at": row["created_at"],
+                }
+
+            # Build update SQL
+            set_clauses = [f"{k} = ?" for k in updates.keys()]
+            values = list(updates.values())
+            values.append(int(tag_id))
+
+            con.execute(
+                f"UPDATE tags SET {', '.join(set_clauses)} WHERE id = ?",
+                values,
+            )
+            con.commit()
+
+            # Get updated tag
+            updated_row = con.execute("SELECT * FROM tags WHERE id = ?", (int(tag_id),)).fetchone()
+            return {
+                "id": int(updated_row["id"]),
+                "name": updated_row["name"],
+                "category": updated_row["category"],
+                "description": updated_row["description"],
+                "created_at": updated_row["created_at"],
+            }
+        finally:
+            con.close()
+
+    def delete_tag(self, tag_id: int) -> bool:
+        """Delete a tag and remove it from all articles.
+        
+        Args:
+            tag_id: Tag ID to delete
+            
+        Returns:
+            True if tag was deleted, False if not found
+        """
+        if not tag_id:
+            return False
+
+        con = self._connect()
+        try:
+            # Delete from article_tags first
+            con.execute("DELETE FROM article_tags WHERE tag_id = ?", (int(tag_id),))
+            
+            # Delete the tag
+            cursor = con.execute("DELETE FROM tags WHERE id = ?", (int(tag_id),))
+            con.commit()
+            
+            return cursor.rowcount > 0
+        finally:
+            con.close()
+
+    def cleanup_unused_tags(self, days: int = 30) -> int:
+        """Remove tags that haven't been used in X days."""
+        cutoff = _now_ts() - (days * 86400)
+        con = self._connect()
+        try:
+            # Find tags not used in the last X days
+            cur = con.execute(
+                """
+                DELETE FROM tags
+                WHERE id NOT IN (
+                    SELECT DISTINCT tag_id FROM article_tags
+                    WHERE created_at > ?
+                )
+                AND created_at < ?
+                """,
+                (cutoff, cutoff),
+            )
+            con.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
+        finally:
+            con.close()
+
+    def update_tag_embedding(self, tag_id: int, embedding_vector: List[float]) -> bool:
+        """
+        Update the embedding vector for a tag.
+        
+        Args:
+            tag_id: Tag ID
+            embedding_vector: List of floats representing the embedding
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not isinstance(tag_id, int) or tag_id <= 0:
+            return False
+        
+        if not embedding_vector or not all(isinstance(x, (int, float)) for x in embedding_vector):
+            return False
+        
+        con = self._connect()
+        try:
+            import json
+            embedding_json = json.dumps(embedding_vector, separators=(",", ":"))
+            con.execute(
+                "UPDATE tags SET embedding_vector = ?, updated_at = ? WHERE id = ?",
+                (embedding_json, _now_ts(), tag_id),
+            )
+            con.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating tag embedding: {e}")
+            return False
+        finally:
+            con.close()
+
+    def get_tags_by_embedding_similarity(
+        self,
+        embedding_vector: List[float],
+        similarity_threshold: float = 0.75,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find tags with embeddings similar to the given embedding.
+        Uses cosine similarity.
+        
+        Args:
+            embedding_vector: Target embedding vector
+            similarity_threshold: Minimum similarity score (0.0-1.0)
+            limit: Maximum number of results
+            
+        Returns:
+            List of tags sorted by similarity (highest first)
+        """
+        if not embedding_vector or limit <= 0:
+            return []
+        
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT id, name, category, description, embedding_vector, created_at FROM tags WHERE embedding_vector IS NOT NULL ORDER BY name"
+            ).fetchall()
+            
+            results: List[Tuple[Dict[str, Any], float]] = []
+            
+            for row in rows:
+                try:
+                    import json
+                    embedding_str = row.get("embedding_vector")
+                    if not embedding_str:
+                        continue
+                    
+                    tag_embedding = json.loads(embedding_str)
+                    if not isinstance(tag_embedding, list):
+                        continue
+                    
+                    # Compute cosine similarity
+                    similarity = self._cosine_similarity(embedding_vector, tag_embedding)
+                    
+                    if similarity >= similarity_threshold:
+                        tag_dict = {
+                            "id": int(row["id"]),
+                            "name": row["name"],
+                            "category": row["category"],
+                            "description": row["description"],
+                            "created_at": row["created_at"],
+                            "embedding_vector": tag_embedding,
+                            "_similarity_score": similarity,  # Include similarity for debugging
+                        }
+                        results.append((tag_dict, similarity))
+                except Exception:
+                    continue
+            
+            # Sort by similarity descending
+            results.sort(key=lambda x: -x[1])
+            
+            return [tag for tag, _ in results[:limit]]
+        finally:
+            con.close()
+
+    @staticmethod
+    def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+        """Calculate cosine similarity between two vectors."""
+        if not vec1 or not vec2 or len(vec1) != len(vec2):
+            return 0.0
+        
+        try:
+            import math
+            dot_product = sum(a * b for a, b in zip(vec1, vec2))
+            magnitude1 = math.sqrt(sum(a * a for a in vec1))
+            magnitude2 = math.sqrt(sum(b * b for b in vec2))
+            
+            if magnitude1 == 0 or magnitude2 == 0:
+                return 0.0
+            
+            return dot_product / (magnitude1 * magnitude2)
+        except Exception:
+            return 0.0
+
+    def get_articles_by_tags(
+        self,
+        tag_names: List[str],
+        match_mode: str = "any",
+    ) -> List[Dict[str, Any]]:
+        """
+        Get articles tagged with one or more tags.
+
+        Args:
+            tag_names: List of tag names to search for
+            match_mode: "any" (OR) or "all" (AND)
+
+        Returns:
+            List of article dicts
+        """
+        if not tag_names:
+            return []
+
+        tag_names = [str(t).strip().lower() for t in tag_names if t]
+        if not tag_names:
+            return []
+
+        con = self._connect()
+        try:
+            # Get tag IDs
+            placeholders = ",".join(["?"] * len(tag_names))
+            rows = con.execute(
+                f"SELECT id FROM tags WHERE name IN ({placeholders})",
+                tuple(tag_names),
+            ).fetchall()
+
+            tag_ids = [int(row["id"]) for row in rows]
+            if not tag_ids:
+                return []
+
+            if match_mode == "all":
+                # Articles that have ALL tags
+                tag_id_placeholders = ",".join(["?"] * len(tag_ids))
+                article_rows = con.execute(
+                    f"""
+                    SELECT article_id, COUNT(*) as tag_count
+                    FROM article_tags
+                    WHERE tag_id IN ({tag_id_placeholders})
+                    GROUP BY article_id
+                    HAVING tag_count = ?
+                    """,
+                    tuple(tag_ids) + (len(tag_ids),),
+                ).fetchall()
+            else:
+                # Articles that have ANY tag (default)
+                tag_id_placeholders = ",".join(["?"] * len(tag_ids))
+                article_rows = con.execute(
+                    f"""
+                    SELECT DISTINCT article_id
+                    FROM article_tags
+                    WHERE tag_id IN ({tag_id_placeholders})
+                    """,
+                    tuple(tag_ids),
+                ).fetchall()
+
+            article_ids = [str(row["article_id"]) for row in article_rows]
+            if not article_ids:
+                return []
+
+            # Fetch full article documents
+            return self.get_articles_by_ids(article_ids)
+
         finally:
             con.close()

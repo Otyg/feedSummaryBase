@@ -57,6 +57,7 @@ class OllamaConfig:
 
     base_url: str = "http://localhost:11434"
     model: str = "gemma3:1b"
+    embedding_model: str = "embeddinggemma:latest"  # Model for embeddings
     max_rps: float = 1.0
 
     # Hur länge vi kan vänta på att Ollama börjar svara (första bytes/headers).
@@ -214,3 +215,47 @@ class OllamaLocalClient:
         text = "".join(chunks).strip()
         self.log.info("LLM request done (chars=%d)", len(text))
         return text
+
+    async def embed(self, text: str) -> List[float]:
+        """
+        Generate embeddings for a given text using the embedding model.
+
+        Args:
+            text: Text to embed
+
+        Returns:
+            List of floats representing the embedding vector
+        """
+        if not text or not isinstance(text, str):
+            return []
+
+        await self._rate_gate()
+        session = await self._get_session()
+
+        payload = {
+            "model": self.cfg.embedding_model,
+            "input": text,
+        }
+
+        url = f"{self.cfg.base_url.rstrip('/')}/api/embed"
+        self.log.debug("Embedding request (model=%s, text_len=%d)", self.cfg.embedding_model, len(text))
+
+        try:
+            async with self._limiter:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status >= 400:
+                        text_resp = await resp.text(errors="ignore")
+                        self.log.error("Embedding error %s: %s", resp.status, text_resp[:500])
+                        return []
+
+                    data = await resp.json()
+                    embeddings = data.get("embeddings", [])
+                    
+                    # Ollama returns a list of embeddings, take the first one
+                    if embeddings and len(embeddings) > 0:
+                        return list(embeddings[0]) if isinstance(embeddings[0], (list, tuple)) else []
+                    
+                    return []
+        except Exception as e:
+            self.log.error("Embedding request failed: %s", e)
+            return []

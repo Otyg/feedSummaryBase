@@ -93,6 +93,30 @@ class NewsStore(Protocol):
 
     def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]: ...
 
+    # Tag management
+    def add_tag(
+        self,
+        name: str,
+        category: str = "GENERAL",
+        description: Optional[str] = None,
+    ) -> Optional[int]: ...
+
+    def get_tag_by_name(self, name: str) -> Optional[Dict[str, Any]]: ...
+
+    def get_all_tags(self) -> List[Dict[str, Any]]: ...
+
+    def add_article_tags(self, article_id: str, tag_ids: List) -> None: ...
+
+    def get_article_tags(self, article_id: str) -> List[Dict[str, Any]]: ...
+
+    def cleanup_unused_tags(self, days: int = 30) -> int: ...
+
+    def get_articles_by_tags(
+        self,
+        tag_names: List[str],
+        match_mode: str = "any",
+    ) -> List[Dict[str, Any]]: ...
+
 
 def _expand_path(p: str) -> str:
     expanded = os.path.expandvars(os.path.expanduser(p))

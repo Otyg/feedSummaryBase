@@ -31,6 +31,7 @@
 # ----------------------------
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -147,6 +148,31 @@ def extract_text_from_html(html: str, url: str) -> str:
 
     extracted = trafilatura.extract(html, url=url, include_comments=False, include_tables=False)
     return (extracted or "").strip()
+
+
+def extract_text_from_rss_entry(entry: feedparser.FeedParserDict) -> str:
+    """Extract text from RSS entry (summary or description) as fallback."""
+
+    # Try summary first
+    summary = getattr(entry, "summary", None) or getattr(entry, "description", None)
+    if isinstance(summary, str) and summary.strip():
+        # Remove HTML tags if present
+        text = re.sub(r"<[^>]+>", " ", summary)
+        text = " ".join(text.split())  # Normalize whitespace
+        return text.strip()
+
+    # Try content field (some feeds use this)
+    content = getattr(entry, "content", None)
+    if isinstance(content, list) and content:
+        for item in content:
+            if isinstance(item, dict):
+                value = item.get("value")
+                if isinstance(value, str) and value.strip():
+                    text = re.sub(r"<[^>]+>", " ", value)
+                    text = " ".join(text.split())
+                    return text.strip()
+
+    return ""
 
 
 async def fetch_article_html(url: str, session: aiohttp.ClientSession, timeout_s: int) -> str:
@@ -320,13 +346,47 @@ async def gather_articles_to_store(
 
                 existing = store.get_article(aid)
 
+                text = None
+                fetch_error = None
+
+                # Try to fetch original article
                 try:
                     async with http_limiter:
                         html = await guarded_fetch_article(link, session, timeout_s)
                     text = extract_text_from_html(html, link)
-                    if len(text) < 200:
-                        continue
+                except Exception as e:
+                    fetch_error = e
+                    logger.debug(f"Kunde inte hämta artikel {link}: {e}")
 
+                # If original article fetch failed, try RSS content as fallback
+                if not text or len(text) < 200:
+                    rss_text = extract_text_from_rss_entry(entry)
+                    if rss_text and len(rss_text) >= 100:
+                        text = rss_text
+                        logger.info(f"Använder RSS-innehål för: {title}")
+
+                # Skip if we still don't have sufficient content
+                if not text or len(text) < 100:
+                    if fetch_error:
+                        if isinstance(fetch_error, RetryError) and fetch_error.last_attempt:
+                            last = fetch_error.last_attempt.exception()
+                            logger.warning(
+                                "Artikel hoppades över: %s -> %s (efter flera försök, sista=%s, no RSS fallback)",
+                                link,
+                                fetch_error,
+                                last,
+                            )
+                        else:
+                            logger.warning(
+                                "Artikel hoppades över: %s -> %s (no RSS fallback)",
+                                link,
+                                fetch_error,
+                            )
+                    else:
+                        logger.debug(f"Artikel hoppades över (otillräckligt innehål): {link}")
+                    continue
+
+                try:
                     chash = compute_content_hash(title, link, text)
                     ts = entry_published_ts(entry)
                     doc = {
@@ -350,15 +410,6 @@ async def gather_articles_to_store(
                             updated += 1
 
                 except Exception as e:
-                    if isinstance(e, RetryError) and e.last_attempt:
-                        last = e.last_attempt.exception()
-                        logger.warning(
-                            "Artikel misslyckades: %s -> %s (efter flera försök, sista=%s)",
-                            link,
-                            e,
-                            last,
-                        )
-                    else:
-                        logger.warning("Artikel misslyckades: %s -> %s", link, e)
+                    logger.warning("Fel vid sparande av artikel: %s -> %s", link, e)
     logger.info(f"Articles: {str(inserted)} inserted, {str(updated)} updated")
     return inserted, updated

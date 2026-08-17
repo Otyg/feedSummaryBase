@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tinydb import Query, TinyDB
 
@@ -375,5 +375,631 @@ class TinyDBStore:
             removed["summary_docs"] = max(0, before - len(sd))
 
             return removed
+        finally:
+            db.close()
+
+    # ============================================================================
+    # Tag management methods
+    # ============================================================================
+
+    def add_tag(
+        self,
+        name: str,
+        category: str = "GENERAL",
+        description: Optional[str] = None,
+    ) -> Optional[int]:
+        """Add a new tag to the database."""
+        if not name or not isinstance(name, str):
+            return None
+
+        name = name.strip().lower()
+        if not name:
+            return None
+
+        db = self._db()
+        try:
+            t = db.table("tags")
+            Q = Query()
+
+            # Check if tag already exists
+            existing = t.search(Q.name == name)
+            if existing:
+                return int(existing[0].doc_id)
+
+            # Insert new tag
+            tag_id = t.insert({
+                "name": name,
+                "category": category,
+                "description": description,
+                "created_at": int(time.time()),
+            })
+            return int(tag_id)
+        finally:
+            db.close()
+
+    def get_tag_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get a tag by name (case-insensitive)."""
+        if not name or not isinstance(name, str):
+            return None
+
+        name = name.strip().lower()
+        if not name:
+            return None
+
+        db = self._db()
+        try:
+            Q = Query()
+            rows = db.table("tags").search(Q.name == name)
+            if rows:
+                row = rows[0]
+                try:
+                    tag_id = int(getattr(row, "doc_id"))
+                except Exception:
+                    tag_id = int(row.get("id", 0))
+                tag_dict = {
+                    "id": tag_id,
+                    "name": row.get("name"),
+                    "category": row.get("category", "GENERAL"),
+                    "description": row.get("description"),
+                    "created_at": row.get("created_at"),
+                }
+                # Include embedding_vector if present
+                if "embedding_vector" in row:
+                    tag_dict["embedding_vector"] = row.get("embedding_vector")
+                return tag_dict
+            return None
+        finally:
+            db.close()
+
+    def get_all_tags(self) -> List[Dict[str, Any]]:
+        """Get all tags."""
+        db = self._db()
+        try:
+            rows = db.table("tags").all()
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                try:
+                    tag_id = int(getattr(row, "doc_id"))
+                except Exception:
+                    tag_id = int(row.get("id", 0))
+                tag_dict = {
+                    "id": tag_id,
+                    "name": row.get("name", ""),
+                    "category": row.get("category", "GENERAL"),
+                    "description": row.get("description"),
+                    "created_at": row.get("created_at"),
+                }
+                # Include embedding_vector if present
+                if "embedding_vector" in row:
+                    tag_dict["embedding_vector"] = row.get("embedding_vector")
+                out.append(tag_dict)
+            # Sort by name
+            out.sort(key=lambda x: x.get("name", ""))
+            return out
+        finally:
+            db.close()
+
+    def add_article_tags(
+        self,
+        article_id: str,
+        tag_ids: List,  # Can be List[int] or List[Dict] with 'tag_id' and optional 'reasoning'
+    ) -> None:
+        """Add tags to an article (replaces existing tags).
+        
+        Args:
+            article_id: Article ID
+            tag_ids: List of tag IDs (int) or list of dicts with 'tag_id' and optional 'reasoning'
+        """
+        if not article_id or not tag_ids:
+            return
+
+        article_id = str(article_id).strip()
+        if not article_id:
+            return
+
+        db = self._db()
+        try:
+            at = db.table("article_tags")
+            Q = Query()
+
+            # Remove existing tags for this article
+            at.remove(Q.article_id == article_id)
+
+            # Add new tags
+            now_ts = int(time.time())
+            for tag_entry in tag_ids:
+                # Handle both int (backward compatibility) and dict formats
+                if isinstance(tag_entry, dict):
+                    tag_id = tag_entry.get("tag_id") or tag_entry.get("id")
+                    reasoning = tag_entry.get("reasoning", "")
+                else:
+                    tag_id = int(tag_entry)
+                    reasoning = ""
+                
+                if not isinstance(tag_id, int) or tag_id <= 0:
+                    continue
+                
+                record = {
+                    "article_id": article_id,
+                    "tag_id": tag_id,
+                    "created_at": now_ts,
+                }
+                
+                # Add reasoning if provided
+                if reasoning:
+                    record["motivering"] = str(reasoning).strip()
+                
+                at.insert(record)
+        finally:
+            db.close()
+
+    def get_article_tags(self, article_id: str) -> List[Dict[str, Any]]:
+        """Get all tags for an article."""
+        if not article_id:
+            return []
+
+        article_id = str(article_id).strip()
+        db = self._db()
+        try:
+            at = db.table("article_tags")
+            tags_table = db.table("tags")
+            Q = Query()
+
+            # Get tag IDs for this article
+            article_tag_rows = at.search(Q.article_id == article_id)
+            if not article_tag_rows:
+                return []
+
+            tag_ids = [row.get("tag_id") for row in article_tag_rows]
+
+            # Get tag details
+            out: List[Dict[str, Any]] = []
+            for tag_id in tag_ids:
+                tag_rows = tags_table.search(Q.id == tag_id)
+                if not tag_rows:
+                    # Try doc_id based search
+                    try:
+                        tag = tags_table.get(doc_id=int(tag_id))
+                        if tag:
+                            try:
+                                tid = int(getattr(tag, "doc_id"))
+                            except Exception:
+                                tid = int(tag.get("id", tag_id))
+                            out.append({
+                                "id": tid,
+                                "name": tag.get("name", ""),
+                                "category": tag.get("category", "GENERAL"),
+                                "description": tag.get("description"),
+                                "created_at": tag.get("created_at"),
+                            })
+                    except Exception:
+                        pass
+                else:
+                    row = tag_rows[0]
+                    try:
+                        tid = int(getattr(row, "doc_id"))
+                    except Exception:
+                        tid = int(row.get("id", tag_id))
+                    out.append({
+                        "id": tid,
+                        "name": row.get("name", ""),
+                        "category": row.get("category", "GENERAL"),
+                        "description": row.get("description"),
+                        "created_at": row.get("created_at"),
+                    })
+
+            # Sort by name
+            out.sort(key=lambda x: x.get("name", ""))
+            return out
+        finally:
+            db.close()
+
+    def remove_article_tag(self, article_id: str, tag_id: int) -> bool:
+        """Remove a specific tag from an article.
+        
+        Args:
+            article_id: Article ID
+            tag_id: Tag ID to remove
+            
+        Returns:
+            True if tag was removed, False otherwise
+        """
+        if not article_id or not tag_id:
+            return False
+
+        article_id = str(article_id).strip()
+        db = self._db()
+        try:
+            at = db.table("article_tags")
+            Q = Query()
+            removed = at.remove((Q.article_id == article_id) & (Q.tag_id == int(tag_id)))
+            return len(removed) > 0
+        finally:
+            db.close()
+
+    def add_tag_to_article(self, article_id: str, tag_id: int) -> bool:
+        """Add a tag to an article without removing existing tags.
+        
+        Args:
+            article_id: Article ID
+            tag_id: Tag ID to add
+            
+        Returns:
+            True if tag was added, False if already associated
+        """
+        if not article_id or not tag_id:
+            return False
+
+        article_id = str(article_id).strip()
+        tag_id = int(tag_id)
+        db = self._db()
+        try:
+            at = db.table("article_tags")
+            Q = Query()
+            
+            # Check if already exists
+            existing = at.search((Q.article_id == article_id) & (Q.tag_id == tag_id))
+            if existing:
+                return False
+
+            now_ts = int(time.time())
+            at.insert({
+                "article_id": article_id,
+                "tag_id": tag_id,
+                "created_at": now_ts,
+            })
+            return True
+        finally:
+            db.close()
+
+    def create_tag(
+        self, name: str, category: str = "GENERAL", description: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new tag.
+        
+        Args:
+            name: Tag name
+            category: Tag category (GENERAL, DOMAIN_ENTITY, etc.)
+            description: Optional description
+            
+        Returns:
+            Created tag dict, or None if tag already exists
+        """
+        if not name:
+            return None
+
+        name = name.strip()
+        category = category.strip() or "GENERAL"
+        description = description.strip() if description else ""
+
+        db = self._db()
+        try:
+            tags_table = db.table("tags")
+            Q = Query()
+            
+            # Check if tag already exists
+            existing = tags_table.search(Q.name == name)
+            if existing:
+                return None
+
+            now_ts = int(time.time())
+            doc_id = tags_table.insert({
+                "name": name,
+                "category": category,
+                "description": description,
+                "created_at": now_ts,
+            })
+
+            return {
+                "id": int(doc_id),
+                "name": name,
+                "category": category,
+                "description": description,
+                "created_at": now_ts,
+            }
+        finally:
+            db.close()
+
+    def update_tag(
+        self, tag_id: int, name: str = None, category: str = None, description: str = None
+    ) -> Optional[Dict[str, Any]]:
+        """Update an existing tag.
+        
+        Args:
+            tag_id: Tag ID to update
+            name: New name (optional)
+            category: New category (optional)
+            description: New description (optional)
+            
+        Returns:
+            Updated tag dict, or None if tag not found
+        """
+        if not tag_id:
+            return None
+
+        db = self._db()
+        try:
+            tags_table = db.table("tags")
+            
+            # Get current tag
+            try:
+                tag_row = tags_table.get(doc_id=int(tag_id))
+            except Exception:
+                return None
+
+            # Prepare updates
+            updates = {}
+            if name is not None:
+                updates["name"] = name.strip()
+            if category is not None:
+                updates["category"] = category.strip() or "GENERAL"
+            if description is not None:
+                updates["description"] = description.strip() if description else ""
+
+            if not updates:
+                # No changes, return current tag
+                return {
+                    "id": int(tag_id),
+                    "name": tag_row.get("name", ""),
+                    "category": tag_row.get("category", "GENERAL"),
+                    "description": tag_row.get("description", ""),
+                    "created_at": tag_row.get("created_at", 0),
+                }
+
+            # Update the tag
+            tags_table.update(updates, doc_ids=[int(tag_id)])
+
+            # Get updated tag
+            updated_row = tags_table.get(doc_id=int(tag_id))
+            return {
+                "id": int(tag_id),
+                "name": updated_row.get("name", ""),
+                "category": updated_row.get("category", "GENERAL"),
+                "description": updated_row.get("description", ""),
+                "created_at": updated_row.get("created_at", 0),
+            }
+        except Exception as e:
+            logger.error(f"Error updating tag: {e}")
+            return None
+        finally:
+            db.close()
+
+    def delete_tag(self, tag_id: int) -> bool:
+        """Delete a tag and remove it from all articles.
+        
+        Args:
+            tag_id: Tag ID to delete
+            
+        Returns:
+            True if tag was deleted, False if not found
+        """
+        if not tag_id:
+            return False
+
+        db = self._db()
+        try:
+            # Delete from article_tags first
+            at = db.table("article_tags")
+            Q = Query()
+            at.remove(Q.tag_id == int(tag_id))
+            
+            # Delete the tag
+            tags_table = db.table("tags")
+            removed = tags_table.remove(doc_ids=[int(tag_id)])
+            
+            return len(removed) > 0
+        except Exception as e:
+            logger.error(f"Error deleting tag: {e}")
+            return False
+        finally:
+            db.close()
+
+    def update_tag_embedding(self, tag_id: int, embedding_vector: List[float]) -> bool:
+        """
+        Update the embedding vector for a tag.
+        
+        Args:
+            tag_id: Tag ID (doc_id in TinyDB)
+            embedding_vector: List of floats representing the embedding
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not isinstance(tag_id, int) or tag_id <= 0:
+            return False
+        
+        if not embedding_vector or not all(isinstance(x, (int, float)) for x in embedding_vector):
+            return False
+        
+        db = self._db()
+        try:
+            t = db.table("tags")
+            Q = Query()
+            # Update the tag with the embedding_vector
+            t.update({"embedding_vector": embedding_vector}, doc_ids=[tag_id])
+            return True
+        except Exception as e:
+            logger.error(f"Error updating tag embedding: {e}")
+            return False
+        finally:
+            db.close()
+
+    def get_tags_by_embedding_similarity(
+        self,
+        embedding_vector: List[float],
+        similarity_threshold: float = 0.75,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find tags with embeddings similar to the given embedding.
+        Uses cosine similarity.
+        
+        Args:
+            embedding_vector: Target embedding vector
+            similarity_threshold: Minimum similarity score (0.0-1.0)
+            limit: Maximum number of results
+            
+        Returns:
+            List of tags sorted by similarity (highest first)
+        """
+        if not embedding_vector or limit <= 0:
+            return []
+        
+        db = self._db()
+        try:
+            rows = db.table("tags").all()
+            results: List[Tuple[Dict[str, Any], float]] = []
+            
+            for row in rows:
+                if "embedding_vector" not in row or not row.get("embedding_vector"):
+                    continue
+                
+                try:
+                    tag_embedding = row.get("embedding_vector")
+                    if not isinstance(tag_embedding, list):
+                        continue
+                    
+                    # Compute cosine similarity
+                    similarity = self._cosine_similarity(embedding_vector, tag_embedding)
+                    
+                    if similarity >= similarity_threshold:
+                        try:
+                            tag_id = int(getattr(row, "doc_id"))
+                        except Exception:
+                            tag_id = int(row.get("id", 0))
+                        
+                        tag_dict = {
+                            "id": tag_id,
+                            "name": row.get("name", ""),
+                            "category": row.get("category", "GENERAL"),
+                            "description": row.get("description"),
+                            "created_at": row.get("created_at"),
+                            "embedding_vector": tag_embedding,
+                            "_similarity_score": similarity,  # Include similarity for debugging
+                        }
+                        results.append((tag_dict, similarity))
+                except Exception:
+                    continue
+            
+            # Sort by similarity descending
+            results.sort(key=lambda x: -x[1])
+            
+            return [tag for tag, _ in results[:limit]]
+        finally:
+            db.close()
+
+    @staticmethod
+    def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+        """Calculate cosine similarity between two vectors."""
+        if not vec1 or not vec2 or len(vec1) != len(vec2):
+            return 0.0
+        
+        try:
+            import math
+            dot_product = sum(a * b for a, b in zip(vec1, vec2))
+            magnitude1 = math.sqrt(sum(a * a for a in vec1))
+            magnitude2 = math.sqrt(sum(b * b for b in vec2))
+            
+            if magnitude1 == 0 or magnitude2 == 0:
+                return 0.0
+            
+            return dot_product / (magnitude1 * magnitude2)
+        except Exception:
+            return 0.0
+
+    def cleanup_unused_tags(self, days: int = 30) -> int:
+        """Remove tags that haven't been used in X days."""
+        cutoff = int(time.time()) - (days * 86400)
+        db = self._db()
+        try:
+            at = db.table("article_tags")
+            tags_table = db.table("tags")
+            Q = Query()
+
+            # Find tag IDs that have been used
+            all_article_tags = at.all()
+            used_tag_ids = set()
+            for row in all_article_tags:
+                created_at = int(row.get("created_at", 0))
+                if created_at > cutoff:
+                    used_tag_ids.add(int(row.get("tag_id", 0)))
+
+            # Remove tags that are not used and are old
+            before = len(tags_table)
+            tags_table.remove(
+                lambda r: (
+                    int(r.get("created_at", 0)) < cutoff
+                    and int(r.get("id", 0)) not in used_tag_ids
+                )
+            )
+            after = len(tags_table)
+            return max(0, before - after)
+        finally:
+            db.close()
+
+    def get_articles_by_tags(
+        self,
+        tag_names: List[str],
+        match_mode: str = "any",
+    ) -> List[Dict[str, Any]]:
+        """
+        Get articles tagged with one or more tags.
+
+        Args:
+            tag_names: List of tag names to search for
+            match_mode: "any" (OR) or "all" (AND)
+
+        Returns:
+            List of article dicts
+        """
+        if not tag_names:
+            return []
+
+        tag_names_lower = [str(t).strip().lower() for t in tag_names if t]
+        if not tag_names_lower:
+            return []
+
+        db = self._db()
+        try:
+            tags_table = db.table("tags")
+            at = db.table("article_tags")
+            Q = Query()
+
+            # Find tag IDs matching the names
+            tag_rows = tags_table.search(
+                lambda r: r.get("name", "").lower() in tag_names_lower
+            )
+            tag_ids = [int(getattr(row, "doc_id", row.get("id", 0))) for row in tag_rows]
+
+            if not tag_ids:
+                return []
+
+            # Find articles
+            if match_mode == "all":
+                # Articles with ALL tags
+                article_tag_rows = at.all()
+                article_tag_counts: Dict[str, int] = {}
+                for row in article_tag_rows:
+                    if int(row.get("tag_id", 0)) in tag_ids:
+                        article_id = row.get("article_id")
+                        article_tag_counts[article_id] = article_tag_counts.get(article_id, 0) + 1
+
+                article_ids = [
+                    aid for aid, count in article_tag_counts.items()
+                    if count == len(tag_ids)
+                ]
+            else:
+                # Articles with ANY tag
+                article_tag_rows = at.search(
+                    lambda r: int(r.get("tag_id", 0)) in tag_ids
+                )
+                article_ids = list(set(row.get("article_id") for row in article_tag_rows))
+
+            if not article_ids:
+                return []
+
+            # Fetch article documents
+            return self.get_articles_by_ids(article_ids)
+
         finally:
             db.close()

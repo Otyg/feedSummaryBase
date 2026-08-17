@@ -171,3 +171,83 @@ class FallbackLLMClient:
                         wait_s,
                     )
                     await asyncio.sleep(wait_s)
+
+    async def embed(self, text: str) -> List[float]:
+        """
+        Generate embeddings using the first available LLM client.
+        Falls back to next provider if current fails.
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            List of floats representing the embedding vector
+        """
+        provider_idx = self._next_provider_idx(self._active_idx)
+        if provider_idx is None:
+            raise RuntimeError("Ingen LLM-provider tillgänglig för embeddings.")
+
+        while True:
+            active = self.clients[provider_idx]
+
+            # Check if client supports embedding
+            if not hasattr(active, 'embed'):
+                next_idx = self._next_provider_idx(provider_idx + 1)
+                if next_idx is not None:
+                    provider_idx = next_idx
+                    continue
+                raise RuntimeError("Ingen LLM-provider stöder embeddings.")
+
+            attempt = 0
+            while True:
+                try:
+                    return await active.embed(text)
+                except LLMUnavailableError as e:
+                    attempt += 1
+                    wait_s = int(self.policy.default_wait_s)
+
+                    if attempt > self.policy.max_quota_retries:
+                        next_idx = self._next_provider_idx(provider_idx + 1)
+                        if next_idx is not None:
+                            log.warning("Embedding provider otillgänglig, provar nästa.")
+                            provider_idx = next_idx
+                            break
+                        raise
+
+                    log.warning("Embedding provider otillgänglig, retry %d/%d...",
+                                attempt, self.policy.max_quota_retries)
+                    await asyncio.sleep(wait_s)
+                except LLMRateLimitError as e:
+                    attempt += 1
+                    wait_s = int(e.retry_after_seconds or self.policy.default_wait_s)
+
+                    if attempt > self.policy.max_quota_retries:
+                        next_idx = self._try_advance_provider_permanently(
+                            provider_idx, "embedding quota/rate-limit"
+                        )
+                        if next_idx is not None:
+                            provider_idx = next_idx
+                            break
+                        raise
+
+                    log.warning("Embedding rate-limited (attempt %d/%d), väntar %ss...",
+                                attempt, self.policy.max_quota_retries, wait_s)
+                    await asyncio.sleep(wait_s)
+
+    async def aclose(self) -> None:
+        """
+        Close all underlying LLM client sessions.
+        
+        Call this when the FallbackLLMClient is no longer needed.
+        """
+        for client in self.clients:
+            if hasattr(client, 'aclose'):
+                try:
+                    await client.aclose()
+                except Exception as e:
+                    log.warning(f"Error closing client: {e}")
+            elif hasattr(client, 'close'):
+                try:
+                    await client.close()
+                except Exception as e:
+                    log.warning(f"Error closing client: {e}")

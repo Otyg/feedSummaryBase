@@ -73,6 +73,7 @@ def _create_single_llm(llm_cfg: Dict[str, Any]):
         cfg = OllamaConfig(
             base_url=str(llm_cfg.get("base_url", "http://localhost:11434")),
             model=str(llm_cfg.get("model", "llama3.1:latest")),
+            embedding_model=str(llm_cfg.get("embedding_model", "embedding-gemma")),
             max_rps=float(llm_cfg.get("max_rps", 1.0)),
             first_byte_timeout_s=int(llm_cfg.get("first_byte_timeout_s", 900)),
             sock_read_timeout_s=int(llm_cfg.get("sock_read_timeout_s", 300)),

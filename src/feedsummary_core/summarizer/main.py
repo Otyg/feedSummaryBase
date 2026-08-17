@@ -63,6 +63,7 @@ from feedsummary_core.summarizer.summarizer import (
     super_meta_from_topic_sections_with_stats,
     _proofread_and_revise_meta_with_stats,
 )
+from feedsummary_core.summarizer.tagging_integration import tag_articles_safe
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -1313,11 +1314,24 @@ async def run_pipeline(
 
         summary_doc_id = _normalize_summary_doc_id(summary_doc_id)
 
+        # Automatically tag articles after summarization
+        article_ids = [a.get("id") for a in to_sum if a.get("id")]
+        if article_ids:
+            tagged_count = await tag_articles_safe(
+                store=store,
+                llm_client=llm,
+                article_ids=article_ids,
+                config=config,
+                job_id=job_id,
+                max_tags_per_article=5,
+            )
+            logger.info(f"Tagged {tagged_count}/{len(article_ids)} articles")
+
         if job_id is not None:
             job_fields: Dict[str, Any] = {
                 "status": "done",
                 "finished_at": int(time.time()),
-                "message": f"Klart: summerade {len(to_sum)} artiklar.",
+                "message": f"Klart: summerade {len(to_sum)} artiklar. Taggade: {tagged_count if article_ids else 0}.",
             }
             if summary_doc_id:
                 job_fields["summary_id"] = summary_doc_id
@@ -1376,11 +1390,26 @@ async def run_resume_job(
 
         summary_doc_id = _normalize_summary_doc_id(summary_doc_id)
 
+        # Automatically tag articles after summarization
+        article_ids = [a.get("id") for a in ordered_articles if a.get("id")]
+        if article_ids:
+            tagged_count = await tag_articles_safe(
+                store=store,
+                llm_client=llm,
+                article_ids=article_ids,
+                config=config,
+                job_id=jid,
+                max_tags_per_article=5,
+            )
+            logger.info(f"Tagged {tagged_count}/{len(article_ids)} articles")
+        else:
+            tagged_count = 0
+
         try:
             job_fields: Dict[str, Any] = {
                 "status": "done",
                 "finished_at": int(time.time()),
-                "message": f"Resume klart: summerade {len(ordered_articles)} artiklar.",
+                "message": f"Resume klart: summerade {len(ordered_articles)} artiklar. Taggade: {tagged_count}.",
             }
             if summary_doc_id:
                 job_fields["summary_id"] = summary_doc_id
@@ -1401,6 +1430,290 @@ async def run_resume_job(
         except Exception:
             pass
         raise
+
+
+async def run_fetch_and_tag(
+    config_path: str = "config.yaml",
+    job_id: Optional[int] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+    config_dict: Optional[Dict[str, Any]] = None,
+    llm=None,
+) -> Optional[int]:
+    """
+    Run fetch and tag only (no summarization).
+    
+    Fetches new articles and tags them, but does not generate summaries.
+    Useful for continuous ingestion and tagging of articles for later summarization.
+    
+    Returns: number of articles fetched and tagged, or None on failure.
+    """
+    llm_created = False
+    try:
+        if config_dict is None:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+        else:
+            config = config_dict
+
+        config = load_feeds_into_config(config, base_config_path=config_path)
+        config = _apply_overrides(config, overrides)
+
+        store = create_store(config.get("store", {}))
+        if llm is None:
+            llm = create_llm_client(config)
+            llm_created = True
+
+        if job_id is not None:
+            store.update_job(
+                job_id,
+                status="running",
+                started_at=int(time.time()),
+                message="Startar fetch och tag...",
+            )
+
+        # Fetch articles
+        ins, upd = await gather_articles_to_store(config, store, job_id=job_id)
+        total_fetched = ins + upd
+
+        if job_id is not None:
+            store.update_job(
+                job_id,
+                message=f"Hämtade {total_fetched} artiklar (nye: {ins}, uppdaterade: {upd}). Taggar...",
+            )
+
+        # Tag recently fetched articles
+        ingest = config.get("ingest") or {}
+        lookback = str(ingest.get("lookback") or "").strip()
+        now = int(time.time())
+        since_ts = now - parse_lookback_to_seconds(lookback) if lookback else 0
+
+        sources = _selected_source_names(config)
+        
+        # Get articles within the lookback window
+        list_by_filter = getattr(store, "list_articles_by_filter", None)
+        if callable(list_by_filter) and since_ts > 0 and sources:
+            articles = list_by_filter(sources=sources, since_ts=since_ts, until_ts=now, limit=5000)
+        else:
+            list_articles = getattr(store, "list_articles", None)
+            if callable(list_articles):
+                articles = list_articles(limit=5000)
+            else:
+                articles = store.list_unsummarized_articles(limit=5000)
+            
+            if sources:
+                srcset = set(sources)
+                articles = [a for a in articles if a.get("source") in srcset]
+            if since_ts > 0:
+                articles = [a for a in articles if _published_ts(a) >= since_ts]
+
+        # Tag articles
+        article_ids = [a.get("id") for a in articles if a.get("id")]
+        tagged_count = 0
+        if article_ids:
+            tagged_count = await tag_articles_safe(
+                store=store,
+                llm_client=llm,
+                article_ids=article_ids,
+                config=config,
+                job_id=job_id,
+                max_tags_per_article=5,
+            )
+            logger.info(f"Tagged {tagged_count}/{len(article_ids)} articles")
+
+        if job_id is not None:
+            store.update_job(
+                job_id,
+                status="done",
+                finished_at=int(time.time()),
+                message=f"Klart: hämtade {total_fetched} artiklar. Taggade: {tagged_count}.",
+            )
+
+        return total_fetched
+
+    except Exception as e:
+        if job_id is not None:
+            try:
+                store.update_job(
+                    job_id,
+                    status="failed",
+                    finished_at=int(time.time()),
+                    message=f"Fel: {e}",
+                )
+            except Exception:
+                pass
+        raise
+    finally:
+        # Close LLM client if we created it
+        if llm_created and llm is not None:
+            try:
+                if hasattr(llm, 'aclose'):
+                    await llm.aclose()
+            except Exception:
+                pass
+
+
+async def run_tag_based_summary(
+    config_path: str = "config.yaml",
+    job_id: Optional[int] = None,
+    tag_names: Optional[List[str]] = None,
+    lookback: Optional[str] = None,
+    config_dict: Optional[Dict[str, Any]] = None,
+    llm=None,
+) -> Optional[str]:
+    """
+    Summarize articles with specific tags from a given time period (no new fetch).
+    
+    Selects articles based on tags and time window, then generates summaries.
+    Does not fetch new articles.
+    
+    Args:
+        config_path: Path to config.yaml
+        job_id: Optional job ID for tracking
+        tag_names: List of tag names to filter articles by
+        lookback: Time window (e.g., "1d", "1w") - if None uses config default
+        config_dict: Optional config dict instead of loading from file
+        llm: Optional LLM client to use
+        
+    Returns: summary_id on success, None on failure
+    """
+    llm_created = False
+    try:
+        if config_dict is None:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+        else:
+            config = config_dict
+
+        config = load_feeds_into_config(config, base_config_path=config_path)
+        
+        # Override lookback if provided
+        if lookback:
+            ingest = config.setdefault("ingest", {})
+            ingest["lookback"] = lookback
+
+        store = create_store(config.get("store", {}))
+        if llm is None:
+            llm = create_llm_client(config)
+            llm_created = True
+
+        if job_id is not None:
+            store.update_job(
+                job_id,
+                status="running",
+                started_at=int(time.time()),
+                message=f"Hämtar artiklar med taggar: {', '.join(tag_names or [])}...",
+            )
+
+        # Get articles with specified tags
+        ingest = config.get("ingest") or {}
+        lb = lookback or str(ingest.get("lookback") or "").strip()
+        now = int(time.time())
+        since_ts = now - parse_lookback_to_seconds(lb) if lb else 0
+
+        # Retrieve articles with specified tags
+        articles = []
+        if tag_names and isinstance(tag_names, list):
+            # Get store method for retrieving articles by tags
+            list_by_tags = getattr(store, "list_articles_by_tags", None)
+            if callable(list_by_tags):
+                articles = list_by_tags(
+                    tag_names=tag_names,
+                    since_ts=since_ts if since_ts > 0 else 0,
+                    until_ts=now,
+                    limit=2000,
+                )
+            else:
+                # Fallback: get all articles and filter by tags manually
+                all_articles = store.list_unsummarized_articles(limit=5000)
+                if since_ts > 0:
+                    all_articles = [a for a in all_articles if _published_ts(a) >= since_ts]
+                
+                # Filter by tags
+                filtered_articles = []
+                for article in all_articles:
+                    article_id = article.get("id")
+                    if article_id:
+                        article_tags = getattr(store, "get_article_tags", None)
+                        if callable(article_tags):
+                            tags = article_tags(article_id)
+                            tag_names_set = {t.get("name", "").lower() for t in (tags or [])}
+                            if any(tn.lower() in tag_names_set for tn in tag_names):
+                                filtered_articles.append(article)
+                articles = filtered_articles[:2000]
+
+        if not articles:
+            msg = f"Inga artiklar hittades med taggar: {', '.join(tag_names or [])}"
+            if job_id is not None:
+                store.update_job(
+                    job_id,
+                    status="done",
+                    finished_at=int(time.time()),
+                    message=msg,
+                )
+            logger.info(msg)
+            return None
+
+        if job_id is not None:
+            store.update_job(
+                job_id,
+                message=f"Hittade {len(articles)} artiklar med taggar. Summerar...",
+            )
+
+        # Build topic map
+        topic_map = _source_topics_map(config)
+        selection = {
+            "lookback": lb,
+            "sources": _selected_source_names(config),
+            "topics": _selected_topics_from_config(config),
+            "tags": list(tag_names or []),
+            "prompt_package": _selected_prompt_package(config),
+        }
+
+        # Generate summary
+        summary_doc_id = await _summarize_and_persist_like_refresh(
+            config=config,
+            store=store,
+            llm=llm,
+            job_id=job_id,
+            articles=articles,
+            topic_map=topic_map,
+            selection=selection,
+        )
+
+        summary_doc_id = _normalize_summary_doc_id(summary_doc_id)
+
+        if job_id is not None:
+            job_fields: Dict[str, Any] = {
+                "status": "done",
+                "finished_at": int(time.time()),
+                "message": f"Klart: summerade {len(articles)} artiklar med taggar.",
+            }
+            if summary_doc_id:
+                job_fields["summary_id"] = summary_doc_id
+            store.update_job(job_id, **job_fields)
+
+        return summary_doc_id
+
+    except Exception as e:
+        if job_id is not None:
+            try:
+                store.update_job(
+                    job_id,
+                    status="failed",
+                    finished_at=int(time.time()),
+                    message=f"Fel: {e}",
+                )
+            except Exception:
+                pass
+        raise
+    finally:
+        # Close LLM client if we created it
+        if llm_created and llm is not None:
+            try:
+                if hasattr(llm, 'aclose'):
+                    await llm.aclose()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
