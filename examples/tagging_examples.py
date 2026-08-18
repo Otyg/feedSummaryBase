@@ -91,14 +91,14 @@ async def example_tag_selection_logic():
     # Add some existing tags
     tag_manager.add_tag("security", category="GENERAL")
     tag_manager.add_tag("network-security", category="GENERAL")
-    tag_manager.add_tag("CVE-2024-12345", category="DOMAIN_ENTITY")
+    tag_manager.add_tag("CVE-2024-12345", category="VULNERABILITY")
 
     # Demonstrate tag selection
     candidates = [
         "security",  # Should match existing "security"
         "web security",  # Should match "security" (substring)
         "network attack",  # Should match "network-security"
-        "CVE-2024-54321",  # Should create new DOMAIN_ENTITY
+        "CVE-2024-54321",  # Should create new VULNERABILITY
         "random-term",  # Should skip (not domain entity, not existing)
     ]
 

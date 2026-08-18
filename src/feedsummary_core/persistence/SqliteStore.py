@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from feedsummary_core.persistence import CleanupPolicy
 from feedsummary_core.persistence.helpers import classify_summary_doc
+from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_tag
 
 logger = logging.getLogger(__name__)
 
@@ -871,7 +872,7 @@ class SqliteStore:
                     "created_at": row["created_at"],
                 }
                 # Parse embedding_vector if present
-                embedding_str = row.get("embedding_vector")
+                embedding_str = row["embedding_vector"]
                 if embedding_str:
                     try:
                         import json
@@ -900,7 +901,7 @@ class SqliteStore:
                     "created_at": row["created_at"],
                 }
                 # Parse embedding_vector if present
-                embedding_str = row.get("embedding_vector")
+                embedding_str = row["embedding_vector"]
                 if embedding_str:
                     try:
                         import json
@@ -1396,5 +1397,233 @@ class SqliteStore:
             # Fetch full article documents
             return self.get_articles_by_ids(article_ids)
 
+        finally:
+            con.close()
+
+    def get_all_categories(self) -> List[Dict[str, Any]]:
+        """Get all tag categories."""
+        con = sqlite3.connect(self.path)
+        con.row_factory = sqlite3.Row
+        try:
+            # Create table if it doesn't exist
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS tag_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    label TEXT NOT NULL,
+                    bg_color TEXT NOT NULL DEFAULT 'bg-secondary',
+                    text_color TEXT NOT NULL DEFAULT 'text-dark',
+                    description TEXT,
+                    created_at INTEGER
+                )
+            """)
+            
+            rows = con.execute("SELECT * FROM tag_categories ORDER BY name").fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            con.close()
+
+    def get_category(self, category_id: int) -> Optional[Dict[str, Any]]:
+        """Get a category by ID."""
+        con = sqlite3.connect(self.path)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS tag_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    label TEXT NOT NULL,
+                    bg_color TEXT NOT NULL DEFAULT 'bg-secondary',
+                    text_color TEXT NOT NULL DEFAULT 'text-dark',
+                    description TEXT,
+                    created_at INTEGER
+                )
+            """)
+            
+            row = con.execute("SELECT * FROM tag_categories WHERE id = ?", (category_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            con.close()
+
+    def create_category(
+        self,
+        name: str,
+        label: str,
+        bg_color: str = "bg-secondary",
+        text_color: str = "text-dark",
+        description: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new tag category."""
+        if not name or not label:
+            return None
+
+        con = sqlite3.connect(self.path)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS tag_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    label TEXT NOT NULL,
+                    bg_color TEXT NOT NULL DEFAULT 'bg-secondary',
+                    text_color TEXT NOT NULL DEFAULT 'text-dark',
+                    description TEXT,
+                    created_at INTEGER
+                )
+            """)
+            
+            now_ts = int(time.time())
+            cursor = con.execute(
+                """
+                INSERT INTO tag_categories (name, label, bg_color, text_color, description, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (name, label, bg_color, text_color, description, now_ts)
+            )
+            con.commit()
+            
+            return {
+                "id": cursor.lastrowid,
+                "name": name,
+                "label": label,
+                "bg_color": bg_color,
+                "text_color": text_color,
+                "description": description,
+                "created_at": now_ts,
+            }
+        except sqlite3.IntegrityError:
+            return None
+        finally:
+            con.close()
+
+    def update_category(
+        self,
+        category_id: int,
+        label: str = None,
+        bg_color: str = None,
+        text_color: str = None,
+        description: str = None,
+    ) -> bool:
+        """Update an existing category."""
+        con = sqlite3.connect(self.path)
+        try:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS tag_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    label TEXT NOT NULL,
+                    bg_color TEXT NOT NULL DEFAULT 'bg-secondary',
+                    text_color TEXT NOT NULL DEFAULT 'text-dark',
+                    description TEXT,
+                    created_at INTEGER
+                )
+            """)
+            
+            # Build update statement dynamically
+            updates = []
+            values = []
+            
+            if label is not None:
+                updates.append("label = ?")
+                values.append(label)
+            if bg_color is not None:
+                updates.append("bg_color = ?")
+                values.append(bg_color)
+            if text_color is not None:
+                updates.append("text_color = ?")
+                values.append(text_color)
+            if description is not None:
+                updates.append("description = ?")
+                values.append(description)
+            
+            if not updates:
+                return False
+            
+            values.append(category_id)
+            query = f"UPDATE tag_categories SET {', '.join(updates)} WHERE id = ?"
+            
+            con.execute(query, tuple(values))
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    def delete_category(self, category_id: int) -> bool:
+        """Delete a category."""
+        con = sqlite3.connect(self.path)
+        try:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS tag_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    label TEXT NOT NULL,
+                    bg_color TEXT NOT NULL DEFAULT 'bg-secondary',
+                    text_color TEXT NOT NULL DEFAULT 'text-dark',
+                    description TEXT,
+                    created_at INTEGER
+                )
+            """)
+            
+            con.execute("DELETE FROM tag_categories WHERE id = ?", (category_id,))
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    def initialize_default_categories(self) -> None:
+        """Initialize default tag categories if they don't exist."""
+        con = sqlite3.connect(self.path)
+        try:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS tag_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    label TEXT NOT NULL,
+                    bg_color TEXT NOT NULL DEFAULT 'bg-secondary',
+                    text_color TEXT NOT NULL DEFAULT 'text-dark',
+                    description TEXT,
+                    created_at INTEGER
+                )
+            """)
+            
+            defaults = [
+                ("GENERAL", "Allmän", "bg-secondary", "text-dark"),
+                ("DOMAIN_ENTITY", "Domän-enhet", "bg-info", "text-dark"),
+                ("VULNERABILITY", "Sårbarhet", "bg-danger", "text-white"),
+                ("THREAT", "Hot", "bg-danger", "text-white"),
+                ("LOCATION", "Plats", "bg-success", "text-dark"),
+                ("PERSON", "Person", "bg-warning", "text-dark"),
+                ("ORGANIZATION", "Organisation", "bg-warning", "text-dark"),
+                ("PRODUCT", "Produkt", "bg-warning", "text-dark"),
+            ]
+            
+            now_ts = int(time.time())
+            
+            for name, label, bg_color, text_color in defaults:
+                try:
+                    con.execute(
+                        """
+                        INSERT OR IGNORE INTO tag_categories
+                        (name, label, bg_color, text_color, description, created_at)
+                        VALUES (?, ?, ?, ?, '', ?)
+                        """,
+                        (name, label, bg_color, text_color, now_ts)
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+
+            # Migrate tags created before the dedicated CVE category existed.
+            rows = con.execute("SELECT id, name, category FROM tags").fetchall()
+            for tag_id, tag_name, tag_category in rows:
+                if (
+                    is_cve_tag(tag_name)
+                    and tag_category != VULNERABILITY_TAG_CATEGORY
+                ):
+                    con.execute(
+                        "UPDATE tags SET category = ? WHERE id = ?",
+                        (VULNERABILITY_TAG_CATEGORY, int(tag_id)),
+                    )
+
+            con.commit()
         finally:
             con.close()

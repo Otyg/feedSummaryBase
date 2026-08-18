@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from tinydb import Query, TinyDB
 
 from feedsummary_core.persistence import CleanupPolicy
+from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_tag
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +468,7 @@ class TinyDBStore:
                     "name": row.get("name", ""),
                     "category": row.get("category", "GENERAL"),
                     "description": row.get("description"),
+                    "synonyms": row.get("synonyms", []),
                     "created_at": row.get("created_at"),
                 }
                 # Include embedding_vector if present
@@ -653,7 +655,7 @@ class TinyDBStore:
             db.close()
 
     def create_tag(
-        self, name: str, category: str = "GENERAL", description: str = ""
+        self, name: str, category: str = "GENERAL", description: str = "", synonyms: List[str] = None
     ) -> Optional[Dict[str, Any]]:
         """Create a new tag.
         
@@ -661,6 +663,7 @@ class TinyDBStore:
             name: Tag name
             category: Tag category (GENERAL, DOMAIN_ENTITY, etc.)
             description: Optional description
+            synonyms: Optional list of synonym strings
             
         Returns:
             Created tag dict, or None if tag already exists
@@ -671,6 +674,7 @@ class TinyDBStore:
         name = name.strip()
         category = category.strip() or "GENERAL"
         description = description.strip() if description else ""
+        synonyms = [s.strip().lower() for s in (synonyms or [])] if synonyms else []
 
         db = self._db()
         try:
@@ -687,6 +691,7 @@ class TinyDBStore:
                 "name": name,
                 "category": category,
                 "description": description,
+                "synonyms": synonyms,
                 "created_at": now_ts,
             })
 
@@ -695,13 +700,14 @@ class TinyDBStore:
                 "name": name,
                 "category": category,
                 "description": description,
+                "synonyms": synonyms,
                 "created_at": now_ts,
             }
         finally:
             db.close()
 
     def update_tag(
-        self, tag_id: int, name: str = None, category: str = None, description: str = None
+        self, tag_id: int, name: str = None, category: str = None, description: str = None, synonyms: List[str] = None
     ) -> Optional[Dict[str, Any]]:
         """Update an existing tag.
         
@@ -710,6 +716,7 @@ class TinyDBStore:
             name: New name (optional)
             category: New category (optional)
             description: New description (optional)
+            synonyms: New synonyms list (optional)
             
         Returns:
             Updated tag dict, or None if tag not found
@@ -735,6 +742,8 @@ class TinyDBStore:
                 updates["category"] = category.strip() or "GENERAL"
             if description is not None:
                 updates["description"] = description.strip() if description else ""
+            if synonyms is not None:
+                updates["synonyms"] = [s.strip().lower() for s in synonyms] if synonyms else []
 
             if not updates:
                 # No changes, return current tag
@@ -743,6 +752,7 @@ class TinyDBStore:
                     "name": tag_row.get("name", ""),
                     "category": tag_row.get("category", "GENERAL"),
                     "description": tag_row.get("description", ""),
+                    "synonyms": tag_row.get("synonyms", []),
                     "created_at": tag_row.get("created_at", 0),
                 }
 
@@ -756,6 +766,7 @@ class TinyDBStore:
                 "name": updated_row.get("name", ""),
                 "category": updated_row.get("category", "GENERAL"),
                 "description": updated_row.get("description", ""),
+                "synonyms": updated_row.get("synonyms", []),
                 "created_at": updated_row.get("created_at", 0),
             }
         except Exception as e:
@@ -791,6 +802,79 @@ class TinyDBStore:
         except Exception as e:
             logger.error(f"Error deleting tag: {e}")
             return False
+        finally:
+            db.close()
+
+    def migrate_synonym_to_main_tag(self, main_tag_id: int, synonym_tag_ids: List[int]) -> Tuple[int, int]:
+        """
+        Migrate articles from synonym tags to main tag and delete synonyms.
+        
+        When a tag becomes a synonym of another tag:
+        1. All articles using the synonym tag get the main tag instead
+        2. The synonym tag is deleted from the database
+        
+        Args:
+            main_tag_id: ID of the main tag that synonyms map to
+            synonym_tag_ids: List of tag IDs that are now synonyms
+            
+        Returns:
+            Tuple of (articles_migrated, synonyms_deleted)
+        """
+        if not main_tag_id or not synonym_tag_ids:
+            return 0, 0
+        
+        articles_migrated = 0
+        synonyms_deleted = 0
+        
+        db = self._db()
+        try:
+            at = db.table("article_tags")
+            Q = Query()
+            
+            # For each synonym tag, find articles and update them
+            for synonym_tag_id in synonym_tag_ids:
+                if synonym_tag_id == main_tag_id:
+                    # Don't process main tag
+                    continue
+                
+                # Find all article_tags entries using this synonym tag
+                article_tag_entries = at.search(Q.tag_id == int(synonym_tag_id))
+                
+                for entry in article_tag_entries:
+                    article_id = entry.get("article_id")
+                    
+                    # Check if article already has main tag
+                    existing_main = at.search(
+                        (Q.article_id == article_id) & 
+                        (Q.tag_id == int(main_tag_id))
+                    )
+                    
+                    if not existing_main:
+                        # Add main tag to article
+                        at.insert({
+                            "article_id": article_id,
+                            "tag_id": int(main_tag_id),
+                            "timestamp": int(time.time())
+                        })
+                    
+                    # Remove synonym tag from article
+                    at.remove(
+                        (Q.article_id == article_id) & 
+                        (Q.tag_id == int(synonym_tag_id))
+                    )
+                    articles_migrated += 1
+                
+                # Delete the synonym tag itself
+                tags_table = db.table("tags")
+                removed = tags_table.remove(doc_ids=[int(synonym_tag_id)])
+                if removed:
+                    synonyms_deleted += 1
+                    logger.info(f"[TagMigration] Deleted synonym tag {synonym_tag_id}, migrated {len(article_tag_entries)} articles")
+            
+            return articles_migrated, synonyms_deleted
+        except Exception as e:
+            logger.error(f"Error migrating synonym tags: {e}")
+            return 0, 0
         finally:
             db.close()
 
@@ -1001,5 +1085,226 @@ class TinyDBStore:
             # Fetch article documents
             return self.get_articles_by_ids(article_ids)
 
+        finally:
+            db.close()
+
+    def get_all_categories(self) -> List[Dict[str, Any]]:
+        """Get all tag categories."""
+        db = self._db()
+        try:
+            categories_table = db.table("tag_categories")
+            docs = list(categories_table.all())
+            out = []
+            for doc in docs:
+                try:
+                    doc_id = int(getattr(doc, "doc_id"))
+                except Exception:
+                    doc_id = int(doc.get("id", 0))
+                
+                out.append({
+                    "id": doc_id,
+                    "name": doc.get("name", ""),
+                    "label": doc.get("label", ""),
+                    "bg_color": doc.get("bg_color", "bg-secondary"),
+                    "text_color": doc.get("text_color", "text-dark"),
+                    "description": doc.get("description", ""),
+                    "created_at": doc.get("created_at", 0),
+                })
+            return out
+        finally:
+            db.close()
+
+    def get_category(self, category_id: int) -> Optional[Dict[str, Any]]:
+        """Get a category by ID."""
+        db = self._db()
+        try:
+            categories_table = db.table("tag_categories")
+            doc = categories_table.get(doc_id=category_id)
+            if not doc:
+                return None
+            
+            return {
+                "id": category_id,
+                "name": doc.get("name", ""),
+                "label": doc.get("label", ""),
+                "bg_color": doc.get("bg_color", "bg-secondary"),
+                "text_color": doc.get("text_color", "text-dark"),
+                "description": doc.get("description", ""),
+                "created_at": doc.get("created_at", 0),
+            }
+        finally:
+            db.close()
+
+    def create_category(
+        self,
+        name: str,
+        label: str,
+        bg_color: str = "bg-secondary",
+        text_color: str = "text-dark",
+        description: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new tag category."""
+        if not name or not label:
+            return None
+
+        db = self._db()
+        try:
+            categories_table = db.table("tag_categories")
+            Q = Query()
+            
+            # Check if category already exists
+            existing = categories_table.search(Q.name == name)
+            if existing:
+                return None
+
+            now_ts = int(time.time())
+            doc_id = categories_table.insert({
+                "name": name,
+                "label": label,
+                "bg_color": bg_color,
+                "text_color": text_color,
+                "description": description,
+                "created_at": now_ts,
+            })
+
+            return {
+                "id": int(doc_id),
+                "name": name,
+                "label": label,
+                "bg_color": bg_color,
+                "text_color": text_color,
+                "description": description,
+                "created_at": now_ts,
+            }
+        finally:
+            db.close()
+
+    def update_category(
+        self,
+        category_id: int,
+        label: str = None,
+        bg_color: str = None,
+        text_color: str = None,
+        description: str = None,
+    ) -> bool:
+        """Update an existing category."""
+        db = self._db()
+        try:
+            categories_table = db.table("tag_categories")
+            
+            # Build update dict with only non-None values
+            update_data = {}
+            if label is not None:
+                update_data["label"] = label
+            if bg_color is not None:
+                update_data["bg_color"] = bg_color
+            if text_color is not None:
+                update_data["text_color"] = text_color
+            if description is not None:
+                update_data["description"] = description
+            
+            if not update_data:
+                return False
+            
+            categories_table.update(update_data, doc_ids=[category_id])
+            return True
+        finally:
+            db.close()
+
+    def delete_category(self, category_id: int) -> bool:
+        """Delete a category."""
+        db = self._db()
+        try:
+            categories_table = db.table("tag_categories")
+            categories_table.remove(doc_ids=[category_id])
+            return True
+        finally:
+            db.close()
+
+    def initialize_default_categories(self) -> None:
+        """Initialize default tag categories if they don't exist."""
+        db = self._db()
+        try:
+            categories_table = db.table("tag_categories")
+            
+            # Define default categories
+            defaults = [
+                {
+                    "name": "GENERAL",
+                    "label": "Allmän",
+                    "bg_color": "bg-secondary",
+                    "text_color": "text-dark",
+                },
+                {
+                    "name": "DOMAIN_ENTITY",
+                    "label": "Domän-enhet",
+                    "bg_color": "bg-info",
+                    "text_color": "text-dark",
+                },
+                {
+                    "name": "VULNERABILITY",
+                    "label": "Sårbarhet",
+                    "bg_color": "bg-danger",
+                    "text_color": "text-white",
+                },
+                {
+                    "name": "THREAT",
+                    "label": "Hot",
+                    "bg_color": "bg-danger",
+                    "text_color": "text-white",
+                },
+                {
+                    "name": "LOCATION",
+                    "label": "Plats",
+                    "bg_color": "bg-success",
+                    "text_color": "text-dark",
+                },
+                {
+                    "name": "PERSON",
+                    "label": "Person",
+                    "bg_color": "bg-warning",
+                    "text_color": "text-dark",
+                },
+                {
+                    "name": "ORGANIZATION",
+                    "label": "Organisation",
+                    "bg_color": "bg-warning",
+                    "text_color": "text-dark",
+                },
+                {
+                    "name": "PRODUCT",
+                    "label": "Produkt",
+                    "bg_color": "bg-warning",
+                    "text_color": "text-dark",
+                },
+            ]
+            
+            Q = Query()
+            now_ts = int(time.time())
+            
+            for default in defaults:
+                # Check if category exists
+                existing = categories_table.search(Q.name == default["name"])
+                if not existing:
+                    categories_table.insert({
+                        "name": default["name"],
+                        "label": default["label"],
+                        "bg_color": default["bg_color"],
+                        "text_color": default["text_color"],
+                        "description": "",
+                        "created_at": now_ts,
+                    })
+
+            # Migrate tags created before the dedicated CVE category existed.
+            tags_table = db.table("tags")
+            for tag in tags_table.all():
+                if (
+                    is_cve_tag(tag.get("name"))
+                    and tag.get("category") != VULNERABILITY_TAG_CATEGORY
+                ):
+                    tags_table.update(
+                        {"category": VULNERABILITY_TAG_CATEGORY},
+                        doc_ids=[tag.doc_id],
+                    )
         finally:
             db.close()

@@ -87,7 +87,7 @@ class OllamaCloudConfig:
 
     host: str = "https://ollama.com"
     model: str = "gemma3:270m"
-    embedding_model: str = "embedding-gemma"  # Model for embeddings
+    embedding_model: str = "embeddinggemma:latest"  # Model for embeddings
     api_key: str = ""
     # quota/preflight
     preflight: bool = True
@@ -147,7 +147,7 @@ class OllamaCloudClient:
         self.cfg = OllamaCloudConfig(
             host=str(llm_cfg.get("host", "https://ollama.com")),
             model=str(llm_cfg.get("model", "gemma3:270m")),
-            embedding_model=str(llm_cfg.get("embedding_model", "embedding-gemma")),
+            embedding_model=str(llm_cfg.get("embedding_model", "embeddinggemma:latest")),
             api_key=_resolve_env(str(llm_cfg.get("api_key", ""))),
             preflight=bool(quota_cfg.get("preflight", True)),
             min_interval_seconds=float(quota_cfg.get("min_interval_seconds", 1.0)),
