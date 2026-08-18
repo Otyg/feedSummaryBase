@@ -87,7 +87,6 @@ class OllamaCloudConfig:
 
     host: str = "https://ollama.com"
     model: str = "gemma3:270m"
-    embedding_model: str = "embeddinggemma:latest"  # Model for embeddings
     api_key: str = ""
     # quota/preflight
     preflight: bool = True
@@ -147,7 +146,6 @@ class OllamaCloudClient:
         self.cfg = OllamaCloudConfig(
             host=str(llm_cfg.get("host", "https://ollama.com")),
             model=str(llm_cfg.get("model", "gemma3:270m")),
-            embedding_model=str(llm_cfg.get("embedding_model", "embeddinggemma:latest")),
             api_key=_resolve_env(str(llm_cfg.get("api_key", ""))),
             preflight=bool(quota_cfg.get("preflight", True)),
             min_interval_seconds=float(quota_cfg.get("min_interval_seconds", 1.0)),
@@ -280,64 +278,11 @@ class OllamaCloudClient:
                 raise LLMUnavailableError(f"Ollama Cloud: chat misslyckades: {e}") from e
 
     async def embed(self, text: str) -> List[float]:
-        """
-        Generate embeddings for a given text using the embedding model.
-
-        Args:
-            text: Text to embed
-
-        Returns:
-            List of floats representing the embedding vector
-        """
-        if not text or not isinstance(text, str):
-            return []
-
-        sync = self._get_loop_sync()
-        async with sync.concurrency_sem:
-            await self._throttle()
-            await self._preflight_quota_check()
-
-            self.log.debug("Embedding request (model=%s, text_len=%d)", self.cfg.embedding_model, len(text))
-
-            try:
-                resp = await self._client.embeddings(
-                    model=self.cfg.embedding_model,
-                    input=text,
-                )
-                
-                if isinstance(resp, dict):
-                    embeddings = resp.get("embeddings", [])
-                    if embeddings and len(embeddings) > 0:
-                        first = embeddings[0]
-                        if isinstance(first, (list, tuple)):
-                            return list(first)
-                        return []
-                
-                return []
-            except Exception as e:
-                try:
-                    body = getattr(e, "error", None) or getattr(e, "message", None) or str(e)
-                    if isinstance(body, str) and body.strip():
-                        self.log.error("Ollama Cloud embedding error: %s", body[:500])
-                except Exception:
-                    pass
-
-                if _is_status(e, 401) or _is_status(e, 403):
-                    raise LLMAuthError("Ollama Cloud: auth misslyckades.") from e
-
-                if _is_status(e, 429):
-                    ra = _extract_retry_after_seconds(e)
-                    raise LLMRateLimitError("Ollama Cloud: rate limit/quota.", ra) from e
-
-                if _is_status(e, 500):
-                    raise LLMUnavailableError(f"Ollama Cloud: server error 500: {e}") from e
-
-                name = e.__class__.__name__.lower()
-                if "timeout" in name:
-                    raise LLMUnavailableError(f"Ollama Cloud: timeout: {e}") from e
-
-                self.log.error("Embedding request failed: %s", e)
-                return []
+        """Reject cloud embeddings; embedding models must run through ollama_local."""
+        raise RuntimeError(
+            "Ollama Cloud används inte för embeddings. "
+            "Lägg till en ollama_local-konfiguration med embedding_model."
+        )
 
     async def aclose(self) -> None:
         """

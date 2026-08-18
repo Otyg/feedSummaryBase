@@ -48,6 +48,12 @@ class LLMClient(Protocol):
     async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str: ...
 
 
+class EmbeddingClient(Protocol):
+    """Minimal async embedding contract used by the fallback wrapper."""
+
+    async def embed(self, text: str) -> List[float]: ...
+
+
 @dataclass
 class FallbackPolicy:
     """Retry and wait settings for quota-triggered provider fallback."""
@@ -70,11 +76,17 @@ class FallbackLLMClient:
       - Finns ingen nästa provider: bubbla felet.
     """
 
-    def __init__(self, clients: List[LLMClient], policy: Optional[FallbackPolicy] = None):
+    def __init__(
+        self,
+        clients: List[LLMClient],
+        policy: Optional[FallbackPolicy] = None,
+        embedding_client: Optional[EmbeddingClient] = None,
+    ):
         if not clients:
             raise ValueError("FallbackLLMClient kräver minst en LLM-klient.")
         self.clients = clients
         self.policy = policy or FallbackPolicy()
+        self.embedding_client = embedding_client
         self._active_idx = 0
         self._blocked_indices: set[int] = set()
 
@@ -174,65 +186,22 @@ class FallbackLLMClient:
 
     async def embed(self, text: str) -> List[float]:
         """
-        Generate embeddings using the first available LLM client.
-        Falls back to next provider if current fails.
-        
+        Generate embeddings exclusively through the configured local Ollama client.
+
         Args:
             text: Text to embed
-            
+
         Returns:
             List of floats representing the embedding vector
         """
-        provider_idx = self._next_provider_idx(self._active_idx)
-        if provider_idx is None:
-            raise RuntimeError("Ingen LLM-provider tillgänglig för embeddings.")
+        if not text or not isinstance(text, str):
+            return []
+        if self.embedding_client is None:
+            raise RuntimeError(
+                "Embeddings kräver en ollama_local-konfiguration i LLM-kedjan."
+            )
 
-        while True:
-            active = self.clients[provider_idx]
-
-            # Check if client supports embedding
-            if not hasattr(active, 'embed'):
-                next_idx = self._next_provider_idx(provider_idx + 1)
-                if next_idx is not None:
-                    provider_idx = next_idx
-                    continue
-                raise RuntimeError("Ingen LLM-provider stöder embeddings.")
-
-            attempt = 0
-            while True:
-                try:
-                    return await active.embed(text)
-                except LLMUnavailableError as e:
-                    attempt += 1
-                    wait_s = int(self.policy.default_wait_s)
-
-                    if attempt > self.policy.max_quota_retries:
-                        next_idx = self._next_provider_idx(provider_idx + 1)
-                        if next_idx is not None:
-                            log.warning("Embedding provider otillgänglig, provar nästa.")
-                            provider_idx = next_idx
-                            break
-                        raise
-
-                    log.warning("Embedding provider otillgänglig, retry %d/%d...",
-                                attempt, self.policy.max_quota_retries)
-                    await asyncio.sleep(wait_s)
-                except LLMRateLimitError as e:
-                    attempt += 1
-                    wait_s = int(e.retry_after_seconds or self.policy.default_wait_s)
-
-                    if attempt > self.policy.max_quota_retries:
-                        next_idx = self._try_advance_provider_permanently(
-                            provider_idx, "embedding quota/rate-limit"
-                        )
-                        if next_idx is not None:
-                            provider_idx = next_idx
-                            break
-                        raise
-
-                    log.warning("Embedding rate-limited (attempt %d/%d), väntar %ss...",
-                                attempt, self.policy.max_quota_retries, wait_s)
-                    await asyncio.sleep(wait_s)
+        return await self.embedding_client.embed(text)
 
     async def aclose(self) -> None:
         """

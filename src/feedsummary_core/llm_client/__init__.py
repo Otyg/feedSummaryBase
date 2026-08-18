@@ -143,6 +143,14 @@ def create_llm_client(config: Dict[str, Any]):
         raise ValueError("Saknar LLM-konfiguration: config['llm'] är tom.")
 
     clients = [_create_single_llm(c) for c in chain_cfgs]
+    embedding_client = next(
+        (
+            client
+            for client, cfg in zip(clients, chain_cfgs)
+            if str(cfg.get("provider") or "").strip().lower() == "ollama_local"
+        ),
+        None,
+    )
 
     # Policy tas från primär (första) config.
     quota_cfg = (chain_cfgs[0].get("quota") or {}) if chain_cfgs else {}
@@ -153,4 +161,8 @@ def create_llm_client(config: Dict[str, Any]):
 
     if len(clients) == 1:
         return clients[0]
-    return FallbackLLMClient(clients=clients, policy=policy)
+    return FallbackLLMClient(
+        clients=clients,
+        policy=policy,
+        embedding_client=embedding_client,
+    )
