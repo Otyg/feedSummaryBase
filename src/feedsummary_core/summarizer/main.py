@@ -1559,6 +1559,7 @@ async def run_tag_based_summary(
     lookback: Optional[str] = None,
     config_dict: Optional[Dict[str, Any]] = None,
     llm=None,
+    prompt_package: Optional[str] = None,
 ) -> Optional[str]:
     """
     Summarize articles with specific tags from a given time period (no new fetch).
@@ -1573,6 +1574,7 @@ async def run_tag_based_summary(
         lookback: Time window (e.g., "1d", "1w") - if None uses config default
         config_dict: Optional config dict instead of loading from file
         llm: Optional LLM client to use
+        prompt_package: Optional named package from the configured prompt root
         
     Returns: summary_id on success, None on failure
     """
@@ -1590,6 +1592,11 @@ async def run_tag_based_summary(
         if lookback:
             ingest = config.setdefault("ingest", {})
             ingest["lookback"] = lookback
+
+        if prompt_package and prompt_package.strip():
+            prompts = config.setdefault("prompts", {})
+            if isinstance(prompts, dict):
+                prompts["selected"] = prompt_package.strip()
 
         store = create_store(config.get("store", {}))
         if llm is None:
@@ -1613,15 +1620,18 @@ async def run_tag_based_summary(
         # Retrieve articles with specified tags
         articles = []
         if tag_names and isinstance(tag_names, list):
-            # Get store method for retrieving articles by tags
-            list_by_tags = getattr(store, "list_articles_by_tags", None)
-            if callable(list_by_tags):
-                articles = list_by_tags(
-                    tag_names=tag_names,
-                    since_ts=since_ts if since_ts > 0 else 0,
-                    until_ts=now,
-                    limit=2000,
-                )
+            # Use the tag query exposed by the store protocol. Tag-based summaries
+            # may intentionally reuse already summarized articles, so this must not
+            # be restricted to list_unsummarized_articles().
+            get_by_tags = getattr(store, "get_articles_by_tags", None)
+            if callable(get_by_tags):
+                articles = get_by_tags(tag_names=tag_names, match_mode="any")
+                articles = [
+                    article
+                    for article in articles
+                    if (since_ts <= 0 or _published_ts(article) >= since_ts)
+                    and _published_ts(article) <= now
+                ][:2000]
             else:
                 # Fallback: get all articles and filter by tags manually
                 all_articles = store.list_unsummarized_articles(limit=5000)
