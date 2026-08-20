@@ -15,6 +15,7 @@ Core library for intelligent RSS feed summarization with LLM support and advance
 - **Multi-Backend Persistence**:
   - SQLite (production-grade SQL storage)
   - TinyDB (JSON-based storage for development)
+  - MongoDB (shared, production-grade document storage)
 - **Job Management**: Track and resume summarization jobs
 - **Batching & Chunking**: Intelligent content batching with token budget management
 - **Proofread & Revise**: LLM-based quality improvement for generated summaries
@@ -66,6 +67,25 @@ tags = store.get_all_tags()
 - File-based storage (news_docs.json)
 - No external dependencies
 - Complete feature parity with SqliteStore
+
+**MongoDBStore** - MongoDB document backend
+- Indexed collections for articles, summaries, jobs, tags, and categories
+- Atomic integer IDs for compatibility with the existing store interface
+- Complete feature parity with TinyDB and SQLite
+
+Install the MongoDB driver and configure the backend:
+
+```bash
+pip install "feedsummary-core[mongodb]"
+```
+
+```python
+store = create_store({
+    "provider": "mongodb",
+    "uri": "mongodb://localhost:27017",
+    "database": "feedsummary",
+})
+```
 
 ### LLM Client (`llm_client/`)
 
@@ -130,7 +150,7 @@ feeds:
     enabled: true
 
 store:
-  type: "sqlite"      # or "tinydb"
+  provider: "sqlite"  # sqlite, tinydb, or mongodb
   path: "news.db"
 
 llm:
@@ -184,6 +204,10 @@ llm:
 Set `similarity_enabled: false` to retain sequential batching. If embeddings
 cannot be generated, the summarizer automatically falls back to sequential
 batching.
+
+Article and tag embeddings are persisted by every storage backend. Cache entries
+contain `embedding_vector`, `embedding_model`, `embedding_source_hash`, and
+`embedding_updated_at`; they are reused until the embedded text or model changes.
 
 ## Usage Examples
 

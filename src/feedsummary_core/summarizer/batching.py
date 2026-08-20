@@ -31,6 +31,7 @@
 #
 
 import asyncio
+import hashlib
 import logging
 import math
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -38,6 +39,29 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 from feedsummary_core.summarizer.helpers import text_clip
 
 logger = logging.getLogger(__name__)
+
+
+def embedding_source_hash(text: str) -> str:
+    """Return a stable fingerprint for the exact text sent to the embedding model."""
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def cached_embedding(
+    document: dict,
+    text: str,
+    embedding_model: str = "",
+) -> Optional[List[float]]:
+    """Return a persisted embedding only when its model and source text still match."""
+    vector = document.get("embedding_vector")
+    if not isinstance(vector, list) or not vector:
+        return None
+    if not all(isinstance(value, (int, float)) for value in vector):
+        return None
+    if document.get("embedding_source_hash") != embedding_source_hash(text):
+        return None
+    if str(document.get("embedding_model") or "") != str(embedding_model or ""):
+        return None
+    return [float(value) for value in vector]
 
 
 def batch_articles(
@@ -140,18 +164,13 @@ def _batch_similarity_groups(
         group = list(group_items)
         group_chars = sum(_estimate_article_chars(article) for article in group)
         group_fits = (
-            (not max_articles_per_batch or len(group) <= max_articles_per_batch)
-            and group_chars <= max_chars_per_batch
-        )
+            not max_articles_per_batch or len(group) <= max_articles_per_batch
+        ) and group_chars <= max_chars_per_batch
 
         if group_fits:
             combined_fits = (
-                (
-                    not max_articles_per_batch
-                    or len(current) + len(group) <= max_articles_per_batch
-                )
-                and _batch_chars(current) + group_chars <= max_chars_per_batch
-            )
+                not max_articles_per_batch or len(current) + len(group) <= max_articles_per_batch
+            ) and _batch_chars(current) + group_chars <= max_chars_per_batch
             if current and not combined_fits:
                 flush()
             current.extend(group)
@@ -181,34 +200,64 @@ async def group_articles_by_similarity(
     embedding_text_chars: int = 2000,
     similarity_threshold: float = 0.78,
     max_concurrency: int = 4,
+    store: Any = None,
+    embedding_model: str = "",
 ) -> List[List[dict]]:
     """Embed articles and return stable groups that likely describe the same story."""
     embedding_inputs: List[str] = []
     for article in articles:
         title = str(article.get("title", "") or "").strip()
         article_body = (
-            article.get("text", "")
-            or article.get("content", "")
-            or article.get("summary", "")
+            article.get("text", "") or article.get("content", "") or article.get("summary", "")
         )
         body = text_clip(article_body, embedding_text_chars).strip()
         embedding_inputs.append("\n\n".join(part for part in (title, body) if part))
 
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def embed_one(text: str) -> Optional[List[float]]:
+    async def embed_one(article: dict, text: str) -> Optional[List[float]]:
         if not text:
             return None
+        persisted = cached_embedding(article, text, embedding_model)
+        if persisted is not None:
+            return persisted
         try:
             async with semaphore:
                 vector = await embed(text)
             if vector and all(isinstance(value, (int, float)) for value in vector):
-                return [float(value) for value in vector]
+                normalized = [float(value) for value in vector]
+                article_id = str(article.get("id") or "").strip()
+                update_embedding = getattr(store, "update_article_embedding", None)
+                if article_id and callable(update_embedding):
+                    try:
+                        source_hash = embedding_source_hash(text)
+                        update_embedding(
+                            article_id,
+                            normalized,
+                            model=embedding_model,
+                            source_hash=source_hash,
+                        )
+                        article.update(
+                            {
+                                "embedding_vector": normalized,
+                                "embedding_model": embedding_model,
+                                "embedding_source_hash": source_hash,
+                            }
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Kunde inte spara artikel-embedding för %s: %s",
+                            article_id,
+                            exc,
+                        )
+                return normalized
         except Exception as exc:
             logger.warning("Kunde inte skapa artikel-embedding: %s", exc)
         return None
 
-    embeddings = await asyncio.gather(*(embed_one(text) for text in embedding_inputs))
+    embeddings = await asyncio.gather(
+        *(embed_one(article, text) for article, text in zip(articles, embedding_inputs))
+    )
     usable = sum(vector is not None for vector in embeddings)
     if usable < 2:
         logger.warning(
@@ -238,6 +287,8 @@ async def batch_articles_by_similarity(
     embedding_text_chars: int = 2000,
     similarity_threshold: float = 0.78,
     max_concurrency: int = 4,
+    store: Any = None,
+    embedding_model: str = "",
 ) -> List[List[dict]]:
     """Embed articles, group likely duplicate stories, and create bounded batches."""
     clipped: List[dict] = []
@@ -252,6 +303,8 @@ async def batch_articles_by_similarity(
         embedding_text_chars=embedding_text_chars,
         similarity_threshold=similarity_threshold,
         max_concurrency=max_concurrency,
+        store=store,
+        embedding_model=embedding_model,
     )
     return _batch_similarity_groups(
         groups,

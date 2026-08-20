@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Protocol
 from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
 from feedsummary_core.persistence.TinyDbStore import TinyDBStore
 from feedsummary_core.persistence.SqliteStore import SqliteStore
+from feedsummary_core.persistence.MongoDBStore import MongoDBStore
 
 
 class StoreError(Exception):
@@ -52,6 +53,15 @@ class NewsStore(Protocol):
     def get_article(self, article_id: str) -> Optional[Dict[str, Any]]: ...
 
     def upsert_article(self, article_doc: Dict[str, Any]) -> None: ...
+
+    def update_article_embedding(
+        self,
+        article_id: str,
+        embedding_vector: List[float],
+        *,
+        model: Optional[str] = None,
+        source_hash: Optional[str] = None,
+    ) -> bool: ...
 
     def list_unsummarized_articles(self, limit: int = 200) -> List[Dict[str, Any]]: ...
 
@@ -113,11 +123,73 @@ class NewsStore(Protocol):
 
     def cleanup_unused_tags(self, days: int = 30) -> int: ...
 
+    def remove_article_tag(self, article_id: str, tag_id: int) -> bool: ...
+
+    def create_tag(
+        self,
+        name: str,
+        category: str = "GENERAL",
+        description: str = "",
+    ) -> Optional[Dict[str, Any]]: ...
+
+    def update_tag(
+        self,
+        tag_id: int,
+        name: Optional[str] = None,
+        category: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]: ...
+
+    def delete_tag(self, tag_id: int) -> bool: ...
+
+    def update_tag_embedding(
+        self,
+        tag_id: int,
+        embedding_vector: List[float],
+        *,
+        model: Optional[str] = None,
+        source_hash: Optional[str] = None,
+    ) -> bool: ...
+
+    def get_tags_by_embedding_similarity(
+        self,
+        embedding_vector: List[float],
+        similarity_threshold: float = 0.75,
+        limit: int = 10,
+        model: Optional[str] = None,
+    ) -> List[Dict[str, Any]]: ...
+
     def get_articles_by_tags(
         self,
         tag_names: List[str],
         match_mode: str = "any",
     ) -> List[Dict[str, Any]]: ...
+
+    def get_all_categories(self) -> List[Dict[str, Any]]: ...
+
+    def get_category(self, category_id: int) -> Optional[Dict[str, Any]]: ...
+
+    def create_category(
+        self,
+        name: str,
+        label: str,
+        bg_color: str = "bg-secondary",
+        text_color: str = "text-dark",
+        description: str = "",
+    ) -> Optional[Dict[str, Any]]: ...
+
+    def update_category(
+        self,
+        category_id: int,
+        label: Optional[str] = None,
+        bg_color: Optional[str] = None,
+        text_color: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> bool: ...
+
+    def delete_category(self, category_id: int) -> bool: ...
+
+    def initialize_default_categories(self) -> None: ...
 
 
 def _expand_path(p: str) -> str:
@@ -128,7 +200,7 @@ def _expand_path(p: str) -> str:
 def create_store(cfg: Dict[str, Any]) -> NewsStore:
     """Instantiate the configured storage backend and ensure its parent path exists."""
 
-    provider = (cfg.get("provider") or "tinydb").lower()
+    provider = (cfg.get("provider") or cfg.get("type") or "tinydb").lower()
 
     if provider == "tinydb":
         raw_path = cfg.get("path", "news_docs.json")
@@ -141,5 +213,13 @@ def create_store(cfg: Dict[str, Any]) -> NewsStore:
         path = _expand_path(raw_path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         return SqliteStore(path=path)  # type: ignore
+
+    if provider in ("mongo", "mongodb"):
+        return MongoDBStore(
+            uri=cfg.get("uri", "mongodb://localhost:27017"),
+            database=cfg.get("database") or cfg.get("database_name") or "feedsummary",
+            client=cfg.get("client"),
+            connect_timeout_ms=int(cfg.get("connect_timeout_ms", 5000)),
+        )  # type: ignore
 
     raise ValueError(f"Unsupported store provider: {provider}")

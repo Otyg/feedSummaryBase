@@ -142,6 +142,10 @@ class SqliteStore:
                     content_hash  TEXT,
                     summarized    INTEGER DEFAULT 0,
                     summarized_at INTEGER,
+                    embedding_vector TEXT,
+                    embedding_model TEXT,
+                    embedding_source_hash TEXT,
+                    embedding_updated_at INTEGER,
                     doc_json      TEXT NOT NULL
                 );
 
@@ -191,6 +195,9 @@ class SqliteStore:
                     category        TEXT DEFAULT 'GENERAL',
                     description     TEXT,
                     embedding_vector TEXT,
+                    embedding_model TEXT,
+                    embedding_source_hash TEXT,
+                    embedding_updated_at INTEGER,
                     created_at      INTEGER,
                     updated_at      INTEGER
                 );
@@ -221,6 +228,29 @@ class SqliteStore:
                     WHERE url IS NOT NULL AND url != '';
                 """
             )
+
+            # Add embedding cache columns to databases created by older versions.
+            migrations = {
+                "articles": {
+                    "embedding_vector": "TEXT",
+                    "embedding_model": "TEXT",
+                    "embedding_source_hash": "TEXT",
+                    "embedding_updated_at": "INTEGER",
+                },
+                "tags": {
+                    "embedding_model": "TEXT",
+                    "embedding_source_hash": "TEXT",
+                    "embedding_updated_at": "INTEGER",
+                },
+            }
+            for table, columns in migrations.items():
+                existing = {
+                    str(row["name"])
+                    for row in con.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, column_type in columns.items():
+                    if column not in existing:
+                        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
             con.commit()
         finally:
             con.close()
@@ -250,6 +280,17 @@ class SqliteStore:
         doc = dict(article_doc)
         aid = str(doc["id"])
 
+        existing_doc = self.get_article(aid)
+        if existing_doc:
+            for field in (
+                "embedding_vector",
+                "embedding_model",
+                "embedding_source_hash",
+                "embedding_updated_at",
+            ):
+                if field not in doc and field in existing_doc:
+                    doc[field] = existing_doc[field]
+
         url = (doc.get("url") or "").strip() or None
         source = (doc.get("source") or "").strip() or None
         title = (doc.get("title") or "").strip() or None
@@ -260,6 +301,13 @@ class SqliteStore:
 
         summarized = 1 if bool(doc.get("summarized")) else 0
         summarized_at = _safe_int(doc.get("summarized_at"), 0) or None
+        embedding_vector = doc.get("embedding_vector")
+        embedding_json = (
+            _json_dumps(embedding_vector) if isinstance(embedding_vector, list) else None
+        )
+        embedding_model = str(doc.get("embedding_model") or "") or None
+        embedding_source_hash = str(doc.get("embedding_source_hash") or "") or None
+        embedding_updated_at = _safe_int(doc.get("embedding_updated_at"), 0) or None
 
         doc_json = _json_dumps(doc)
 
@@ -269,9 +317,11 @@ class SqliteStore:
                 """
                 INSERT INTO articles (
                     id, url, source, title, published, published_ts, fetched_at,
-                    content_hash, summarized, summarized_at, doc_json
+                    content_hash, summarized, summarized_at, embedding_vector,
+                    embedding_model, embedding_source_hash, embedding_updated_at,
+                    doc_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     url=excluded.url,
                     source=excluded.source,
@@ -282,6 +332,10 @@ class SqliteStore:
                     content_hash=excluded.content_hash,
                     summarized=excluded.summarized,
                     summarized_at=excluded.summarized_at,
+                    embedding_vector=excluded.embedding_vector,
+                    embedding_model=excluded.embedding_model,
+                    embedding_source_hash=excluded.embedding_source_hash,
+                    embedding_updated_at=excluded.embedding_updated_at,
                     doc_json=excluded.doc_json
                 """,
                 (
@@ -295,10 +349,66 @@ class SqliteStore:
                     content_hash,
                     summarized,
                     summarized_at,
+                    embedding_json,
+                    embedding_model,
+                    embedding_source_hash,
+                    embedding_updated_at,
                     doc_json,
                 ),
             )
             con.commit()
+        finally:
+            con.close()
+
+    def update_article_embedding(
+        self,
+        article_id: str,
+        embedding_vector: List[float],
+        *,
+        model: Optional[str] = None,
+        source_hash: Optional[str] = None,
+    ) -> bool:
+        """Persist a reusable embedding for an existing article."""
+        if not article_id or not embedding_vector or not all(
+            isinstance(value, (int, float)) for value in embedding_vector
+        ):
+            return False
+        normalized = [float(value) for value in embedding_vector]
+        updated_at = _now_ts()
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT doc_json FROM articles WHERE id = ?", (str(article_id),)
+            ).fetchone()
+            if not row:
+                return False
+            doc = _json_loads(row["doc_json"]) or {}
+            doc.update(
+                {
+                    "embedding_vector": normalized,
+                    "embedding_model": str(model or ""),
+                    "embedding_source_hash": str(source_hash or ""),
+                    "embedding_updated_at": updated_at,
+                }
+            )
+            con.execute(
+                """
+                UPDATE articles
+                SET embedding_vector = ?, embedding_model = ?,
+                    embedding_source_hash = ?, embedding_updated_at = ?, doc_json = ?
+                WHERE id = ?
+                """,
+                (
+                    _json_dumps(normalized),
+                    str(model or ""),
+                    str(source_hash or ""),
+                    updated_at,
+                    _json_dumps(doc),
+                    str(article_id),
+                ),
+            )
+            con.commit()
+            return True
         finally:
             con.close()
 
@@ -860,7 +970,11 @@ class SqliteStore:
         con = self._connect()
         try:
             row = con.execute(
-                "SELECT id, name, category, description, embedding_vector, created_at FROM tags WHERE name = ?",
+                """
+                SELECT id, name, category, description, embedding_vector,
+                       embedding_model, embedding_source_hash, embedding_updated_at, created_at
+                FROM tags WHERE name = ?
+                """,
                 (name,),
             ).fetchone()
             if row:
@@ -877,6 +991,9 @@ class SqliteStore:
                     try:
                         import json
                         tag_dict["embedding_vector"] = json.loads(embedding_str)
+                        tag_dict["embedding_model"] = row["embedding_model"] or ""
+                        tag_dict["embedding_source_hash"] = row["embedding_source_hash"] or ""
+                        tag_dict["embedding_updated_at"] = row["embedding_updated_at"]
                     except Exception:
                         pass
                 return tag_dict
@@ -889,7 +1006,11 @@ class SqliteStore:
         con = self._connect()
         try:
             rows = con.execute(
-                "SELECT id, name, category, description, embedding_vector, created_at FROM tags ORDER BY name"
+                """
+                SELECT id, name, category, description, embedding_vector,
+                       embedding_model, embedding_source_hash, embedding_updated_at, created_at
+                FROM tags ORDER BY name
+                """
             ).fetchall()
             out: List[Dict[str, Any]] = []
             for row in rows:
@@ -906,6 +1027,9 @@ class SqliteStore:
                     try:
                         import json
                         tag_dict["embedding_vector"] = json.loads(embedding_str)
+                        tag_dict["embedding_model"] = row["embedding_model"] or ""
+                        tag_dict["embedding_source_hash"] = row["embedding_source_hash"] or ""
+                        tag_dict["embedding_updated_at"] = row["embedding_updated_at"]
                     except Exception:
                         pass
                 out.append(tag_dict)
@@ -1129,6 +1253,10 @@ class SqliteStore:
             updates = {}
             if name is not None:
                 updates["name"] = name.strip()
+                updates["embedding_vector"] = None
+                updates["embedding_model"] = None
+                updates["embedding_source_hash"] = None
+                updates["embedding_updated_at"] = None
             if category is not None:
                 updates["category"] = category.strip() or "GENERAL"
             if description is not None:
@@ -1214,7 +1342,14 @@ class SqliteStore:
         finally:
             con.close()
 
-    def update_tag_embedding(self, tag_id: int, embedding_vector: List[float]) -> bool:
+    def update_tag_embedding(
+        self,
+        tag_id: int,
+        embedding_vector: List[float],
+        *,
+        model: Optional[str] = None,
+        source_hash: Optional[str] = None,
+    ) -> bool:
         """
         Update the embedding vector for a tag.
         
@@ -1235,12 +1370,25 @@ class SqliteStore:
         try:
             import json
             embedding_json = json.dumps(embedding_vector, separators=(",", ":"))
-            con.execute(
-                "UPDATE tags SET embedding_vector = ?, updated_at = ? WHERE id = ?",
-                (embedding_json, _now_ts(), tag_id),
+            now = _now_ts()
+            cursor = con.execute(
+                """
+                UPDATE tags
+                SET embedding_vector = ?, embedding_model = ?, embedding_source_hash = ?,
+                    embedding_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    embedding_json,
+                    str(model or ""),
+                    str(source_hash or ""),
+                    now,
+                    now,
+                    tag_id,
+                ),
             )
             con.commit()
-            return True
+            return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Error updating tag embedding: {e}")
             return False
@@ -1252,6 +1400,7 @@ class SqliteStore:
         embedding_vector: List[float],
         similarity_threshold: float = 0.75,
         limit: int = 10,
+        model: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Find tags with embeddings similar to the given embedding.
@@ -1271,7 +1420,11 @@ class SqliteStore:
         con = self._connect()
         try:
             rows = con.execute(
-                "SELECT id, name, category, description, embedding_vector, created_at FROM tags WHERE embedding_vector IS NOT NULL ORDER BY name"
+                """
+                SELECT id, name, category, description, embedding_vector,
+                       embedding_model, embedding_source_hash, embedding_updated_at, created_at
+                FROM tags WHERE embedding_vector IS NOT NULL ORDER BY name
+                """
             ).fetchall()
             
             results: List[Tuple[Dict[str, Any], float]] = []
@@ -1279,7 +1432,9 @@ class SqliteStore:
             for row in rows:
                 try:
                     import json
-                    embedding_str = row.get("embedding_vector")
+                    if model is not None and str(row["embedding_model"] or "") != str(model):
+                        continue
+                    embedding_str = row["embedding_vector"]
                     if not embedding_str:
                         continue
                     
@@ -1298,6 +1453,9 @@ class SqliteStore:
                             "description": row["description"],
                             "created_at": row["created_at"],
                             "embedding_vector": tag_embedding,
+                            "embedding_model": row["embedding_model"] or "",
+                            "embedding_source_hash": row["embedding_source_hash"] or "",
+                            "embedding_updated_at": row["embedding_updated_at"],
                             "_similarity_score": similarity,  # Include similarity for debugging
                         }
                         results.append((tag_dict, similarity))

@@ -76,6 +76,35 @@ class TinyDBStore:
         db.table("articles").upsert(article_doc, A.id == article_doc["id"])
         db.close()
 
+    def update_article_embedding(
+        self,
+        article_id: str,
+        embedding_vector: List[float],
+        *,
+        model: Optional[str] = None,
+        source_hash: Optional[str] = None,
+    ) -> bool:
+        """Persist a reusable embedding for an existing article."""
+        if not article_id or not embedding_vector or not all(
+            isinstance(value, (int, float)) for value in embedding_vector
+        ):
+            return False
+        db = self._db()
+        try:
+            A = Query()
+            updated = db.table("articles").update(
+                {
+                    "embedding_vector": [float(value) for value in embedding_vector],
+                    "embedding_model": str(model or ""),
+                    "embedding_source_hash": str(source_hash or ""),
+                    "embedding_updated_at": int(time.time()),
+                },
+                A.id == str(article_id),
+            )
+            return bool(updated)
+        finally:
+            db.close()
+
     def list_articles(self, limit: int = 2000) -> List[Dict[str, Any]]:
         """
         Returnera artiklar utan att använda 'summarized'-flagga.
@@ -447,6 +476,9 @@ class TinyDBStore:
                 # Include embedding_vector if present
                 if "embedding_vector" in row:
                     tag_dict["embedding_vector"] = row.get("embedding_vector")
+                    tag_dict["embedding_model"] = row.get("embedding_model", "")
+                    tag_dict["embedding_source_hash"] = row.get("embedding_source_hash", "")
+                    tag_dict["embedding_updated_at"] = row.get("embedding_updated_at")
                 return tag_dict
             return None
         finally:
@@ -474,6 +506,9 @@ class TinyDBStore:
                 # Include embedding_vector if present
                 if "embedding_vector" in row:
                     tag_dict["embedding_vector"] = row.get("embedding_vector")
+                    tag_dict["embedding_model"] = row.get("embedding_model", "")
+                    tag_dict["embedding_source_hash"] = row.get("embedding_source_hash", "")
+                    tag_dict["embedding_updated_at"] = row.get("embedding_updated_at")
                 out.append(tag_dict)
             # Sort by name
             out.sort(key=lambda x: x.get("name", ""))
@@ -738,6 +773,10 @@ class TinyDBStore:
             updates = {}
             if name is not None:
                 updates["name"] = name.strip()
+                updates["embedding_vector"] = None
+                updates["embedding_model"] = None
+                updates["embedding_source_hash"] = None
+                updates["embedding_updated_at"] = None
             if category is not None:
                 updates["category"] = category.strip() or "GENERAL"
             if description is not None:
@@ -878,7 +917,14 @@ class TinyDBStore:
         finally:
             db.close()
 
-    def update_tag_embedding(self, tag_id: int, embedding_vector: List[float]) -> bool:
+    def update_tag_embedding(
+        self,
+        tag_id: int,
+        embedding_vector: List[float],
+        *,
+        model: Optional[str] = None,
+        source_hash: Optional[str] = None,
+    ) -> bool:
         """
         Update the embedding vector for a tag.
         
@@ -898,10 +944,16 @@ class TinyDBStore:
         db = self._db()
         try:
             t = db.table("tags")
-            Q = Query()
-            # Update the tag with the embedding_vector
-            t.update({"embedding_vector": embedding_vector}, doc_ids=[tag_id])
-            return True
+            updated = t.update(
+                {
+                    "embedding_vector": [float(value) for value in embedding_vector],
+                    "embedding_model": str(model or ""),
+                    "embedding_source_hash": str(source_hash or ""),
+                    "embedding_updated_at": int(time.time()),
+                },
+                doc_ids=[tag_id],
+            )
+            return bool(updated)
         except Exception as e:
             logger.error(f"Error updating tag embedding: {e}")
             return False
@@ -913,6 +965,7 @@ class TinyDBStore:
         embedding_vector: List[float],
         similarity_threshold: float = 0.75,
         limit: int = 10,
+        model: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Find tags with embeddings similar to the given embedding.
@@ -936,6 +989,8 @@ class TinyDBStore:
             
             for row in rows:
                 if "embedding_vector" not in row or not row.get("embedding_vector"):
+                    continue
+                if model is not None and str(row.get("embedding_model") or "") != str(model):
                     continue
                 
                 try:

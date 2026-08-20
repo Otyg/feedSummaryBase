@@ -54,9 +54,13 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from feedsummary_core.llm_client import LLMClient
+from feedsummary_core.llm_client import LLMClient, get_client_embedding_model
 from feedsummary_core.persistence import NewsStore
-from feedsummary_core.summarizer.batching import group_articles_by_similarity
+from feedsummary_core.summarizer.batching import (
+    cached_embedding,
+    embedding_source_hash,
+    group_articles_by_similarity,
+)
 from feedsummary_core.tagging_rules import (
     CVE_PATTERN,
     VULNERABILITY_TAG_CATEGORY,
@@ -194,7 +198,17 @@ class TagManager:
         try:
             fn = getattr(self.store, "add_tag", None)
             if callable(fn):
-                return fn(name=name, category=category, description=description)
+                tag_id = fn(name=name, category=category, description=description)
+                embedding = self._embedding_cache.get(name)
+                update_embedding = getattr(self.store, "update_tag_embedding", None)
+                if tag_id and embedding and callable(update_embedding):
+                    update_embedding(
+                        tag_id,
+                        embedding,
+                        model=get_client_embedding_model(self.llm_client),
+                        source_hash=embedding_source_hash(name),
+                    )
+                return tag_id
         except Exception as e:
             logger.error(f"Error adding tag: {e}")
         return None
@@ -331,6 +345,8 @@ class TagManager:
             embedding_text_chars=max(1, embedding_text_chars),
             similarity_threshold=min(1.0, max(0.0, similarity_threshold)),
             max_concurrency=max(1, embedding_max_concurrency),
+            store=self.store,
+            embedding_model=get_client_embedding_model(self.llm_client),
         )
         add_tag_to_article = getattr(self.store, "add_tag_to_article", None)
         if not callable(add_tag_to_article):
@@ -551,11 +567,20 @@ class TagManager:
                     # Use the store's embedding similarity method if available
                     fn = getattr(self.store, "get_tags_by_embedding_similarity", None)
                     if callable(fn):
-                        similar_by_embedding = fn(
-                            candidate_embedding,
-                            similarity_threshold=max(0.6, similarity_threshold - 0.1),
-                            limit=5
-                        )
+                        try:
+                            similar_by_embedding = fn(
+                                candidate_embedding,
+                                similarity_threshold=max(0.6, similarity_threshold - 0.1),
+                                limit=5,
+                                model=get_client_embedding_model(self.llm_client),
+                            )
+                        except TypeError:
+                            # Compatibility with external stores implementing the older API.
+                            similar_by_embedding = fn(
+                                candidate_embedding,
+                                similarity_threshold=max(0.6, similarity_threshold - 0.1),
+                                limit=5,
+                            )
                         
                         if similar_by_embedding:
                             # Log the embedding matches found
@@ -646,11 +671,30 @@ class TagManager:
         if text_lower in self._embedding_cache:
             return self._embedding_cache[text_lower]
 
+        model = get_client_embedding_model(self.llm_client)
+        get_tag = getattr(self.store, "get_tag_by_name", None)
+        existing_tag = get_tag(text) if callable(get_tag) else None
+        if isinstance(existing_tag, dict):
+            persisted = cached_embedding(existing_tag, text, model)
+            if persisted is not None:
+                self._embedding_cache[text_lower] = persisted
+                return persisted
+
         try:
             embedding = await self.llm_client.embed(text)
             if embedding:
-                self._embedding_cache[text_lower] = embedding
-            return embedding
+                normalized = [float(value) for value in embedding]
+                self._embedding_cache[text_lower] = normalized
+                update_embedding = getattr(self.store, "update_tag_embedding", None)
+                if existing_tag and callable(update_embedding):
+                    update_embedding(
+                        int(existing_tag["id"]),
+                        normalized,
+                        model=model,
+                        source_hash=embedding_source_hash(text),
+                    )
+                return normalized
+            return None
         except Exception as e:
             logger.warning(f"[TagMatch] Failed to compute embedding for '{text}': {e}")
             return None
@@ -1393,14 +1437,15 @@ If NO tags are relevant, respond with:
             return 0
         
         processed_count = 0
+        embedding_model = get_client_embedding_model(self.llm_client)
         
         for tag in existing_tags:
             try:
                 tag_id = tag.get("id")
                 tag_name = tag.get("name", "")
                 
-                # Skip if already has embedding
-                if tag.get("embedding_vector"):
+                # Skip only when both the source text and model still match.
+                if cached_embedding(tag, tag_name, embedding_model) is not None:
                     continue
                 
                 if not tag_id or not tag_name:
@@ -1413,7 +1458,12 @@ If NO tags are relevant, respond with:
                     # Update tag with embedding
                     fn = getattr(self.store, "update_tag_embedding", None)
                     if callable(fn):
-                        success = fn(tag_id, embedding)
+                        success = fn(
+                            tag_id,
+                            embedding,
+                            model=embedding_model,
+                            source_hash=embedding_source_hash(tag_name),
+                        )
                         if success:
                             processed_count += 1
                             logger.info(f"Generated embedding for tag '{tag_name}'")
@@ -1457,8 +1507,19 @@ If NO tags are relevant, respond with:
             return []
         
         try:
-            # Get article content embedding
-            content_embedding = await self.llm_client.embed(article_content)
+            embedding_model = get_client_embedding_model(self.llm_client)
+            article = self.store.get_article(article_id) or {}
+            content_embedding = cached_embedding(article, article_content, embedding_model)
+            if content_embedding is None:
+                content_embedding = await self.llm_client.embed(article_content)
+                update_embedding = getattr(self.store, "update_article_embedding", None)
+                if content_embedding and callable(update_embedding):
+                    update_embedding(
+                        article_id,
+                        content_embedding,
+                        model=embedding_model,
+                        source_hash=embedding_source_hash(article_content),
+                    )
             
             if not content_embedding:
                 logger.warning(f"Failed to embed content for article {article_id}")
@@ -1470,11 +1531,19 @@ If NO tags are relevant, respond with:
                 logger.warning("Store doesn't support embedding similarity search")
                 return []
             
-            similar_tags = fn(
-                content_embedding,
-                similarity_threshold=similarity_threshold,
-                limit=max_tags
-            )
+            try:
+                similar_tags = fn(
+                    content_embedding,
+                    similarity_threshold=similarity_threshold,
+                    limit=max_tags,
+                    model=embedding_model,
+                )
+            except TypeError:
+                similar_tags = fn(
+                    content_embedding,
+                    similarity_threshold=similarity_threshold,
+                    limit=max_tags,
+                )
             
             logger.info(f"Found {len(similar_tags)} tags matching content for article {article_id}")
             

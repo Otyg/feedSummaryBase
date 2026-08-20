@@ -29,6 +29,10 @@ dependencies = [
   "ollama>=0.6.1",            # :contentReference[oaicite:9]{index=9}
   "lxml_html_clean>=0.4.3",   # :contentReference[oaicite:10]{index=10}
 ]
+
+[project.optional-dependencies]
+mongodb = ["pymongo>=4.10"]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

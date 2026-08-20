@@ -72,6 +72,27 @@ def has_local_embedding_provider(config: Dict[str, Any]) -> bool:
     )
 
 
+def get_local_embedding_model(config: Dict[str, Any]) -> str:
+    """Return the embedding model configured for the first local Ollama provider."""
+    configured = config.get("llm")
+    llm_configs = list(configured) if isinstance(configured, list) else [configured]
+    llm_configs.append(config.get("llm_fallback"))
+    for item in llm_configs:
+        if (
+            isinstance(item, dict)
+            and str(item.get("provider") or "").strip().lower() == "ollama_local"
+        ):
+            return str(item.get("embedding_model") or "embeddinggemma:latest").strip()
+    return ""
+
+
+def get_client_embedding_model(client: Any) -> str:
+    """Return an embedding client's model name without depending on its concrete type."""
+    embedding_client = getattr(client, "embedding_client", None) or client
+    cfg = getattr(embedding_client, "cfg", None)
+    return str(getattr(cfg, "embedding_model", "") or "").strip()
+
+
 def _create_single_llm(llm_cfg: Dict[str, Any]):
     provider = (llm_cfg.get("provider") or "ollama").lower()
 

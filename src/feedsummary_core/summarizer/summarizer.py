@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from feedsummary_core.llm_client import (
     LLMClient,
+    get_local_embedding_model,
     get_primary_llm_config,
     has_local_embedding_provider,
 )
@@ -1253,6 +1254,8 @@ async def summarize_batches_then_meta_with_stats(
             embedding_text_chars=int(batching.get("embedding_text_chars", 2000)),
             similarity_threshold=threshold,
             max_concurrency=int(batching.get("embedding_max_concurrency", 4)),
+            store=store,
+            embedding_model=get_local_embedding_model(config),
         )
 
     # batch resume
