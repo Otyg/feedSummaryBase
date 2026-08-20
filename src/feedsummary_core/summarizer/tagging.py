@@ -56,6 +56,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from feedsummary_core.llm_client import LLMClient
 from feedsummary_core.persistence import NewsStore
+from feedsummary_core.summarizer.batching import group_articles_by_similarity
 from feedsummary_core.tagging_rules import (
     CVE_PATTERN,
     VULNERABILITY_TAG_CATEGORY,
@@ -300,6 +301,118 @@ class TagManager:
         except Exception as e:
             logger.error(f"Error getting article tags: {e}")
         return []
+
+    async def ensure_similar_articles_share_tags(
+        self,
+        articles: List[Dict[str, Any]],
+        *,
+        similarity_threshold: float = 0.78,
+        embedding_text_chars: int = 2000,
+        embedding_max_concurrency: int = 4,
+        max_shared_tags: int = 1,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Add a shared existing tag to similar articles that have no tag overlap.
+
+        The method never removes or replaces tags. A tag already assigned to at
+        least one article in the similarity group is selected, preferring tags
+        used by more group members and general tags over narrower entities.
+        """
+        if (
+            len(articles) < 2
+            or not self.llm_client
+            or not hasattr(self.llm_client, "embed")
+            or max_shared_tags <= 0
+        ):
+            return {}
+
+        groups = await group_articles_by_similarity(
+            articles,
+            self.llm_client.embed,
+            embedding_text_chars=max(1, embedding_text_chars),
+            similarity_threshold=min(1.0, max(0.0, similarity_threshold)),
+            max_concurrency=max(1, embedding_max_concurrency),
+        )
+        add_tag_to_article = getattr(self.store, "add_tag_to_article", None)
+        if not callable(add_tag_to_article):
+            logger.warning("Store doesn't support adding individual tags to articles")
+            return {}
+
+        additions: Dict[str, List[Dict[str, Any]]] = {}
+        category_priority = {
+            self.TAG_CATEGORY_GENERAL: 0,
+            self.TAG_CATEGORY_VULNERABILITY: 1,
+            self.TAG_CATEGORY_DOMAIN_ENTITY: 2,
+        }
+
+        for group in groups:
+            if len(group) < 2:
+                continue
+
+            tags_by_article: Dict[str, List[Dict[str, Any]]] = {}
+            article_by_id: Dict[str, Dict[str, Any]] = {}
+            for article in group:
+                article_id = str(article.get("id") or "").strip()
+                if not article_id:
+                    continue
+                article_by_id[article_id] = article
+                tags_by_article[article_id] = self.get_article_tags(article_id)
+
+            if len(tags_by_article) < 2:
+                continue
+
+            tag_id_sets = [
+                {tag.get("id") for tag in tags if tag.get("id")}
+                for tags in tags_by_article.values()
+            ]
+            if tag_id_sets and set.intersection(*tag_id_sets):
+                continue
+
+            tag_counts: Dict[int, int] = {}
+            tags_by_id: Dict[int, Dict[str, Any]] = {}
+            for tags in tags_by_article.values():
+                for tag in tags:
+                    tag_id = tag.get("id")
+                    if not isinstance(tag_id, int) or tag_id <= 0:
+                        continue
+                    tag_counts[tag_id] = tag_counts.get(tag_id, 0) + 1
+                    tags_by_id[tag_id] = tag
+
+            candidates = sorted(
+                tags_by_id.values(),
+                key=lambda tag: (
+                    -tag_counts[int(tag["id"])],
+                    category_priority.get(str(tag.get("category") or ""), 3),
+                    str(tag.get("name") or "").lower(),
+                ),
+            )[:max_shared_tags]
+
+            for tag in candidates:
+                tag_id = int(tag["id"])
+                tag_name = str(tag.get("name") or "")
+                for article_id, existing_tags in tags_by_article.items():
+                    if any(existing.get("id") == tag_id for existing in existing_tags):
+                        continue
+                    if not add_tag_to_article(article_id, tag_id):
+                        continue
+
+                    shared_tag = dict(tag)
+                    shared_tag["reasoning"] = "Delad från semantiskt liknande artikel."
+                    existing_tags.append(shared_tag)
+                    additions.setdefault(article_id, []).append(shared_tag)
+
+                    article = article_by_id[article_id]
+                    article_tag_names = list(article.get("tags") or [])
+                    if tag_name and tag_name not in article_tag_names:
+                        article["tags"] = article_tag_names + [tag_name]
+                        self.store.upsert_article(article)
+
+        if additions:
+            logger.info(
+                "[TagConsistency] Added %d shared tag associations to %d articles.",
+                sum(len(tags) for tags in additions.values()),
+                len(additions),
+            )
+        return additions
 
     def _is_relevant_new_tag(self, text: str) -> bool:
         """

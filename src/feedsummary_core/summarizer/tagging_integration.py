@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from feedsummary_core.llm_client import LLMClient
+from feedsummary_core.llm_client import LLMClient, has_local_embedding_provider
 from feedsummary_core.persistence import NewsStore
 from feedsummary_core.summarizer.tagging import TagManager
 
@@ -130,6 +130,44 @@ async def tag_articles(
         except Exception as e:
             logger.error(f"Error tagging article {article_id}: {e}")
             results[article_id] = []
+
+    tagging_cfg = config.get("tagging", {}) or {}
+    consistency_cfg = tagging_cfg.get("similarity_consistency", {}) or {}
+    batching_cfg = config.get("batching", {}) or {}
+    consistency_enabled = bool(consistency_cfg.get("enabled", True))
+    if (
+        consistency_enabled
+        and enable_embedding_matching
+        and has_local_embedding_provider(config)
+    ):
+        try:
+            articles = [store.get_article(article_id) for article_id in article_ids]
+            additions = await tag_manager.ensure_similar_articles_share_tags(
+                [article for article in articles if article],
+                similarity_threshold=float(
+                    consistency_cfg.get(
+                        "similarity_threshold",
+                        batching_cfg.get("similarity_threshold", 0.78),
+                    )
+                ),
+                embedding_text_chars=int(
+                    consistency_cfg.get(
+                        "embedding_text_chars",
+                        batching_cfg.get("embedding_text_chars", 2000),
+                    )
+                ),
+                embedding_max_concurrency=int(
+                    consistency_cfg.get(
+                        "embedding_max_concurrency",
+                        batching_cfg.get("embedding_max_concurrency", 4),
+                    )
+                ),
+                max_shared_tags=int(consistency_cfg.get("max_shared_tags", 1)),
+            )
+            for article_id in additions:
+                results[article_id] = store.get_article_tags(article_id)
+        except Exception as e:
+            logger.warning("Could not reconcile tags for similar articles: %s", e)
 
     return results
 

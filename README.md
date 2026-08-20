@@ -150,7 +150,40 @@ tagging:
   max_tags_per_article: 5
   use_similarity_matching: true
   similarity_threshold: 0.6
+  similarity_consistency:
+    enabled: true
+    similarity_threshold: 0.78
+    max_shared_tags: 1
 ```
+
+After all articles in a run have been tagged, similarity consistency checks
+embedding-based article groups for tag overlap. If a group has no tag shared by
+all members, the most common existing general tag is added to the missing
+articles. Existing tags are never removed or replaced.
+
+### Similarity-based batching
+
+When the LLM chain contains an `ollama_local` provider, articles are embedded with
+that provider's configured `embedding_model`. Articles above the similarity
+threshold are kept in the same summary batch whenever the hard article and
+character limits allow it.
+
+```yaml
+batching:
+  similarity_enabled: true
+  similarity_threshold: 0.78
+  embedding_text_chars: 2000
+  embedding_max_concurrency: 4
+
+llm:
+  provider: ollama_local
+  model: qwen2.5:7b
+  embedding_model: embeddinggemma:latest
+```
+
+Set `similarity_enabled: false` to retain sequential batching. If embeddings
+cannot be generated, the summarizer automatically falls back to sequential
+batching.
 
 ## Usage Examples
 
