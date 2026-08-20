@@ -405,6 +405,17 @@ class TagManager:
                 if str(tag.get("name") or "").strip().lower() == tag_lower
             ][:1]
 
+        # An exact name must always win over semantic matching. Otherwise an
+        # embedding result in another category can replace a tag that already
+        # exists under precisely the requested name.
+        for tag in existing_tags:
+            existing_name = str(tag.get("name") or "").strip().lower()
+            if existing_name == tag_lower:
+                logger.debug(
+                    f"[TagMatch] Exact string match: '{tag_name}' == '{existing_name}'"
+                )
+                return [tag]
+
         # Check if tag_name matches any existing tag's synonyms (synonym-to-main-tag replacement)
         for tag in existing_tags:
             tag_synonyms = tag.get("synonyms", [])
@@ -441,10 +452,13 @@ class TagManager:
                             ])
                             logger.info(f"[TagMatch] Embedding-based match for '{tag_name}': {match_details}")
                             
-                            # Prefer GENERAL tags over DOMAIN_ENTITY
+                            # Similarity is the primary ordering criterion;
+                            # category is only a tie-breaker.
                             similar_by_embedding.sort(
-                                key=lambda x: x.get("category") == self.TAG_CATEGORY_GENERAL,
-                                reverse=True
+                                key=lambda x: (
+                                    -float(x.get("_similarity_score", 0.0)),
+                                    x.get("category") != self.TAG_CATEGORY_GENERAL,
+                                )
                             )
                             return similar_by_embedding
                         else:
@@ -463,15 +477,14 @@ class TagManager:
             if not tag_name_str:
                 continue
 
-            # Exact match
-            if tag_name_str == tag_lower:
-                logger.debug(f"[TagMatch] Exact string match: '{tag_name}' == '{tag_name_str}'")
-                matches.append((tag, 1.0))
-                continue
-
-            # Substring match
-            if tag_lower in tag_name_str or tag_name_str in tag_lower:
-                logger.debug(f"[TagMatch] Substring match: '{tag_name}' ⊂ '{tag_name_str}'")
+            # Phrase containment is useful for tags such as "password" and
+            # "password spraying", but only at token boundaries. Raw
+            # substring matching incorrectly considered "ray" part of
+            # "spraying" and "mfa" part of "comfast".
+            if self._contains_complete_term(tag_lower, tag_name_str):
+                logger.debug(
+                    f"[TagMatch] Whole-term match: '{tag_name}' vs '{tag_name_str}'"
+                )
                 matches.append((tag, 0.9))
                 continue
 
@@ -486,7 +499,7 @@ class TagManager:
         matches.sort(
             key=lambda x: (
                 -x[1],  # Higher similarity first
-                x[0].get("category") == self.TAG_CATEGORY_GENERAL,  # GENERAL first
+                x[0].get("category") != self.TAG_CATEGORY_GENERAL,  # GENERAL first
             )
         )
 
@@ -498,6 +511,73 @@ class TagManager:
             logger.info(f"[TagMatch] String-based match for '{tag_name}': {match_details}")
 
         return [tag for tag, _ in matches]
+
+    @staticmethod
+    def _contains_complete_term(first: str, second: str) -> bool:
+        """Return True when either tag contains the other as complete tokens."""
+        if not first or not second:
+            return False
+
+        def contains(container: str, term: str) -> bool:
+            pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
+            return re.search(pattern, container) is not None
+
+        return contains(first, second) or contains(second, first)
+
+    async def _get_or_compute_embedding_async(self, text: str) -> Optional[List[float]]:
+        """Compute an embedding without blocking the active event loop."""
+        if not text or not self.llm_client:
+            return None
+
+        text_lower = text.lower()
+        if text_lower in self._embedding_cache:
+            return self._embedding_cache[text_lower]
+
+        try:
+            embedding = await self.llm_client.embed(text)
+            if embedding:
+                self._embedding_cache[text_lower] = embedding
+            return embedding
+        except Exception as e:
+            logger.warning(f"[TagMatch] Failed to compute embedding for '{text}': {e}")
+            return None
+
+    async def _cache_candidate_embeddings(self, candidate_tags: List) -> None:
+        """Populate the sync matcher's cache while its caller can await I/O."""
+        if not self.llm_client or not hasattr(self.llm_client, "embed"):
+            return
+
+        existing_tags = self.get_all_tags()
+        exact_names = {
+            str(tag.get("name") or "").strip().lower()
+            for tag in existing_tags
+        }
+        synonym_names: Set[str] = set()
+        for tag in existing_tags:
+            synonyms = tag.get("synonyms", [])
+            if isinstance(synonyms, list):
+                synonym_names.update(
+                    str(synonym).strip().lower() for synonym in synonyms
+                )
+
+        seen: Set[str] = set()
+        for candidate in candidate_tags:
+            if isinstance(candidate, dict):
+                tag_name = str(candidate.get("name") or "").strip().lower()
+            else:
+                tag_name = str(candidate or "").strip().lower()
+
+            if (
+                not tag_name
+                or tag_name in seen
+                or tag_name in exact_names
+                or tag_name in synonym_names
+                or is_cve_tag(tag_name)
+            ):
+                continue
+
+            seen.add(tag_name)
+            await self._get_or_compute_embedding_async(tag_name)
 
     def _get_or_compute_embedding(self, text: str) -> Optional[List[float]]:
         """
@@ -518,19 +598,17 @@ class TagManager:
         if text_lower in self._embedding_cache:
             return self._embedding_cache[text_lower]
         
-        # Compute embedding (synchronously in async context)
+        # Compute synchronously only when no event loop is active. Async callers
+        # populate this cache through _cache_candidate_embeddings first.
         try:
             import asyncio
-            # Try to get running event loop
             try:
-                loop = asyncio.get_running_loop()
-                # We're in an async context
-                task = loop.create_task(self.llm_client.embed(text))
-                # This is risky - we can't await in a sync function
-                # We'll just skip caching in sync context
+                asyncio.get_running_loop()
+                logger.debug(
+                    f"[TagMatch] Embedding for '{text}' was not precomputed in async context"
+                )
                 return None
             except RuntimeError:
-                # No running loop - try to create one temporarily
                 loop = asyncio.new_event_loop()
                 try:
                     embedding = loop.run_until_complete(self.llm_client.embed(text))
@@ -740,6 +818,20 @@ class TagManager:
 
         return deduplicated_tags
 
+    async def select_tags_for_article_async(
+        self,
+        article_id: str,
+        candidate_tags: List,
+        allow_new_tags: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Async selection path that precomputes embeddings before matching."""
+        await self._cache_candidate_embeddings(candidate_tags)
+        return self.select_tags_for_article(
+            article_id=article_id,
+            candidate_tags=candidate_tags,
+            allow_new_tags=allow_new_tags,
+        )
+
     def extract_tags_from_llm_response(self, response: str) -> List[Dict[str, str]]:
         """
         Extract tags from LLM response.
@@ -909,7 +1001,7 @@ class TagManager:
             candidate_tags = self.extract_tags_from_llm_response(response)
 
             # Select best tags using priority logic
-            selected = self.select_tags_for_article(
+            selected = await self.select_tags_for_article_async(
                 article_id=article.get("id", ""),
                 candidate_tags=candidate_tags[:max_tags * 2],  # Get more than needed
                 allow_new_tags=True,
