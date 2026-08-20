@@ -30,12 +30,12 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-from feedsummary_core.summarizer.helpers import text_clip
-
-
-from typing import Any, Dict, List, Optional, Tuple
-
+import asyncio
 import logging
+import math
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+
+from feedsummary_core.summarizer.helpers import text_clip
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,191 @@ def batch_articles(
         batches.append(current)
 
     return batches
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if not left or len(left) != len(right):
+        return -1.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return -1.0
+    return dot / (left_norm * right_norm)
+
+
+def _similarity_components(
+    embeddings: Sequence[Optional[Sequence[float]]], threshold: float
+) -> List[List[int]]:
+    """Return stable, transitive groups of articles whose embeddings are similar."""
+    parents = list(range(len(embeddings)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(embeddings)):
+        if not embeddings[left]:
+            continue
+        for right in range(left + 1, len(embeddings)):
+            if (
+                embeddings[right]
+                and _cosine_similarity(embeddings[left], embeddings[right]) >= threshold
+            ):
+                union(left, right)
+
+    grouped: Dict[int, List[int]] = {}
+    for index in range(len(embeddings)):
+        grouped.setdefault(find(index), []).append(index)
+    return sorted(grouped.values(), key=lambda group: group[0])
+
+
+def _batch_similarity_groups(
+    groups: Sequence[Sequence[dict]],
+    *,
+    max_chars_per_batch: int,
+    max_articles_per_batch: int,
+) -> List[List[dict]]:
+    """Pack similarity groups together whenever the configured limits allow it."""
+    batches: List[List[dict]] = []
+    current: List[dict] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            batches.append(current)
+            current = []
+
+    for group_items in groups:
+        group = list(group_items)
+        group_chars = sum(_estimate_article_chars(article) for article in group)
+        group_fits = (
+            (not max_articles_per_batch or len(group) <= max_articles_per_batch)
+            and group_chars <= max_chars_per_batch
+        )
+
+        if group_fits:
+            combined_fits = (
+                (
+                    not max_articles_per_batch
+                    or len(current) + len(group) <= max_articles_per_batch
+                )
+                and _batch_chars(current) + group_chars <= max_chars_per_batch
+            )
+            if current and not combined_fits:
+                flush()
+            current.extend(group)
+            continue
+
+        # A similarity group can itself exceed a hard limit. Keep as much of it
+        # together as possible, splitting only where the normal batcher must.
+        flush()
+        for article in group:
+            if current and not _can_fit_in_batch(
+                current,
+                article,
+                max_chars_per_batch=max_chars_per_batch,
+                max_articles_per_batch=max_articles_per_batch,
+            ):
+                flush()
+            current.append(article)
+
+    flush()
+    return batches
+
+
+async def group_articles_by_similarity(
+    articles: List[dict],
+    embed: Callable[[str], Awaitable[List[float]]],
+    *,
+    embedding_text_chars: int = 2000,
+    similarity_threshold: float = 0.78,
+    max_concurrency: int = 4,
+) -> List[List[dict]]:
+    """Embed articles and return stable groups that likely describe the same story."""
+    embedding_inputs: List[str] = []
+    for article in articles:
+        title = str(article.get("title", "") or "").strip()
+        article_body = (
+            article.get("text", "")
+            or article.get("content", "")
+            or article.get("summary", "")
+        )
+        body = text_clip(article_body, embedding_text_chars).strip()
+        embedding_inputs.append("\n\n".join(part for part in (title, body) if part))
+
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def embed_one(text: str) -> Optional[List[float]]:
+        if not text:
+            return None
+        try:
+            async with semaphore:
+                vector = await embed(text)
+            if vector and all(isinstance(value, (int, float)) for value in vector):
+                return [float(value) for value in vector]
+        except Exception as exc:
+            logger.warning("Kunde inte skapa artikel-embedding: %s", exc)
+        return None
+
+    embeddings = await asyncio.gather(*(embed_one(text) for text in embedding_inputs))
+    usable = sum(vector is not None for vector in embeddings)
+    if usable < 2:
+        logger.warning(
+            "Semantisk gruppering hoppades över: endast %d/%d embeddings kunde skapas.",
+            usable,
+            len(articles),
+        )
+        return [[article] for article in articles]
+
+    components = _similarity_components(embeddings, similarity_threshold)
+    logger.info(
+        "Semantisk gruppering placerade %d artiklar i %d ämnesgrupper (tröskel %.2f).",
+        len(articles),
+        len(components),
+        similarity_threshold,
+    )
+    return [[articles[index] for index in component] for component in components]
+
+
+async def batch_articles_by_similarity(
+    articles: List[dict],
+    embed: Callable[[str], Awaitable[List[float]]],
+    *,
+    max_chars_per_batch: int,
+    max_articles_per_batch: int,
+    article_clip_chars: int = 2500,
+    embedding_text_chars: int = 2000,
+    similarity_threshold: float = 0.78,
+    max_concurrency: int = 4,
+) -> List[List[dict]]:
+    """Embed articles, group likely duplicate stories, and create bounded batches."""
+    clipped: List[dict] = []
+    for article in articles:
+        item = dict(article)
+        item["text"] = text_clip(item.get("text", ""), article_clip_chars)
+        clipped.append(item)
+
+    groups = await group_articles_by_similarity(
+        clipped,
+        embed,
+        embedding_text_chars=embedding_text_chars,
+        similarity_threshold=similarity_threshold,
+        max_concurrency=max_concurrency,
+    )
+    return _batch_similarity_groups(
+        groups,
+        max_chars_per_batch=max_chars_per_batch,
+        max_articles_per_batch=max_articles_per_batch,
+    )
 
 
 # ----------------------------

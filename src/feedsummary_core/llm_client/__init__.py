@@ -59,6 +59,19 @@ class LLMClient(Protocol):
     async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str: ...
 
 
+def has_local_embedding_provider(config: Dict[str, Any]) -> bool:
+    """Return whether the configured LLM chain contains a local embedding provider."""
+    llm_configs: List[Any] = []
+    configured = config.get("llm")
+    llm_configs.extend(configured if isinstance(configured, list) else [configured])
+    llm_configs.append(config.get("llm_fallback"))
+    return any(
+        isinstance(item, dict)
+        and str(item.get("provider") or "").strip().lower() == "ollama_local"
+        for item in llm_configs
+    )
+
+
 def _create_single_llm(llm_cfg: Dict[str, Any]):
     provider = (llm_cfg.get("provider") or "ollama").lower()
 

@@ -43,7 +43,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from feedsummary_core.llm_client import LLMClient, get_primary_llm_config
+from feedsummary_core.llm_client import (
+    LLMClient,
+    get_primary_llm_config,
+    has_local_embedding_provider,
+)
 from feedsummary_core.persistence import NewsStore
 from feedsummary_core.summarizer.batching import (
     PromptTooLongStructural,
@@ -57,6 +61,7 @@ from feedsummary_core.summarizer.batching import (
     _estimate_article_chars,
     _move_article_to_tail_batch,
     batch_articles,
+    batch_articles_by_similarity,
     build_messages_for_batch,
     trim_text_tail_by_words,
 )
@@ -1235,6 +1240,20 @@ async def summarize_batches_then_meta_with_stats(
                     "meta_budget_tokens": int(meta_cp.get("meta_budget_tokens") or 0),
                 }
                 return cached, stats
+
+    similarity_enabled = bool(batching.get("similarity_enabled", True))
+    if similarity_enabled and has_local_embedding_provider(config) and hasattr(llm, "embed"):
+        threshold = min(1.0, max(0.0, float(batching.get("similarity_threshold", 0.78))))
+        batches = await batch_articles_by_similarity(
+            articles_ordered,
+            llm.embed,
+            max_chars_per_batch=max_chars,
+            max_articles_per_batch=max_n,
+            article_clip_chars=article_clip_chars,
+            embedding_text_chars=int(batching.get("embedding_text_chars", 2000)),
+            similarity_threshold=threshold,
+            max_concurrency=int(batching.get("embedding_max_concurrency", 4)),
+        )
 
     # batch resume
     done_map: Dict[int, str] = {}
