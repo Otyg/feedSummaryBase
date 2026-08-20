@@ -34,11 +34,14 @@ import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 import aiohttp
 import feedparser
 import trafilatura
 from aiolimiter import AsyncLimiter
+from lxml import html as lxml_html
+from lxml.etree import _Element, tostring
 from tenacity import (
     RetryError,
     retry,
@@ -143,10 +146,100 @@ async def fetch_rss(feed_url: str, session: aiohttp.ClientSession) -> feedparser
     return feedparser.parse(content)
 
 
-def extract_text_from_html(html: str, url: str) -> str:
-    """Extract readable article text from raw HTML using Trafilatura."""
+def _normalize_extraction_domain(value: str) -> str:
+    """Normalize a configured domain or URL hostname for exact matching."""
+    candidate = str(value or "").strip().lower().rstrip(".")
+    if "://" in candidate:
+        candidate = (urlsplit(candidate).hostname or "").lower().rstrip(".")
+    if candidate.startswith("www."):
+        candidate = candidate[4:]
+    return candidate
 
-    extracted = trafilatura.extract(html, url=url, include_comments=False, include_tables=False)
+
+def _domain_extraction_rule(
+    url: str,
+    extraction_config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the exact normalized domain rule for a URL, if configured."""
+    if not isinstance(extraction_config, dict):
+        return None
+    domains = extraction_config.get("domains")
+    if not isinstance(domains, dict):
+        return None
+
+    hostname = _normalize_extraction_domain(urlsplit(url).hostname or "")
+    for configured_domain, rule in domains.items():
+        if (
+            _normalize_extraction_domain(str(configured_domain)) == hostname
+            and isinstance(rule, dict)
+        ):
+            return rule
+    return None
+
+
+def _select_html_fragment(html: str, xpath: str, url: str) -> Optional[str]:
+    """Select and serialize the first element matched by a configured XPath."""
+    try:
+        tree = lxml_html.fromstring(html, base_url=url)
+        matches = tree.xpath(xpath)
+    except Exception as error:
+        logger.warning("Invalid content_xpath for %s (%s): %s", url, xpath, error)
+        return None
+
+    elements = [match for match in matches if isinstance(match, _Element)]
+    if not elements:
+        logger.warning("content_xpath matched no elements for %s: %s", url, xpath)
+        return None
+    if len(elements) > 1:
+        logger.warning(
+            "content_xpath matched %d elements for %s; using the first: %s",
+            len(elements),
+            url,
+            xpath,
+        )
+    return tostring(elements[0], encoding="unicode", method="html")
+
+
+def extract_text_from_html(
+    html: str,
+    url: str,
+    extraction_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Extract readable text, optionally preselecting a domain-specific fragment."""
+    rule = _domain_extraction_rule(url, extraction_config)
+    extract_kwargs: Dict[str, Any] = {
+        "url": url,
+        "include_comments": False,
+        "include_tables": False,
+    }
+    if rule:
+        for option in (
+            "include_comments",
+            "include_tables",
+            "include_links",
+            "include_images",
+            "favor_precision",
+            "favor_recall",
+            "deduplicate",
+            "target_language",
+            "prune_xpath",
+        ):
+            if option in rule:
+                extract_kwargs[option] = rule[option]
+
+        xpath = str(rule.get("content_xpath") or "").strip()
+        fragment = _select_html_fragment(html, xpath, url) if xpath else None
+        if fragment:
+            extracted = trafilatura.extract(fragment, **extract_kwargs)
+            if extracted and extracted.strip():
+                logger.debug("Used domain-specific content_xpath for %s: %s", url, xpath)
+                return extracted.strip()
+            logger.warning(
+                "Trafilatura returned no text for selected fragment at %s; using full page",
+                url,
+            )
+
+    extracted = trafilatura.extract(html, **extract_kwargs)
     return (extracted or "").strip()
 
 
@@ -247,6 +340,7 @@ async def gather_articles_to_store(
     config = load_feeds_into_config(config, base_config_path="config.yaml")
     feeds = config.get("feeds", [])
     ingest_cfg = config.get("ingest") or {}
+    extraction_config = ingest_cfg.get("extraction")
     lookback = ingest_cfg.get("lookback")
     max_items = int(ingest_cfg.get("max_items_per_feed", config.get("max_items_per_feed", 8)))
 
@@ -353,7 +447,7 @@ async def gather_articles_to_store(
                 try:
                     async with http_limiter:
                         html = await guarded_fetch_article(link, session, timeout_s)
-                    text = extract_text_from_html(html, link)
+                    text = extract_text_from_html(html, link, extraction_config)
                 except Exception as e:
                     fetch_error = e
                     logger.debug(f"Kunde inte hämta artikel {link}: {e}")

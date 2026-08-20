@@ -414,10 +414,71 @@ def _resolve_path(base_config_path: str, p: str) -> str:
     return os.path.join(base_dir, p2)
 
 
+def load_extraction_rules_into_config(
+    config: Dict[str, Any], *, base_config_path: str = "config.yaml"
+) -> Dict[str, Any]:
+    """Load optional domain-specific extraction rules from an external YAML file."""
+
+    ingest = config.get("ingest")
+    if not isinstance(ingest, dict):
+        return config
+
+    extraction = ingest.get("extraction")
+    if not isinstance(extraction, dict):
+        return config
+    if isinstance(extraction.get("domains"), dict):
+        return config
+
+    rules_path = extraction.get("path")
+    if not isinstance(rules_path, str) or not rules_path.strip():
+        return config
+
+    path = _resolve_path(base_config_path, rules_path)
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            loaded = yaml.safe_load(file) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError(f"extraction rules must be a mapping, got {type(loaded)}")
+        domains = loaded.get("domains")
+        if not isinstance(domains, dict):
+            raise ValueError("extraction rules must contain a 'domains' mapping")
+
+        for domain, rule in domains.items():
+            if not isinstance(domain, str) or not domain.strip():
+                raise ValueError("each extraction domain must be a non-empty string")
+            if not isinstance(rule, dict):
+                raise ValueError(f"extraction rule for {domain!r} must be a mapping")
+            selector = rule.get("content_xpath")
+            if not isinstance(selector, str) or not selector.strip():
+                raise ValueError(
+                    f"extraction rule for {domain!r} requires a non-empty content_xpath"
+                )
+
+        ingest_copy = dict(ingest)
+        ingest_copy["extraction"] = {
+            **loaded,
+            "_source_path": path,
+        }
+        config["ingest"] = ingest_copy
+        logger.info("Loaded extraction rules for %d domain(s): %s", len(domains), path)
+        return config
+    except FileNotFoundError:
+        logger.error("extraction rules file not found: %s", path)
+        raise
+    except Exception as error:
+        logger.error("failed to read extraction rules: %s -> %s", path, error)
+        raise
+
+
 def load_feeds_into_config(
     config: Dict[str, Any], *, base_config_path: str = "config.yaml"
 ) -> Dict[str, Any]:
     """Populate ``config['feeds']`` from an external YAML file when needed."""
+
+    config = load_extraction_rules_into_config(
+        config,
+        base_config_path=base_config_path,
+    )
 
     logger.info("Reading feed-configs")
     feeds = config.get("feeds")
