@@ -66,7 +66,7 @@ async def tag_articles(
         llm_client: LLM client for generating tags and embeddings
         article_ids: List of article IDs to tag
         config: Configuration dictionary
-        max_tags_per_article: Maximum tags per article
+        max_tags_per_article: Maximum non-CVE tags per article
         skip_if_already_tagged: If True, skip articles that already have tags
         enable_embedding_matching: If True, use embedding-based tag matching when available
 
@@ -187,7 +187,7 @@ async def tag_article(
         llm_client: LLM client
         article_id: Article ID to tag
         config: Configuration
-        max_tags: Maximum tags
+        max_tags: Maximum non-CVE tags
 
     Returns:
         List of assigned tags
@@ -320,7 +320,7 @@ async def tag_articles_safe(
         article_ids: List of article IDs to tag
         config: Configuration dictionary
         job_id: Optional job ID for logging
-        max_tags_per_article: Maximum tags per article
+        max_tags_per_article: Maximum non-CVE tags per article
 
     Returns:
         Number of articles successfully tagged

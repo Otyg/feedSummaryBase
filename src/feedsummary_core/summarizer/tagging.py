@@ -64,6 +64,7 @@ from feedsummary_core.summarizer.batching import (
 from feedsummary_core.tagging_rules import (
     CVE_PATTERN,
     VULNERABILITY_TAG_CATEGORY,
+    extract_cve_ids,
     is_cve_tag,
 )
 
@@ -164,7 +165,7 @@ class TagManager:
 
         Args:
             name: Tag name (normalized to lowercase)
-            category: Tag category (GENERAL, DOMAIN_ENTITY, or VULNERABILITY)
+            category: Name of a database-defined tag category
             description: Optional description
 
         Returns:
@@ -182,13 +183,16 @@ class TagManager:
         if is_cve_tag(name):
             category = self.TAG_CATEGORY_VULNERABILITY
 
-        # Validate category
-        if category not in (
-            self.TAG_CATEGORY_GENERAL,
-            self.TAG_CATEGORY_DOMAIN_ENTITY,
-            self.TAG_CATEGORY_VULNERABILITY,
-        ):
-            category = self.TAG_CATEGORY_GENERAL
+        # Non-CVE categories must resolve to a category defined by the active
+        # database. Stores without category support retain the legacy defaults.
+        if not is_cve_tag(name):
+            resolved_category = self._resolve_tag_category(category)
+            if resolved_category is None:
+                logger.debug(
+                    f"[TagValidate] Rejected tag '{name}': unknown category {category!r}"
+                )
+                return None
+            category = resolved_category
 
         # Validate tag name length (max 2 words for GENERAL, unlimited otherwise)
         if not self._is_valid_tag_name(name, category):
@@ -235,6 +239,57 @@ class TagManager:
         except Exception as e:
             logger.error(f"Error getting all tags: {e}")
         return []
+
+    def get_all_categories(self) -> List[Dict[str, Any]]:
+        """Get all tag categories defined by the active store."""
+        try:
+            fn = getattr(self.store, "get_all_categories", None)
+            if callable(fn):
+                categories = fn()
+                if isinstance(categories, list):
+                    return [category for category in categories if isinstance(category, dict)]
+        except Exception as e:
+            logger.error(f"Error getting tag categories: {e}")
+        return []
+
+    def _resolve_tag_category(
+        self,
+        proposed_category: Any,
+        fallback_category: str = TAG_CATEGORY_GENERAL,
+        categories: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        """Resolve a proposed category to its canonical database-defined name."""
+        available = self.get_all_categories() if categories is None else categories
+        if not available:
+            legacy_categories = {
+                self.TAG_CATEGORY_GENERAL,
+                self.TAG_CATEGORY_DOMAIN_ENTITY,
+                self.TAG_CATEGORY_VULNERABILITY,
+            }
+            proposed = str(proposed_category or "").strip().upper()
+            if proposed in legacy_categories:
+                return proposed
+            if fallback_category in legacy_categories:
+                return fallback_category
+            return self.TAG_CATEGORY_GENERAL
+
+        category_names = {
+            str(category.get("name") or "").strip().casefold():
+            str(category.get("name") or "").strip()
+            for category in available
+            if str(category.get("name") or "").strip()
+        }
+        for candidate in (proposed_category, fallback_category, self.TAG_CATEGORY_GENERAL):
+            normalized = str(candidate or "").strip().casefold()
+            if normalized in category_names:
+                return category_names[normalized]
+
+        logger.warning(
+            "No database-defined tag category matches proposed=%r or fallback=%r",
+            proposed_category,
+            fallback_category,
+        )
+        return None
 
     def _ensure_cve_category(self, tag: Dict[str, Any]) -> Dict[str, Any]:
         """Persist and return the canonical category for an existing CVE tag."""
@@ -883,6 +938,13 @@ class TagManager:
         """
         selected_tags: List[Dict[str, Any]] = []
         processed_tags: Set[str] = set()
+        available_categories = self.get_all_categories()
+        available_category_names = {
+            str(category.get("name") or "").strip().casefold():
+            str(category.get("name") or "").strip()
+            for category in available_categories
+            if str(category.get("name") or "").strip()
+        }
 
         for candidate in candidate_tags:
             if not candidate:
@@ -892,10 +954,12 @@ class TagManager:
             if isinstance(candidate, dict):
                 tag_name = candidate.get("name", "").strip().lower()
                 tag_type = candidate.get("type", "CATEGORY").upper()
+                proposed_category = candidate.get("category")
                 tag_reasoning = candidate.get("reasoning", "")
             else:
                 tag_name = str(candidate).strip().lower()
                 tag_type = "CATEGORY"  # Default for backward compatibility
+                proposed_category = None
                 tag_reasoning = ""
             
             if not tag_name or tag_name in processed_tags:
@@ -915,6 +979,19 @@ class TagManager:
             elif allow_new_tags:
                 # Decision logic based on tag type
                 should_create = False
+                default_category = (
+                    self.TAG_CATEGORY_DOMAIN_ENTITY
+                    if tag_type == "NAMED_ENTITY"
+                    else self.TAG_CATEGORY_GENERAL
+                )
+                explicit_category = available_category_names.get(
+                    str(proposed_category or "").strip().casefold()
+                )
+                resolved_category = self._resolve_tag_category(
+                    proposed_category,
+                    fallback_category=default_category,
+                    categories=available_categories,
+                )
                 
                 if tag_type == "NAMED_ENTITY":
                     # NAMED_ENTITY tags (organizations, groups, actors) are always created
@@ -923,17 +1000,24 @@ class TagManager:
                 elif tag_type == "CATEGORY":
                     # CATEGORY tags only created if they match our keyword heuristics
                     should_create = self._is_relevant_new_tag(tag_name)
+
+                # An explicit valid database category is enough evidence to create
+                # a new tag even if the legacy keyword heuristic does not know it.
+                if explicit_category:
+                    should_create = True
                 
                 if should_create:
                     # Validate tag name (max 2 words for GENERAL, unlimited otherwise)
                     if is_cve_tag(tag_name):
                         tag_category = self.TAG_CATEGORY_VULNERABILITY
                     else:
-                        tag_category = (
-                            self.TAG_CATEGORY_DOMAIN_ENTITY
-                            if tag_type == "NAMED_ENTITY"
-                            else self.TAG_CATEGORY_GENERAL
+                        tag_category = resolved_category
+
+                    if tag_category is None:
+                        logger.debug(
+                            f"[TagSelect] Rejected tag '{tag_name}': no valid database category"
                         )
+                        continue
                     
                     if not self._is_valid_tag_name(tag_name, tag_category):
                         logger.debug(f"[TagSelect] Rejected tag '{tag_name}': exceeds word limit for {tag_type}")
@@ -996,8 +1080,8 @@ class TagManager:
         Expects JSON format with per-tag reasoning:
         {
             "tags": [
-                {"tag": "tag1", "type": "NAMED_ENTITY", "reasoning": "Why this tag..."},
-                {"tag": "tag2", "type": "CATEGORY", "reasoning": "Why this tag..."},
+                {"tag": "tag1", "type": "NAMED_ENTITY", "category": "ORGANIZATION", "reasoning": "Why this tag..."},
+                {"tag": "tag2", "type": "CATEGORY", "category": "THREAT", "reasoning": "Why this tag..."},
                 ...
             ]
         }
@@ -1022,7 +1106,8 @@ class TagManager:
             response: LLM response text
 
         Returns:
-            List of tags as dicts with 'name', 'type', and optional 'reasoning' keys.
+            List of tags as dicts with 'name', 'type', 'category', and optional
+            'reasoning' keys.
             If reasoning is not provided, defaults to empty string.
         """
         if not response or not isinstance(response, str):
@@ -1053,11 +1138,13 @@ class TagManager:
                             if isinstance(obj, dict):
                                 tag_name = obj.get("tag") or obj.get("name")
                                 tag_type = obj.get("type", "CATEGORY")
+                                tag_category = obj.get("category")
                                 tag_reasoning = obj.get("reasoning", "")
                                 if tag_name:
                                     tags.append({
                                         "name": str(tag_name).strip().lower(),
                                         "type": tag_type.upper() if tag_type else "CATEGORY",
+                                        "category": str(tag_category).strip() if tag_category else "",
                                         "reasoning": str(tag_reasoning).strip() if tag_reasoning else ""
                                     })
                         except Exception:
@@ -1094,11 +1181,13 @@ class TagManager:
                                 if isinstance(t, dict):
                                     tag_name = t.get("tag") or t.get("name")
                                     tag_type = t.get("type", "CATEGORY")
+                                    tag_category = t.get("category")
                                     tag_reasoning = t.get("reasoning", "")
                                     if tag_name:
                                         tags.append({
                                             "name": str(tag_name).strip().lower(),
                                             "type": tag_type.upper() if tag_type else "CATEGORY",
+                                            "category": str(tag_category).strip() if tag_category else "",
                                             "reasoning": str(tag_reasoning).strip() if tag_reasoning else ""
                                         })
                                 elif isinstance(t, str):
@@ -1129,7 +1218,7 @@ class TagManager:
             llm_client: LLM client for generating tags
             article: Article dict with 'title', 'content', etc.
             config: Configuration dict
-            max_tags: Maximum number of tags to select
+            max_tags: Maximum number of non-CVE tags to select
 
         Returns:
             List of selected tags
@@ -1146,8 +1235,26 @@ class TagManager:
         if not text_context:
             return []
 
+        # CVE identifiers are deterministic domain entities. Extract them directly
+        # instead of relying on the LLM to include every identifier in its response.
+        cve_candidates = [
+            {
+                "name": cve_id,
+                "type": "NAMED_ENTITY",
+                "category": self.TAG_CATEGORY_VULNERABILITY,
+                "reasoning": "CVE identifier mentioned explicitly in the article.",
+            }
+            for cve_id in extract_cve_ids(
+                " ".join(part for part in (title, content, summary) if part)
+            )
+        ]
+
         # Prepare prompt for tag generation
-        prompt = self._build_tagging_prompt(text_context, max_tags)
+        prompt = self._build_tagging_prompt(
+            text_context,
+            max_tags,
+            categories=self.get_all_categories(),
+        )
 
         try:
             # Use chat() method instead of generate() for compatibility with FallbackLLMClient
@@ -1156,26 +1263,81 @@ class TagManager:
                 temperature=0.3
             )
             candidate_tags = self.extract_tags_from_llm_response(response)
+        except Exception as e:
+            logger.error(f"Error generating LLM tags: {e}")
+            candidate_tags = []
 
-            # Select best tags using priority logic
+        try:
+            # CVEs are prepended so all directly extracted identifiers are processed
+            # even when the LLM returns more candidates than the regular-tag budget.
+            regular_limit = max(0, max_tags)
+            regular_candidates = [
+                candidate
+                for candidate in candidate_tags
+                if not is_cve_tag(candidate.get("name"))
+            ]
             selected = await self.select_tags_for_article_async(
                 article_id=article.get("id", ""),
-                candidate_tags=candidate_tags[:max_tags * 2],  # Get more than needed
+                candidate_tags=cve_candidates + regular_candidates[:regular_limit * 2],
                 allow_new_tags=True,
             )
 
-            return selected[:max_tags]  # Limit to max_tags
+            # Preserve selection order while applying the maximum only to non-CVE
+            # tags. Every CVE mentioned in the article remains in the result.
+            limited: List[Dict[str, Any]] = []
+            regular_count = 0
+            for tag in selected:
+                if is_cve_tag(tag.get("name")):
+                    limited.append(tag)
+                elif regular_count < regular_limit:
+                    limited.append(tag)
+                    regular_count += 1
+            return limited
         except Exception as e:
             logger.error(f"Error generating tags: {e}")
             return []
 
-    def _build_tagging_prompt(self, article_text: str, max_tags: int = 5) -> str:
+    def _build_tagging_prompt(
+        self,
+        article_text: str,
+        max_tags: int = 5,
+        categories: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         """Build a prompt for the LLM to generate tags."""
         # Truncate article text if too long
         if len(article_text) > 2000:
             article_text = article_text[:2000] + "..."
 
-        return f"""Analyze the following article and extract up to {max_tags} relevant tags.
+        category_lines = []
+        category_names = []
+        for category in categories or []:
+            name = str(category.get("name") or "").strip()
+            if not name:
+                continue
+            category_names.append(name)
+            label = str(category.get("label") or "").strip()
+            description = str(category.get("description") or "").strip()
+            details = ": ".join(part for part in (label, description) if part)
+            category_lines.append(f"- {name}" + (f": {details}" if details else ""))
+        if not category_names:
+            category_names = ["GENERAL", "DOMAIN_ENTITY", "VULNERABILITY"]
+            category_lines = [f"- {name}" for name in category_names]
+        category_list = "\n".join(category_lines)
+        category_lookup = {name.casefold(): name for name in category_names}
+
+        def example_category(*preferred: str) -> str:
+            for name in preferred:
+                if name.casefold() in category_lookup:
+                    return category_lookup[name.casefold()]
+            return category_names[0]
+
+        entity_category = example_category("ORGANIZATION", "DOMAIN_ENTITY", "GENERAL")
+        topic_category = example_category("THREAT", "GENERAL")
+        product_category = example_category("PRODUCT", "DOMAIN_ENTITY", "GENERAL")
+
+        return f"""Analyze the following article and extract up to {max_tags} relevant non-CVE tags.
+Also include every CVE identifier mentioned in the article.
+CVE identifiers do not count toward this limit.
 
 CLASSIFICATION RULES:
 Tags should be classified as one of two types:
@@ -1196,10 +1358,16 @@ Tags should be classified as one of two types:
    - Security concepts (zero-day, vulnerability, authentication)
    - Any conceptual or descriptive tags
 
+AVAILABLE DATABASE CATEGORIES:
+{category_list}
+
 IMPORTANT:
 - Return tags in lowercase
 - Keep tags concise (1-3 words max)
 - Focus on the main topics and entities mentioned
+- Include every CVE identifier, even when this makes the total exceed {max_tags} tags
+- Set "category" to exactly one name from AVAILABLE DATABASE CATEGORIES
+- Choose the most specific suitable database category; use GENERAL when none is suitable
 - For NAMED_ENTITY tags: include ANY organization/group/actor/product name mentioned, even if uncommon
 - For CATEGORY tags: only include if they are central to the article
 - Provide a brief explanation for each tag (1-2 sentences max)
@@ -1210,9 +1378,9 @@ Article:
 Respond in JSON format:
 {{
     "tags": [
-        {{"tag": "tag1", "type": "NAMED_ENTITY", "reasoning": "Brief explanation why this tag is relevant"}},
-        {{"tag": "tag2", "type": "CATEGORY", "reasoning": "Brief explanation why this tag is relevant"}},
-        {{"tag": "tag3", "type": "NAMED_ENTITY", "reasoning": "Brief explanation why this tag is relevant"}}
+        {{"tag": "tag1", "type": "NAMED_ENTITY", "category": "{entity_category}", "reasoning": "Brief explanation why this tag is relevant"}},
+        {{"tag": "tag2", "type": "CATEGORY", "category": "{topic_category}", "reasoning": "Brief explanation why this tag is relevant"}},
+        {{"tag": "tag3", "type": "NAMED_ENTITY", "category": "{product_category}", "reasoning": "Brief explanation why this tag is relevant"}}
     ]
 }}"""
 

@@ -37,7 +37,25 @@ from typing import Any
 
 
 VULNERABILITY_TAG_CATEGORY = "VULNERABILITY"
-CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+CVE_PATTERN = re.compile(
+    r"(?<!\w)CVE-[0-9]{4}-[0-9]{4,19}(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def extract_cve_ids(text: Any) -> list[str]:
+    """Extract unique CVE identifiers in canonical uppercase form."""
+    if not isinstance(text, str):
+        return []
+
+    cve_ids: list[str] = []
+    seen: set[str] = set()
+    for match in CVE_PATTERN.finditer(text):
+        cve_id = match.group(0).upper()
+        if cve_id not in seen:
+            seen.add(cve_id)
+            cve_ids.append(cve_id)
+    return cve_ids
 
 
 def is_cve_tag(name: Any) -> bool:

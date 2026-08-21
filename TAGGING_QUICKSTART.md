@@ -167,7 +167,7 @@ Edit `tagging.py` to modify patterns:
 
 ```python
 # Add CVE variants
-CVE_PATTERN = re.compile(r'CVE-\d{4}-\d{4,5}|GHSA-\w{4}-\w{4}-\w{4}')
+CVE_PATTERN = re.compile(r'CVE-[0-9]{4}-[0-9]{4,19}|GHSA-\w{4}-\w{4}-\w{4}')
 
 # Add threat actor keywords
 THREAT_ACTOR_KEYWORDS = {

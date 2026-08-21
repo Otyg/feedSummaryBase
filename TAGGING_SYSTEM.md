@@ -86,28 +86,26 @@ CREATE TABLE article_tags (
 
 ## Taggkategorier
 
-### GENERAL (Standard)
-- Normala ämnestaggar
-- Prioriteras från befintliga taggar
-- Får inte skapas nya automatiskt (om de redan finns)
+Kategorier hämtas dynamiskt från databasens `tag_categories`. LLM:en får
+kategoriernas namn, etikett och beskrivning och väljer den mest specifika
+lämpliga kategorin för varje ny tagg. Valet valideras case-insensitivt mot
+databasen och lagras med kategorins kanoniska namn.
 
-### DOMAIN_ENTITY (Domänspecifik)
-Undantag där nya taggar ALLTID tillåts:
-- **CVE:er**: `CVE-2024-1234` mönster
-- **Hot-aktörer**: APT-grupper, kampanjnamn (t.ex. "APT28", "Lazarus Group")
-- **Geografiska regioner**: Länder, kontinenter (t.ex. "Russia", "North Korea")
-- **Sårbarheter**: Specifika sårbarhetsnamn och typer
+Om LLM:en inte anger en giltig kategori används en definierad standardkategori,
+normalt `GENERAL` eller `DOMAIN_ENTITY`. CVE-taggar är ett särskilt undantag och
+tvingas alltid till `VULNERABILITY`.
 
 ## Taggprioriteringsalgoritm
 
 ```
-1. Extrahera kandidattaggar från artikel (via LLM)
-2. För varje kandidattagg:
+1. Hämta tillgängliga kategorier från databasen
+2. Extrahera kandidattaggar och kategori från artikel (via LLM)
+3. För varje kandidattagg:
    a. Sök efter befintliga liknande taggar
    b. Om befintlig tagg finns → använd den
-   c. Om domänspecifik entitet → skapa ny DOMAIN_ENTITY tagg
-   d. Annars → hoppa över (föredra allmän framför specifik)
-3. Lagra valda taggar i databasen
+   c. Om en ny tagg ska skapas → validera LLM-kategorin mot databasen
+   d. Skapa taggen med databasens kanoniska kategorinamn
+4. Lagra valda taggar i databasen
 ```
 
 ### Likhetsmätning
@@ -215,23 +213,23 @@ print(f"Removed {removed} unused tags")
 Systemet använder följande prompt-mall för att få LLM att extrahera taggar:
 
 ```
-Analyze the following article and extract up to {max_tags} relevant tags.
+Analyze the following article and extract up to {max_tags} relevant non-CVE tags.
 
 IMPORTANT RULES:
-1. Prefer existing, general tags over creating new, specific tags
-2. CVE numbers (e.g., CVE-2024-1234), threat actors, regions, and 
-   vulnerability names are EXCEPTIONS - these should be new tags
-3. Return tags in lowercase
-4. Keep tags concise (1-3 words max)
-5. Focus on the main topics and entities mentioned
+1. Select "category" from the database categories included in the prompt
+2. Use the most specific suitable category and GENERAL as fallback
+3. Include every CVE; CVE tags do not count toward max_tags
+4. Return tags in lowercase and keep them concise
 
 Article:
 {article_text}
 
 Respond in JSON format:
 {
-    "tags": ["tag1", "tag2", "tag3"],
-    "reasoning": "Brief explanation of why these tags were chosen"
+    "tags": [
+        {"tag": "tag1", "type": "NAMED_ENTITY", "category": "ORGANIZATION",
+         "reasoning": "Why this tag and category are relevant"}
+    ]
 }
 ```
 
@@ -241,7 +239,7 @@ Systemet extraherar sedan JSON från svar och tillämpar prioriteringslogiken.
 
 Systemet identifierar domänspecifika entiteter genom:
 
-1. **Regex-mönster**: CVE format (`CVE-\d{4}-\d{4,5}`)
+1. **Regex-mönster**: CVE format (`CVE-[0-9]{4}-[0-9]{4,19}`)
 2. **Nyckelordsmatchning**:
    - Hot-aktörer: "APT", "group", "threat actor", "collective"
    - Regioner: Länder, kontinenter, geografiska termer
@@ -363,7 +361,7 @@ similar_tags = tag_manager._find_similar_existing_tags(
 Redigera regex-mönster och nyckelord i `tagging.py`:
 
 ```python
-CVE_PATTERN = re.compile(r'CVE-\d{4}-\d{4,5}', re.IGNORECASE)
+CVE_PATTERN = re.compile(r'CVE-[0-9]{4}-[0-9]{4,19}', re.IGNORECASE)
 THREAT_ACTOR_KEYWORDS = {'APT', 'group', ...}  # Lägg till fler ord
 ```
 
