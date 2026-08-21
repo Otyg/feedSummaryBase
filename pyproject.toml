@@ -33,6 +33,9 @@ dependencies = [
 [project.optional-dependencies]
 mongodb = ["pymongo>=4.10"]
 
+[project.scripts]
+feedsummary-migrate-tinydb-mongodb = "feedsummary_core.persistence.migrate_tinydb_to_mongodb:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

@@ -87,6 +87,23 @@ store = create_store({
 })
 ```
 
+Migrate an existing TinyDB database by validating it first and then running the
+idempotent import:
+
+```bash
+feedsummary-migrate-tinydb-mongodb news_docs.json --dry-run
+
+export FEEDSUMMARY_MONGODB_URI="mongodb://localhost:27017"
+export FEEDSUMMARY_MONGODB_DATABASE="feedsummary"
+feedsummary-migrate-tinydb-mongodb news_docs.json
+```
+
+The migration preserves article, job, tag, and category IDs along with tag
+relations and embedding caches. Unique URL or name collisions stop the import by
+default; use `--conflict-policy keep-existing` to map relations to the existing
+MongoDB records. The command can also be run as
+`python -m feedsummary_core.persistence.migrate_tinydb_to_mongodb`.
+
 ### LLM Client (`llm_client/`)
 
 Unified interface for LLM interaction with support for multiple backends:
