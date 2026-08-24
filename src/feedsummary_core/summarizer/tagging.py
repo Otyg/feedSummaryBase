@@ -51,7 +51,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from feedsummary_core.llm_client import LLMClient, get_client_embedding_model
@@ -123,6 +122,15 @@ NAMED_ENTITY_INDICATORS = {
     'system', 'application', 'framework', 'library',
     'city', 'country', 'state', 'province', 'region', 'continent',
     'apple', 'microsoft', 'google', 'amazon', 'facebook', 'meta',
+}
+
+LITERAL_EVIDENCE_CATEGORIES = {
+    "DOMAIN_ENTITY",
+    "LOCATION",
+    "ORGANIZATION",
+    "PERSON",
+    "PRODUCT",
+    "VULNERABILITY",
 }
 
 
@@ -557,6 +565,7 @@ class TagManager:
         self,
         tag_name: str,
         similarity_threshold: float = 0.6,
+        allow_fuzzy_matching: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Find existing tags that are semantically similar to the given tag name.
@@ -570,6 +579,10 @@ class TagManager:
         Args:
             tag_name: Tag name to find matches for
             similarity_threshold: Minimum similarity score (0.0-1.0)
+            allow_fuzzy_matching: If False, only exact names and configured
+                synonyms are considered. Named entities use this stricter mode
+                so one company or product cannot be replaced by another based
+                on embedding or spelling similarity.
 
         Returns:
             List of similar existing tags, ordered by similarity
@@ -609,6 +622,9 @@ class TagManager:
                 if tag_lower in synonyms_lower:
                     logger.info(f"[TagMatch] Synonym match: '{tag_name}' is a synonym of main tag '{tag.get('name')}'")
                     return [tag]
+
+        if not allow_fuzzy_matching:
+            return []
 
         # Try embedding-based matching first if LLM client is available
         if self.llm_client and hasattr(self.llm_client, 'embed'):
@@ -717,6 +733,54 @@ class TagManager:
 
         return contains(first, second) or contains(second, first)
 
+    @staticmethod
+    def _article_evidence_text(article: Dict[str, Any]) -> str:
+        """Return article fields that may independently support an entity tag."""
+        fields = ("title", "text", "content", "summary", "url", "source", "author")
+        return "\n".join(
+            str(article.get(field) or "").strip()
+            for field in fields
+            if str(article.get(field) or "").strip()
+        )
+
+    @staticmethod
+    def _article_mentions_tag(article_text: str, tag_name: str) -> bool:
+        """Check for a literal, case-insensitive tag mention at word boundaries."""
+        text = str(article_text or "").casefold()
+        tag = str(tag_name or "").strip().casefold()
+        if not text or not tag:
+            return False
+        pattern = rf"(?<!\w){re.escape(tag)}(?!\w)"
+        return re.search(pattern, text) is not None
+
+    def _candidate_requires_literal_evidence(self, candidate: Dict[str, Any]) -> bool:
+        """Return whether a proposed tag represents a named entity."""
+        name = str(candidate.get("name") or "").strip().casefold()
+        tag_type = str(candidate.get("type") or "CATEGORY").strip().upper()
+        category = str(candidate.get("category") or "").strip().upper()
+        if (
+            tag_type == "NAMED_ENTITY"
+            or category in LITERAL_EVIDENCE_CATEGORIES
+            or name in KNOWN_ORGANIZATIONS
+        ):
+            return True
+
+        existing = self.get_tag_by_name(name)
+        existing_category = str((existing or {}).get("category") or "").strip().upper()
+        return existing_category in LITERAL_EVIDENCE_CATEGORIES
+
+    def _stored_entity_has_literal_evidence(
+        self,
+        tag: Dict[str, Any],
+        article_text: str,
+    ) -> bool:
+        """Check a stored entity tag's canonical name and configured synonyms."""
+        names = [str(tag.get("name") or "")]
+        synonyms = tag.get("synonyms") or []
+        if isinstance(synonyms, list):
+            names.extend(str(synonym or "") for synonym in synonyms)
+        return any(self._article_mentions_tag(article_text, name) for name in names)
+
     async def _get_or_compute_embedding_async(self, text: str) -> Optional[List[float]]:
         """Compute an embedding without blocking the active event loop."""
         if not text or not self.llm_client:
@@ -776,8 +840,10 @@ class TagManager:
         for candidate in candidate_tags:
             if isinstance(candidate, dict):
                 tag_name = str(candidate.get("name") or "").strip().lower()
+                tag_type = str(candidate.get("type") or "CATEGORY").strip().upper()
             else:
                 tag_name = str(candidate or "").strip().lower()
+                tag_type = "CATEGORY"
 
             if (
                 not tag_name
@@ -785,6 +851,7 @@ class TagManager:
                 or tag_name in exact_names
                 or tag_name in synonym_names
                 or is_cve_tag(tag_name)
+                or tag_type == "NAMED_ENTITY"
             ):
                 continue
 
@@ -918,6 +985,7 @@ class TagManager:
         article_id: str,
         candidate_tags: List,  # Can be List[str] or List[Dict[str, str]]
         allow_new_tags: bool = True,
+        article_text: str = "",
     ) -> List[Dict[str, Any]]:
         """
         Select the best tags for an article from a list of candidates.
@@ -932,6 +1000,7 @@ class TagManager:
             article_id: Article ID (for context/validation)
             candidate_tags: List of candidate tags (strings or dicts with 'name', 'type', and optional 'reasoning')
             allow_new_tags: If True, allow creating new relevant tags
+            article_text: Optional source text used to reject ungrounded entity tags
 
         Returns:
             List of selected tags as dicts with 'id', 'name', 'category', and optional 'reasoning' fields
@@ -965,14 +1034,40 @@ class TagManager:
             if not tag_name or tag_name in processed_tags:
                 continue
 
+            if (
+                article_text
+                and isinstance(candidate, dict)
+                and self._candidate_requires_literal_evidence(candidate)
+                and not self._article_mentions_tag(article_text, tag_name)
+            ):
+                logger.info("[TagSelect] Rejected ungrounded entity tag '%s'", tag_name)
+                continue
+
             processed_tags.add(tag_name)
 
             # Try to find existing similar tags
-            similar_tags = self._find_similar_existing_tags(tag_name)
+            similar_tags = self._find_similar_existing_tags(
+                tag_name,
+                allow_fuzzy_matching=tag_type != "NAMED_ENTITY",
+            )
 
             if similar_tags:
                 # Use the best match (already sorted by priority)
                 tag_dict = self._ensure_cve_category(similar_tags[0].copy())
+                matched_category = str(tag_dict.get("category") or "").strip().upper()
+                if (
+                    article_text
+                    and matched_category in LITERAL_EVIDENCE_CATEGORIES
+                    and not self._stored_entity_has_literal_evidence(
+                        tag_dict,
+                        article_text,
+                    )
+                ):
+                    logger.info(
+                        "[TagSelect] Rejected ungrounded matched entity tag '%s'",
+                        tag_dict.get("name"),
+                    )
+                    continue
                 tag_dict["reasoning"] = tag_reasoning
                 logger.debug(f"[TagSelect] Using existing tag '{tag_dict['name']}' for candidate '{tag_name}'")
                 selected_tags.append(tag_dict)
@@ -1064,6 +1159,7 @@ class TagManager:
         article_id: str,
         candidate_tags: List,
         allow_new_tags: bool = True,
+        article_text: str = "",
     ) -> List[Dict[str, Any]]:
         """Async selection path that precomputes embeddings before matching."""
         await self._cache_candidate_embeddings(candidate_tags)
@@ -1071,6 +1167,7 @@ class TagManager:
             article_id=article_id,
             candidate_tags=candidate_tags,
             allow_new_tags=allow_new_tags,
+            article_text=article_text,
         )
 
     def extract_tags_from_llm_response(self, response: str) -> List[Dict[str, str]]:
@@ -1226,12 +1323,7 @@ class TagManager:
         if not article:
             return []
 
-        title = article.get("title", "").strip()
-        content = article.get("content", "").strip()
-        summary = article.get("summary", "").strip()
-
-        # Combine available text for context
-        text_context = " ".join([title, content or summary])
+        text_context = self._article_evidence_text(article)
         if not text_context:
             return []
 
@@ -1245,7 +1337,7 @@ class TagManager:
                 "reasoning": "CVE identifier mentioned explicitly in the article.",
             }
             for cve_id in extract_cve_ids(
-                " ".join(part for part in (title, content, summary) if part)
+                text_context
             )
         ]
 
@@ -1275,11 +1367,19 @@ class TagManager:
                 candidate
                 for candidate in candidate_tags
                 if not is_cve_tag(candidate.get("name"))
+                and (
+                    not self._candidate_requires_literal_evidence(candidate)
+                    or self._article_mentions_tag(
+                        text_context,
+                        str(candidate.get("name") or ""),
+                    )
+                )
             ]
             selected = await self.select_tags_for_article_async(
                 article_id=article.get("id", ""),
                 candidate_tags=cve_candidates + regular_candidates[:regular_limit * 2],
                 allow_new_tags=True,
+                article_text=text_context,
             )
 
             # Preserve selection order while applying the maximum only to non-CVE
@@ -1365,6 +1465,8 @@ IMPORTANT:
 - Return tags in lowercase
 - Keep tags concise (1-3 words max)
 - Focus on the main topics and entities mentioned
+- Use only the supplied article as evidence; do not infer entities from outside knowledge
+- Every NAMED_ENTITY tag must occur literally in the supplied article text or metadata
 - Include every CVE identifier, even when this makes the total exceed {max_tags} tags
 - Set "category" to exactly one name from AVAILABLE DATABASE CATEGORIES
 - Choose the most specific suitable database category; use GENERAL when none is suitable
@@ -1409,12 +1511,7 @@ Respond in JSON format:
         if not article:
             return []
 
-        title = article.get("title", "").strip()
-        content = article.get("content", "").strip()
-        summary = article.get("summary", "").strip()
-
-        # Combine available text for context
-        text_context = " ".join([title, content or summary])
+        text_context = self._article_evidence_text(article)
         if not text_context:
             return []
 
@@ -1441,7 +1538,7 @@ Respond in JSON format:
                 })
 
         if not available_tags:
-            logger.info(f"[Reclassify] No available tags (article already has all tags)")
+            logger.info("[Reclassify] No available tags (article already has all tags)")
             return []
 
         # Build the reclassification prompt
@@ -1467,6 +1564,15 @@ Respond in JSON format:
                     None
                 )
                 if match:
+                    category = str(match.get("category") or "").strip().upper()
+                    if category in LITERAL_EVIDENCE_CATEGORIES and not self._article_mentions_tag(
+                        text_context, match["name"]
+                    ):
+                        logger.info(
+                            "[Reclassify] Rejected ungrounded entity tag '%s'",
+                            match["name"],
+                        )
+                        continue
                     suggested_tags.append({
                         "id": match["id"],
                         "name": match["name"],

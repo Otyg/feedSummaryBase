@@ -152,7 +152,10 @@ class CveCategoryTests(unittest.TestCase):
         article = {
             "id": "article-1",
             "title": "CVE-2025-1234 fixed by Acme",
-            "content": "The update also fixes cve-2026-123456.",
+            "content": (
+                "The update also fixes cve-2026-123456 in Example Product. "
+                "Third Entity is also discussed."
+            ),
             "summary": "CVE-2025-1234 is mentioned again.",
         }
 
