@@ -220,6 +220,7 @@ def create_store(cfg: Dict[str, Any]) -> NewsStore:
             database=cfg.get("database") or cfg.get("database_name") or "feedsummary",
             client=cfg.get("client"),
             connect_timeout_ms=int(cfg.get("connect_timeout_ms", 5000)),
+            initialize_schema=bool(cfg.get("initialize_schema", True)),
         )  # type: ignore
 
     raise ValueError(f"Unsupported store provider: {provider}")

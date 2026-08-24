@@ -154,6 +154,9 @@ venv.bak/
 # mkdocs documentation
 /site
 
+# Local machine-learning benchmark outputs
+/artifacts/tag-benchmark/
+
 # mypy
 .mypy_cache/
 .dmypy.json
