@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Tuple
 
 from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
@@ -106,6 +107,7 @@ class MongoDBStore:
         *,
         client: Any = None,
         connect_timeout_ms: int = 5000,
+        initialize_schema: bool = True,
     ):
         if not database or not str(database).strip():
             raise ValueError("database must be a non-empty string")
@@ -122,7 +124,8 @@ class MongoDBStore:
 
         self.client = client
         self.db = client[self.database_name]
-        self._init_db()
+        if initialize_schema:
+            self._init_db()
 
     def close(self) -> None:
         if self._owns_client and self.client is not None:
@@ -465,6 +468,71 @@ class MongoDBStore:
 
     def get_all_tags(self) -> List[Dict[str, Any]]:
         return [self._tag_doc(doc) for doc in self.db.tags.find().sort("name", ASCENDING)]  # type: ignore[misc]
+
+    def iter_articles_with_tags(
+        self,
+        *,
+        categories: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield canonically tagged articles for read-only exports.
+
+        The export starts from ``article_tags`` so an article is included only
+        when a tagging pass produced at least one persisted association.  The
+        optional category filter applies to the returned labels, not to article
+        eligibility; an article tagged only with excluded entity categories is
+        therefore returned with an empty ``tags`` list and can act as a negative
+        training example.
+        """
+        pipeline: List[Dict[str, Any]] = [
+            {
+                "$group": {
+                    "_id": "$article_id",
+                    "tag_ids": {"$addToSet": "$tag_id"},
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "articles",
+                    "localField": "_id",
+                    "foreignField": "_id",
+                    "as": "article_docs",
+                }
+            },
+            {"$unwind": "$article_docs"},
+            {
+                "$lookup": {
+                    "from": "tags",
+                    "localField": "tag_ids",
+                    "foreignField": "_id",
+                    "as": "tag_docs",
+                }
+            },
+            {"$sort": {"article_docs._mongo_sort_ts": ASCENDING, "_id": ASCENDING}},
+        ]
+        if limit is not None and int(limit) > 0:
+            pipeline.append({"$limit": int(limit)})
+
+        allowed = {
+            str(category).strip().casefold()
+            for category in categories or []
+            if str(category).strip()
+        }
+        for row in self.db.article_tags.aggregate(pipeline):
+            article = _public_doc(row.get("article_docs"))
+            if not isinstance(article, dict):
+                continue
+            tags = []
+            for raw_tag in row.get("tag_docs") or []:
+                tag = self._tag_doc(raw_tag)
+                if not isinstance(tag, dict):
+                    continue
+                category = str(tag.get("category") or "GENERAL").casefold()
+                if allowed and category not in allowed:
+                    continue
+                tags.append(tag)
+            tags.sort(key=lambda tag: str(tag.get("name") or "").casefold())
+            yield {"article": article, "tags": tags}
 
     def add_article_tags(self, article_id: str, tag_ids: List) -> None:
         if not article_id or not tag_ids:

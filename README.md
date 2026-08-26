@@ -197,12 +197,44 @@ tagging:
     max_shared_tags: 1
 ```
 
-If aiohttp receives HTTP 403 for a feed or one of its articles, ingestion retries
-once with native curl and TLS 1.3. When that retry succeeds, a warning identifies
-the URL and instructs you to add `http_client: "curl"` and
-`tls_min_version: "1.3"` to that feed's configuration. Configuring both avoids
-the extra failed request on subsequent runs. The `curl` executable must be
-available in `PATH` when this client is selected or the fallback is needed.
+### Benchmark classical ML tagging
+
+The first ML tagging stage is an offline, read-only benchmark against historical
+MongoDB tag assignments. It does not change the production LLM tagging flow.
+Install the optional dependencies and add an ML section to the normal config:
+
+```bash
+pip install "feedsummary-core[ml]"
+feedsummary-benchmark-tags --config config.yaml --output-dir artifacts/tag-benchmark
+```
+
+```yaml
+store:
+  provider: mongodb
+  uri: mongodb://localhost:27017
+  database: feedsummary
+
+tagging:
+  ml:
+    categories: [GENERAL]
+    min_label_support: 10
+    max_tags_per_article: 5
+    max_text_chars: 20000
+    random_seed: 42
+    n_jobs: 1
+    max_category_combinations: 63
+```
+
+Each run writes a JSON report, a compact Markdown report, and the winning
+scikit-learn pipeline. Historical tags are treated as labels and may contain
+LLM-generated noise. Only load the generated Joblib model from a trusted source.
+When multiple categories are configured, every non-empty category combination
+is evaluated. Ranking uses chronological validation micro-F1 adjusted for tag
+assignment coverage: tags excluded by `min_label_support` count as unpredicted.
+The report shows raw F1 alongside label and assignment coverage, so a category
+with one easy, well-supported tag cannot win merely because its many rare tags
+were filtered out. The limit above prevents an accidental exponential benchmark
+when too many categories are supplied.
 
 After all articles in a run have been tagged, similarity consistency checks
 embedding-based article groups for tag overlap. If a group has no tag shared by

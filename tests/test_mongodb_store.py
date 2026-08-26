@@ -108,6 +108,62 @@ class MongoDBStoreTests(unittest.TestCase):
         self.assertIn("VULNERABILITY", {doc["name"] for doc in self.store.get_all_categories()})
         self.assertEqual("VULNERABILITY", self.store.get_tag_by_name("CVE-2026-12345")["category"])
 
+    def test_iter_articles_with_tags_filters_labels_but_keeps_negative_examples(self):
+        self.store.upsert_article(
+            {
+                "id": "general-article",
+                "title": "General",
+                "published_ts": 10,
+                "url": "https://example.test/general",
+            }
+        )
+        self.store.upsert_article(
+            {
+                "id": "entity-only-article",
+                "title": "Entity",
+                "published_ts": 20,
+                "url": "https://example.test/entity",
+            }
+        )
+        self.store.upsert_article(
+            {
+                "id": "untagged-article",
+                "title": "Untagged",
+                "published_ts": 30,
+                "url": "https://example.test/untagged",
+            }
+        )
+        general_id = self.store.add_tag("ransomware", "GENERAL")
+        entity_id = self.store.add_tag("acme", "ORGANIZATION")
+        self.store.add_article_tags("general-article", [general_id, entity_id])
+        self.store.add_article_tags("entity-only-article", [entity_id])
+        self.store.db.article_tags.insert_one(
+            {
+                "_id": "missing-article:999",
+                "article_id": "missing-article",
+                "tag_id": general_id,
+            }
+        )
+
+        rows = list(self.store.iter_articles_with_tags(categories=["GENERAL"]))
+
+        self.assertEqual(
+            ["general-article", "entity-only-article"],
+            [row["article"]["id"] for row in rows],
+        )
+        self.assertEqual(["ransomware"], [tag["name"] for tag in rows[0]["tags"]])
+        self.assertEqual([], rows[1]["tags"])
+
+    def test_read_only_initialization_does_not_create_mongodb_collections(self):
+        client = mongomock.MongoClient()
+        store = MongoDBStore(
+            database="read_only_test",
+            client=client,
+            initialize_schema=False,
+        )
+
+        self.assertEqual([], store.db.list_collection_names())
+
     def test_article_and_tag_embedding_metadata_is_persisted(self):
         self.store.upsert_article({"id": "article-1", "title": "Title"})
         self.assertTrue(
