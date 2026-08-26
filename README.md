@@ -162,9 +162,13 @@ Create a `config.yaml` file:
 
 ```yaml
 feeds:
-  - url: "https://example.com/feed.xml"
-    lookback: "48h"
-    enabled: true
+  - name: "Example feed"
+    url: "https://example.com/feed.xml"
+    # Optional per-feed minimum TLS version, applied to the feed and its articles.
+    # Supported values: "1.2" and "1.3".
+    tls_min_version: "1.3"
+    # Use native curl for servers that reject aiohttp's TLS fingerprint.
+    http_client: "curl"
 
 store:
   provider: "sqlite"  # sqlite, tinydb, or mongodb
@@ -192,6 +196,13 @@ tagging:
     similarity_threshold: 0.78
     max_shared_tags: 1
 ```
+
+If aiohttp receives HTTP 403 for a feed or one of its articles, ingestion retries
+once with native curl and TLS 1.3. When that retry succeeds, a warning identifies
+the URL and instructs you to add `http_client: "curl"` and
+`tls_min_version: "1.3"` to that feed's configuration. Configuring both avoids
+the extra failed request on subsequent runs. The `curl` executable must be
+available in `PATH` when this client is selected or the fallback is needed.
 
 After all articles in a run have been tagged, similarity consistency checks
 embedding-based article groups for tag overlap. If a group has no tag shared by

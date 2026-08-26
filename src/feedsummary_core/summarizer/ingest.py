@@ -32,6 +32,7 @@
 import asyncio
 import logging
 import re
+import ssl
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
@@ -62,6 +63,111 @@ from feedsummary_core.summarizer.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+_HTTP_USER_AGENT = "news-summarizer/2.1 (personal; rate-limited)"
+
+
+_TLS_MIN_VERSIONS = {
+    "1.2": ssl.TLSVersion.TLSv1_2,
+    "tls1.2": ssl.TLSVersion.TLSv1_2,
+    "tlsv1.2": ssl.TLSVersion.TLSv1_2,
+    "tlsv1_2": ssl.TLSVersion.TLSv1_2,
+    "1.3": ssl.TLSVersion.TLSv1_3,
+    "tls1.3": ssl.TLSVersion.TLSv1_3,
+    "tlsv1.3": ssl.TLSVersion.TLSv1_3,
+    "tlsv1_3": ssl.TLSVersion.TLSv1_3,
+}
+
+
+def _feed_ssl_context(feed_cfg: Dict[str, Any]) -> Optional[ssl.SSLContext]:
+    """Build a default SSL context with a feed-specific minimum TLS version."""
+    configured_version = feed_cfg.get("tls_min_version")
+    if configured_version is None or str(configured_version).strip() == "":
+        return None
+
+    normalized_version = str(configured_version).strip().lower()
+    minimum_version = _TLS_MIN_VERSIONS.get(normalized_version)
+    if minimum_version is None:
+        raise ValueError(
+            f"Ogiltig tls_min_version {configured_version!r}; "
+            "tillåtna värden är '1.2' och '1.3'"
+        )
+
+    context = ssl.create_default_context()
+    context.minimum_version = minimum_version
+    return context
+
+
+def _request_ssl_kwargs(ssl_context: Optional[ssl.SSLContext]) -> Dict[str, Any]:
+    """Keep aiohttp's default TLS handling unless a feed override is configured."""
+    return {"ssl": ssl_context} if ssl_context is not None else {}
+
+
+def _feed_http_client(feed_cfg: Dict[str, Any]) -> str:
+    """Validate and normalize the HTTP client selected for a feed."""
+    http_client = str(feed_cfg.get("http_client") or "aiohttp").strip().lower()
+    if http_client not in {"aiohttp", "curl"}:
+        raise ValueError(
+            f"Ogiltig http_client {http_client!r}; tillåtna värden är 'aiohttp' och 'curl'"
+        )
+    return http_client
+
+
+def _tls_1_3_config_warning(url: str) -> None:
+    logger.warning(
+        "HTTP 403 för %s med aiohttp, men hämtningen lyckades med curl och tvingad TLS 1.3. "
+        "Lägg till http_client: \"curl\" och tls_min_version: \"1.3\" för feeden i "
+        "feed-konfigurationen.",
+        url,
+    )
+
+
+async def _fetch_with_curl(
+    url: str,
+    timeout_s: int,
+    ssl_context: Optional[ssl.SSLContext],
+) -> bytes:
+    """Fetch a URL with native curl for servers that reject aiohttp's TLS fingerprint."""
+    command = [
+        "curl",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--fail-with-body",
+        "--max-time",
+        str(timeout_s),
+        "--user-agent",
+        _HTTP_USER_AGENT,
+        "--proto",
+        "=http,https",
+        "--proto-redir",
+        "=http,https",
+    ]
+    if ssl_context is not None:
+        if ssl_context.minimum_version >= ssl.TLSVersion.TLSv1_3:
+            command.append("--tlsv1.3")
+        elif ssl_context.minimum_version >= ssl.TLSVersion.TLSv1_2:
+            command.append("--tlsv1.2")
+    command.extend(("--", url))
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "curl krävs för denna feed men körfilen hittades inte i PATH"
+        ) from error
+
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"curl kunde inte hämta {url} (exit {process.returncode}): {detail[:500]}"
+        )
+    return stdout
 
 
 def _norm_cat(s: str) -> str:
@@ -136,14 +242,47 @@ def _passes_category_filter(entry: feedparser.FeedParserDict, feed_cfg: Dict[str
     return True
 
 
-async def fetch_rss(feed_url: str, session: aiohttp.ClientSession) -> feedparser.FeedParserDict:
+async def fetch_rss(
+    feed_url: str,
+    session: aiohttp.ClientSession,
+    ssl_context: Optional[ssl.SSLContext] = None,
+    http_client: str = "aiohttp",
+) -> feedparser.FeedParserDict:
     """Download and parse one RSS or Atom feed."""
 
-    async with session.get(feed_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+    if http_client == "curl":
+        content = await _fetch_with_curl(feed_url, 20, ssl_context)
+        logger.info(f"{feed_url} hämtad med curl")
+        return feedparser.parse(content)
+
+    try:
+        content = await _fetch_rss_content(feed_url, session, ssl_context)
+    except aiohttp.ClientResponseError as error:
+        if error.status != 403:
+            raise
+
+        tls_1_3_context = _feed_ssl_context({"tls_min_version": "1.3"})
+        content = await _fetch_with_curl(feed_url, 20, tls_1_3_context)
+        _tls_1_3_config_warning(feed_url)
+
+    return feedparser.parse(content)
+
+
+async def _fetch_rss_content(
+    feed_url: str,
+    session: aiohttp.ClientSession,
+    ssl_context: Optional[ssl.SSLContext],
+) -> bytes:
+    """Download RSS bytes once with the supplied TLS context."""
+    async with session.get(
+        feed_url,
+        timeout=aiohttp.ClientTimeout(total=20),
+        **_request_ssl_kwargs(ssl_context),
+    ) as resp:
         resp.raise_for_status()
         content = await resp.read()
         logger.info(f"{feed_url} hämtad")
-    return feedparser.parse(content)
+    return content
 
 
 def _normalize_extraction_domain(value: str) -> str:
@@ -268,10 +407,43 @@ def extract_text_from_rss_entry(entry: feedparser.FeedParserDict) -> str:
     return ""
 
 
-async def fetch_article_html(url: str, session: aiohttp.ClientSession, timeout_s: int) -> str:
+async def fetch_article_html(
+    url: str,
+    session: aiohttp.ClientSession,
+    timeout_s: int,
+    ssl_context: Optional[ssl.SSLContext] = None,
+    http_client: str = "aiohttp",
+) -> str:
     """Fetch raw article HTML and raise :class:`RateLimitError` on HTTP 429."""
 
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+    if http_client == "curl":
+        content = await _fetch_with_curl(url, timeout_s, ssl_context)
+        return content.decode("utf-8", errors="ignore")
+
+    try:
+        return await _fetch_article_html_once(url, session, timeout_s, ssl_context)
+    except aiohttp.ClientResponseError as error:
+        if error.status != 403:
+            raise
+
+        tls_1_3_context = _feed_ssl_context({"tls_min_version": "1.3"})
+        content = await _fetch_with_curl(url, timeout_s, tls_1_3_context)
+        _tls_1_3_config_warning(url)
+        return content.decode("utf-8", errors="ignore")
+
+
+async def _fetch_article_html_once(
+    url: str,
+    session: aiohttp.ClientSession,
+    timeout_s: int,
+    ssl_context: Optional[ssl.SSLContext],
+) -> str:
+    """Fetch article HTML once with the supplied TLS context."""
+    async with session.get(
+        url,
+        timeout=aiohttp.ClientTimeout(total=timeout_s),
+        **_request_ssl_kwargs(ssl_context),
+    ) as resp:
         if resp.status == 429:
             ra = resp.headers.get("Retry-After")
             retry_after = float(ra) if ra and ra.isdigit() else None
@@ -310,11 +482,23 @@ def _is_transient_article_error(exc: BaseException) -> bool:
     retry=retry_if_exception(_is_transient_article_error),
     reraise=True,
 )
-async def guarded_fetch_article(url: str, session: aiohttp.ClientSession, timeout_s: int) -> str:
+async def guarded_fetch_article(
+    url: str,
+    session: aiohttp.ClientSession,
+    timeout_s: int,
+    ssl_context: Optional[ssl.SSLContext] = None,
+    http_client: str = "aiohttp",
+) -> str:
     """Fetch an article with retry handling for rate limits and transient HTTP issues."""
 
     try:
-        return await fetch_article_html(url, session, timeout_s)
+        return await fetch_article_html(
+            url,
+            session,
+            timeout_s,
+            ssl_context,
+            http_client,
+        )
     except RateLimitError as e:
         if e.retry_after:
             await asyncio.sleep(min(e.retry_after, 60))
@@ -333,6 +517,8 @@ async def gather_articles_to_store(
     - max_items_per_feed används fortfarande som safety cap.
     - Per-feed filter:
         category_include / category_exclude (matchar entry.tags[].term m.fl.)
+        tls_min_version (valfritt, "1.2" eller "1.3")
+        http_client (valfritt, "aiohttp" eller "curl")
 
     ✅ Artikel-store ska bara hålla artiklar:
       - vi sätter inte summarized/summarized_at här längre
@@ -346,7 +532,7 @@ async def gather_articles_to_store(
 
     timeout_s = int(config.get("article_timeout_s", 20))
     http_limiter = AsyncLimiter(max_rate=6, time_period=1)
-    headers = {"User-Agent": "news-summarizer/2.1 (personal; rate-limited)"}
+    headers = {"User-Agent": _HTTP_USER_AGENT}
 
     inserted = 0
     updated = 0
@@ -363,8 +549,10 @@ async def gather_articles_to_store(
             set_job(f"Läser RSS: {name}", job_id, store)
 
             try:
+                ssl_context = _feed_ssl_context(f)
+                http_client = _feed_http_client(f)
                 logger.info(f"Hämtar RSS: {name}")
-                feed = await fetch_rss(feed_url, session)
+                feed = await fetch_rss(feed_url, session, ssl_context, http_client)
             except Exception as e:
                 logger.warning(f"Kunde inte läsa RSS: {name} ({feed_url}) -> {e}")
                 continue
@@ -446,7 +634,13 @@ async def gather_articles_to_store(
                 # Try to fetch original article
                 try:
                     async with http_limiter:
-                        html = await guarded_fetch_article(link, session, timeout_s)
+                        html = await guarded_fetch_article(
+                            link,
+                            session,
+                            timeout_s,
+                            ssl_context,
+                            http_client,
+                        )
                     text = extract_text_from_html(html, link, extraction_config)
                 except Exception as e:
                     fetch_error = e
