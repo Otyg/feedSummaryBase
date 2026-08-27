@@ -115,6 +115,13 @@ class NewsStore(Protocol):
 
     def get_all_tags(self) -> List[Dict[str, Any]]: ...
 
+    def iter_articles_with_tags(
+        self,
+        *,
+        categories: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ): ...
+
     def add_article_tags(self, article_id: str, tag_ids: List) -> None: ...
 
     def add_tag_to_article(self, article_id: str, tag_id: int) -> bool: ...

@@ -197,6 +197,42 @@ tagging:
     max_shared_tags: 1
 ```
 
+### Embedding-based ML tagging
+
+The first production ML path uses scikit-learn `SGDClassifier` models with
+persisted article embeddings. It is disabled by default and currently intended
+for `DOMAIN_ENTITY`. On each tagging run, a corpus fingerprint detects changed
+article-tag associations and atomically retrains the artifact when needed.
+Full retraining is deliberate: unlike a naive `partial_fit`, it correctly
+handles tags that were removed or corrected.
+
+```yaml
+tagging:
+  # Existing tags in these categories may be selected by the LLM, but the LLM
+  # may not create new tags in them.
+  llm_new_tag_excluded_categories: [DOMAIN_ENTITY]
+  ml:
+    enabled: false
+    algorithm: sgd
+    representation: embedding
+    categories: [DOMAIN_ENTITY]
+    embedding_model: ""  # inherit from the local embedding provider
+    embedding_text_chars: 2000
+    model_path: data/tagging_ml/domain_entity_sgd_embeddings.joblib
+    min_label_support: 10
+    min_training_articles: 30
+    max_tags_per_article: 5
+    threshold: 0.5
+    alpha: 0.0001
+    random_state: 42
+    auto_retrain: true
+```
+
+When a compatible embedding or model is unavailable, tagging safely falls back
+to the existing LLM path. `llm_new_tag_excluded_categories` still applies to
+that fallback, so it may reuse an existing `DOMAIN_ENTITY` tag but cannot add a
+new one. Joblib artifacts must only be loaded from trusted local paths.
+
 ### Benchmark classical ML tagging
 
 The first ML tagging stage is an offline, read-only benchmark against historical

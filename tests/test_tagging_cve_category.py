@@ -120,6 +120,46 @@ class CveCategoryTests(unittest.TestCase):
         tag = self.store.get_tag_by_name("cve-2026-123")
         self.assertEqual("DOMAIN_ENTITY", tag["category"])
 
+    def test_llm_cannot_create_tag_in_configured_category(self):
+        client = FakeTaggingClient(
+            [{"tag": "Acme", "type": "NAMED_ENTITY", "category": "DOMAIN_ENTITY"}]
+        )
+
+        selected = asyncio.run(
+            self.manager.generate_tags_for_article(
+                llm_client=client,
+                article={"id": "article-1", "title": "Acme released an update"},
+                config={
+                    "tagging": {
+                        "llm_new_tag_excluded_categories": ["DOMAIN_ENTITY"]
+                    }
+                },
+            )
+        )
+
+        self.assertEqual([], selected)
+        self.assertIsNone(self.store.get_tag_by_name("acme"))
+
+    def test_llm_can_select_existing_tag_in_creation_excluded_category(self):
+        self.store.add_tag("acme", category="DOMAIN_ENTITY")
+        client = FakeTaggingClient(
+            [{"tag": "Acme", "type": "NAMED_ENTITY", "category": "DOMAIN_ENTITY"}]
+        )
+
+        selected = asyncio.run(
+            self.manager.generate_tags_for_article(
+                llm_client=client,
+                article={"id": "article-1", "title": "Acme released an update"},
+                config={
+                    "tagging": {
+                        "llm_new_tag_excluded_categories": ["DOMAIN_ENTITY"]
+                    }
+                },
+            )
+        )
+
+        self.assertEqual(["acme"], [tag["name"] for tag in selected])
+
     def test_extracts_only_complete_cves_with_four_to_nineteen_digits(self):
         nineteen_digits = "1234567890123456789"
         text = (

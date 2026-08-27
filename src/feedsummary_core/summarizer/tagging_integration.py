@@ -39,12 +39,19 @@ the summarization workflow.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from feedsummary_core.llm_client import LLMClient, has_local_embedding_provider
+from feedsummary_core.llm_client import (
+    LLMClient,
+    get_client_embedding_model,
+    has_local_embedding_provider,
+)
 from feedsummary_core.persistence import NewsStore
+from feedsummary_core.summarizer.batching import ensure_article_embedding
 from feedsummary_core.summarizer.tagging import TagManager
+from feedsummary_core.tagging_ml.embedding_sgd import EmbeddingSGDSettings, EmbeddingSGDTagger
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +83,18 @@ async def tag_articles(
     # Pass llm_client to TagManager to enable embedding-based matching
     tag_manager = TagManager(store, llm_client=llm_client if enable_embedding_matching else None)
     results: Dict[str, List[Dict[str, Any]]] = {}
+    ml_tagger: Optional[EmbeddingSGDTagger] = None
+    try:
+        ml_settings = EmbeddingSGDSettings.from_config(
+            config,
+            embedding_model=get_client_embedding_model(llm_client),
+        )
+        if ml_settings.enabled:
+            candidate = EmbeddingSGDTagger(ml_settings)
+            if await asyncio.to_thread(candidate.refresh_from_store, store):
+                ml_tagger = candidate
+    except Exception as e:
+        logger.warning("ML tagging unavailable; falling back to LLM tagging: %s", e)
 
     for article_id in article_ids:
         try:
@@ -93,13 +112,50 @@ async def tag_articles(
                 logger.warning(f"Article {article_id} not found")
                 continue
 
-            # Generate tags
-            tags = await tag_manager.generate_tags_for_article(
+            ml_tags: List[Dict[str, Any]] = []
+            excluded_categories = set()
+            if ml_tagger and not ml_tagger.can_predict(article):
+                embed = getattr(llm_client, "embed", None)
+                if callable(embed):
+                    tagging_cfg = config.get("tagging", {}) or {}
+                    ml_cfg = tagging_cfg.get("ml", {}) or {}
+                    batching_cfg = config.get("batching", {}) or {}
+                    await ensure_article_embedding(
+                        article,
+                        embed,
+                        store=store,
+                        embedding_model=ml_tagger.settings.embedding_model,
+                        embedding_text_chars=int(
+                            ml_cfg.get(
+                                "embedding_text_chars",
+                                batching_cfg.get("embedding_text_chars", 2000),
+                            )
+                        ),
+                    )
+            if ml_tagger and ml_tagger.can_predict(article):
+                ml_tags = ml_tagger.predict_tags(article, store)
+                excluded_categories.update(ml_tagger.settings.categories)
+
+            # Let the LLM handle categories that are not covered by a usable ML model.
+            llm_budget = max(
+                0,
+                max_tags_per_article
+                - sum(1 for tag in ml_tags if str(tag.get("name") or "").strip()),
+            )
+            llm_tags = await tag_manager.generate_tags_for_article(
                 llm_client=llm_client,
                 article=article,
                 config=config,
-                max_tags=max_tags_per_article,
+                max_tags=llm_budget,
+                excluded_categories=excluded_categories,
             )
+            tags = []
+            seen_tag_ids = set()
+            for tag in ml_tags + llm_tags:
+                tag_id = tag.get("id")
+                if tag_id and tag_id not in seen_tag_ids:
+                    seen_tag_ids.add(tag_id)
+                    tags.append(tag)
 
             if tags:
                 # Store tags with reasoning
