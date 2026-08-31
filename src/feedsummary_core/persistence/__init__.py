@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
@@ -66,6 +67,8 @@ class NewsStore(Protocol):
     def list_unsummarized_articles(self, limit: int = 200) -> List[Dict[str, Any]]: ...
 
     def list_articles(self, limit: int = 2000) -> List[Dict[str, Any]]: ...
+
+    def iter_articles(self, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]: ...
 
     def list_articles_by_filter(
         self,

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tinydb import Query, TinyDB
@@ -117,6 +118,19 @@ class TinyDBStore:
         # sort oldest-first på published_ts för stabil batching
         out.sort(key=lambda r: int(r.get("published_ts") or r.get("fetched_at") or 0))
         return out[:limit]
+
+    def iter_articles(self, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        """Yield every article oldest-first without the list API's default cap."""
+        db = self._db()
+        try:
+            articles = [dict(row) for row in db.table("articles")]
+        finally:
+            db.close()
+        articles.sort(
+            key=lambda row: int(row.get("published_ts") or row.get("fetched_at") or 0)
+        )
+        maximum = int(limit) if limit is not None and int(limit) > 0 else None
+        yield from articles[:maximum]
 
     def list_articles_by_filter(
         self,

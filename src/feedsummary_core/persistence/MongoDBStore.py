@@ -250,6 +250,16 @@ class MongoDBStore:
         cursor = self.db.articles.find().sort("_mongo_sort_ts", ASCENDING).limit(max(0, int(limit)))
         return [_public_doc(doc) for doc in cursor]  # type: ignore[misc]
 
+    def iter_articles(self, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        """Yield every article oldest-first without the list API's default cap."""
+        cursor = self.db.articles.find().sort("_mongo_sort_ts", ASCENDING)
+        if limit is not None and int(limit) > 0:
+            cursor = cursor.limit(int(limit))
+        for doc in cursor:
+            article = _public_doc(doc)
+            if isinstance(article, dict):
+                yield article
+
     def list_articles_by_filter(
         self,
         *,

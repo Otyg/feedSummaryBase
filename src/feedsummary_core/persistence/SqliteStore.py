@@ -36,6 +36,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -431,6 +432,26 @@ class SqliteStore:
                 if isinstance(doc, dict):
                     out.append(doc)
             return out
+        finally:
+            con.close()
+
+    def iter_articles(self, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        """Yield every article oldest-first without the list API's default cap."""
+        con = self._connect()
+        try:
+            query = """
+                SELECT doc_json
+                FROM articles
+                ORDER BY COALESCE(published_ts, fetched_at, 0) ASC
+            """
+            params: Tuple[Any, ...] = ()
+            if limit is not None and int(limit) > 0:
+                query += " LIMIT ?"
+                params = (int(limit),)
+            for row in con.execute(query, params):
+                article = _json_loads(row["doc_json"]) or {}
+                if isinstance(article, dict):
+                    yield article
         finally:
             con.close()
 

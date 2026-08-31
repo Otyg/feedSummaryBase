@@ -187,6 +187,11 @@ class EmbeddingClassifierTagger:
             "corpus_fingerprint": artifact.get("corpus_fingerprint"),
         }
 
+    @property
+    def label_names(self) -> tuple[str, ...]:
+        """Return the label vocabulary stored in the loaded artifact."""
+        return tuple(str(name) for name in (self._artifact or {}).get("classes") or ())
+
     def _model_path(self) -> Path:
         return Path(os.path.expandvars(os.path.expanduser(self.settings.model_path))).resolve()
 
@@ -454,17 +459,23 @@ class EmbeddingClassifierTagger:
 
     def can_predict(self, article: dict[str, Any]) -> bool:
         """Return whether an article has an embedding compatible with the artifact."""
+        return self.embedding_incompatibility_reason(article) is None
+
+    def embedding_incompatibility_reason(self, article: dict[str, Any]) -> str | None:
+        """Explain why an article cannot be scored, or return ``None`` when compatible."""
         if not self._artifact:
-            return False
+            return "model_not_ready"
         vector = article.get("embedding_vector")
         if not isinstance(vector, list) or not vector:
-            return False
+            return "missing_embedding"
         if not all(isinstance(value, (int, float)) for value in vector):
-            return False
+            return "invalid_embedding"
         if len(vector) != int(self._artifact["embedding_dimension"]):
-            return False
+            return "embedding_dimension_mismatch"
         expected_model = str(self._artifact.get("embedding_model") or "")
-        return not expected_model or str(article.get("embedding_model") or "") == expected_model
+        if expected_model and str(article.get("embedding_model") or "") != expected_model:
+            return "embedding_model_mismatch"
+        return None
 
     def predict_tags(
         self,

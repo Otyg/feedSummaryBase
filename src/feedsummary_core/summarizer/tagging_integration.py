@@ -207,7 +207,7 @@ async def tag_articles(
                     logging.INFO,
                     "ml_tagging.skipped",
                     article_id=article_id,
-                    reason="incompatible_embedding",
+                    reason=ml_tagger.embedding_incompatibility_reason(article),
                     expected_embedding_model=ml_tagger.model_metadata.get(
                         "embedding_model"
                     ),

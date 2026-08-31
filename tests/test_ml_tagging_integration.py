@@ -149,8 +149,13 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         "feedsummary_core.summarizer.tagging_integration.EmbeddingClassifierTagger.can_predict",
         return_value=False,
     )
+    @patch(
+        "feedsummary_core.summarizer.tagging_integration.EmbeddingClassifierTagger.embedding_incompatibility_reason",
+        return_value="embedding_model_mismatch",
+    )
     async def test_incompatible_embedding_leaves_category_to_llm(
         self,
+        incompatibility_reason,
         can_predict,
         refresh,
         from_config,
@@ -181,7 +186,7 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(), call["excluded_categories"])
         combined_logs = "\n".join(captured.output)
         self.assertIn("ml_tagging.skipped", combined_logs)
-        self.assertIn('"reason": "incompatible_embedding"', combined_logs)
+        self.assertIn('"reason": "embedding_model_mismatch"', combined_logs)
 
 
 if __name__ == "__main__":

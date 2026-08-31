@@ -169,6 +169,8 @@ feeds:
     tls_min_version: "1.3"
     # Use native curl for servers that reject aiohttp's TLS fingerprint.
     http_client: "curl"
+    # Optional: use only text embedded in the RSS entry and never fetch its link.
+    fetch_article: false
 
 store:
   provider: "sqlite"  # sqlite, tinydb, or mongodb
