@@ -80,7 +80,7 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
     @patch(
         "feedsummary_core.summarizer.tagging_integration.EmbeddingClassifierTagger.predict_tags"
     )
-    async def test_ml_category_is_merged_and_excluded_from_llm(
+    async def test_ml_category_is_merged_without_excluding_it_from_llm(
         self,
         predict_tags,
         score_names,
@@ -104,6 +104,7 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 config={
                     "tagging": {
                         "ml": {"enabled": True},
+                        "llm_new_tag_excluded_categories": ["DOMAIN_ENTITY"],
                         "similarity_consistency": {"enabled": False},
                     }
                 },
@@ -120,7 +121,11 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         call = generate_tags.await_args.kwargs
         self.assertEqual(4, call["max_tags"])
-        self.assertEqual({"DOMAIN_ENTITY"}, call["excluded_categories"])
+        self.assertNotIn("excluded_categories", call)
+        self.assertEqual(
+            ["DOMAIN_ENTITY"],
+            call["config"]["tagging"]["llm_new_tag_excluded_categories"],
+        )
         combined_logs = "\n".join(captured.output)
         self.assertIn("ml_tagging.model_ready", combined_logs)
         self.assertIn("ml_tagging.predictions", combined_logs)
@@ -183,7 +188,7 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         call = generate_tags.await_args.kwargs
         self.assertEqual(5, call["max_tags"])
-        self.assertEqual(set(), call["excluded_categories"])
+        self.assertNotIn("excluded_categories", call)
         combined_logs = "\n".join(captured.output)
         self.assertIn("ml_tagging.skipped", combined_logs)
         self.assertIn('"reason": "embedding_model_mismatch"', combined_logs)

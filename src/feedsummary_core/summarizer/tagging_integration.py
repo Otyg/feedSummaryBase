@@ -146,7 +146,6 @@ async def tag_articles(
                 continue
 
             ml_tags: List[Dict[str, Any]] = []
-            excluded_categories = set()
             if ml_tagger and not ml_tagger.can_predict(article):
                 embed = getattr(llm_client, "embed", None)
                 if callable(embed):
@@ -168,7 +167,6 @@ async def tag_articles(
             if ml_tagger and ml_tagger.can_predict(article):
                 scores = ml_tagger.score_names(article)
                 ml_tags = ml_tagger.predict_tags(article, store, scores=scores)
-                excluded_categories.update(ml_tagger.settings.categories)
                 _log_ml_event(
                     logging.INFO,
                     "ml_tagging.predictions",
@@ -218,7 +216,9 @@ async def tag_articles(
                     actual_dimension=len(vector) if isinstance(vector, list) else None,
                 )
 
-            # Let the LLM handle categories that are not covered by a usable ML model.
+            # Let the LLM supplement ML predictions with existing tags in every
+            # category. Creation restrictions remain independently controlled by
+            # tagging.llm_new_tag_excluded_categories.
             llm_budget = max(
                 0,
                 max_tags_per_article
@@ -229,7 +229,6 @@ async def tag_articles(
                 article=article,
                 config=config,
                 max_tags=llm_budget,
-                excluded_categories=excluded_categories,
             )
             tags = []
             seen_tag_ids = set()
