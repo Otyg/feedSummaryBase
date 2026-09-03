@@ -34,5 +34,18 @@
 """Classical machine-learning utilities for article tagging experiments."""
 
 from feedsummary_core.tagging_ml.benchmark import BenchmarkSettings, run_benchmark
+from feedsummary_core.tagging_ml.embedding_sgd import (
+    EmbeddingClassifierSettings,
+    EmbeddingClassifierTagger,
+    EmbeddingSGDSettings,
+    EmbeddingSGDTagger,
+)
 
-__all__ = ["BenchmarkSettings", "run_benchmark"]
+__all__ = [
+    "BenchmarkSettings",
+    "EmbeddingClassifierSettings",
+    "EmbeddingClassifierTagger",
+    "EmbeddingSGDSettings",
+    "EmbeddingSGDTagger",
+    "run_benchmark",
+]

@@ -34,11 +34,16 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tinydb import Query, TinyDB
 
 from feedsummary_core.persistence import CleanupPolicy
+from feedsummary_core.persistence.tag_relations import (
+    PARENT_CHILD_RELATION,
+    proposed_parent_child_edges,
+)
 from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_tag
 
 logger = logging.getLogger(__name__)
@@ -117,6 +122,19 @@ class TinyDBStore:
         # sort oldest-first på published_ts för stabil batching
         out.sort(key=lambda r: int(r.get("published_ts") or r.get("fetched_at") or 0))
         return out[:limit]
+
+    def iter_articles(self, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        """Yield every article oldest-first without the list API's default cap."""
+        db = self._db()
+        try:
+            articles = [dict(row) for row in db.table("articles")]
+        finally:
+            db.close()
+        articles.sort(
+            key=lambda row: int(row.get("published_ts") or row.get("fetched_at") or 0)
+        )
+        maximum = int(limit) if limit is not None and int(limit) > 0 else None
+        yield from articles[:maximum]
 
     def list_articles_by_filter(
         self,
@@ -516,6 +534,101 @@ class TinyDBStore:
         finally:
             db.close()
 
+    def get_tag_relations(self, tag_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        tag_id = int(tag_id)
+        db = self._db()
+        try:
+            tags_table = db.table("tags")
+            relations = db.table("tag_relations")
+            tags_by_id = {}
+            for row in tags_table.all():
+                related_id = int(getattr(row, "doc_id", row.get("id", 0)))
+                tags_by_id[related_id] = {
+                    "id": related_id,
+                    "name": row.get("name", ""),
+                    "category": row.get("category", "GENERAL"),
+                    "description": row.get("description"),
+                }
+            rows = [
+                row
+                for row in relations.all()
+                if row.get("relation_type", PARENT_CHILD_RELATION)
+                == PARENT_CHILD_RELATION
+                and (
+                    int(row.get("parent_tag_id", 0)) == tag_id
+                    or int(row.get("child_tag_id", 0)) == tag_id
+                )
+            ]
+            parents = [
+                tags_by_id[int(row["parent_tag_id"])]
+                for row in rows
+                if int(row["child_tag_id"]) == tag_id
+                and int(row["parent_tag_id"]) in tags_by_id
+            ]
+            children = [
+                tags_by_id[int(row["child_tag_id"])]
+                for row in rows
+                if int(row["parent_tag_id"]) == tag_id
+                and int(row["child_tag_id"]) in tags_by_id
+            ]
+            parents.sort(key=lambda tag: str(tag.get("name") or "").casefold())
+            children.sort(key=lambda tag: str(tag.get("name") or "").casefold())
+            return {"parents": parents, "children": children}
+        finally:
+            db.close()
+
+    def set_tag_relations(
+        self,
+        tag_id: int,
+        *,
+        parent_ids: Optional[List[int]] = None,
+        child_ids: Optional[List[int]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        tag_id = int(tag_id)
+        db = self._db()
+        try:
+            tags_by_id = {}
+            for row in db.table("tags").all():
+                related_id = int(getattr(row, "doc_id", row.get("id", 0)))
+                tags_by_id[related_id] = row
+            relations = db.table("tag_relations")
+            existing_edges = {
+                (int(row["parent_tag_id"]), int(row["child_tag_id"]))
+                for row in relations.all()
+                if row.get("relation_type", PARENT_CHILD_RELATION)
+                == PARENT_CHILD_RELATION
+            }
+            proposed_edges = proposed_parent_child_edges(
+                tag_id,
+                parent_ids=parent_ids,
+                child_ids=child_ids,
+                tags_by_id=tags_by_id,
+                existing_edges=existing_edges,
+            )
+            relations.remove(
+                lambda row: row.get("relation_type", PARENT_CHILD_RELATION)
+                == PARENT_CHILD_RELATION
+                and (
+                    int(row.get("parent_tag_id", 0)) == tag_id
+                    or int(row.get("child_tag_id", 0)) == tag_id
+                )
+            )
+            now = int(time.time())
+            for parent_id, child_id in proposed_edges:
+                if parent_id != tag_id and child_id != tag_id:
+                    continue
+                relations.insert(
+                    {
+                        "relation_type": PARENT_CHILD_RELATION,
+                        "parent_tag_id": parent_id,
+                        "child_tag_id": child_id,
+                        "created_at": now,
+                    }
+                )
+        finally:
+            db.close()
+        return self.get_tag_relations(tag_id)
+
     def add_article_tags(
         self,
         article_id: str,
@@ -798,6 +911,16 @@ class TinyDBStore:
             # Update the tag
             tags_table.update(updates, doc_ids=[int(tag_id)])
 
+            new_category = updates.get("category")
+            if new_category is not None and new_category != str(
+                tag_row.get("category") or "GENERAL"
+            ):
+                relations = db.table("tag_relations")
+                relations.remove(
+                    lambda row: int(row.get("parent_tag_id", 0)) == int(tag_id)
+                    or int(row.get("child_tag_id", 0)) == int(tag_id)
+                )
+
             # Get updated tag
             updated_row = tags_table.get(doc_id=int(tag_id))
             return {
@@ -832,6 +955,10 @@ class TinyDBStore:
             at = db.table("article_tags")
             Q = Query()
             at.remove(Q.tag_id == int(tag_id))
+            db.table("tag_relations").remove(
+                lambda row: int(row.get("parent_tag_id", 0)) == int(tag_id)
+                or int(row.get("child_tag_id", 0)) == int(tag_id)
+            )
             
             # Delete the tag
             tags_table = db.table("tags")
@@ -905,6 +1032,11 @@ class TinyDBStore:
                 
                 # Delete the synonym tag itself
                 tags_table = db.table("tags")
+                db.table("tag_relations").remove(
+                    lambda row: int(row.get("parent_tag_id", 0))
+                    == int(synonym_tag_id)
+                    or int(row.get("child_tag_id", 0)) == int(synonym_tag_id)
+                )
                 removed = tags_table.remove(doc_ids=[int(synonym_tag_id)])
                 if removed:
                     synonyms_deleted += 1
@@ -1065,12 +1197,18 @@ class TinyDBStore:
 
             # Remove tags that are not used and are old
             before = len(tags_table)
-            tags_table.remove(
-                lambda r: (
-                    int(r.get("created_at", 0)) < cutoff
-                    and int(r.get("id", 0)) not in used_tag_ids
+            removed_ids = {
+                int(getattr(row, "doc_id", row.get("id", 0)))
+                for row in tags_table.all()
+                if int(row.get("created_at", 0)) < cutoff
+                and int(getattr(row, "doc_id", row.get("id", 0))) not in used_tag_ids
+            }
+            if removed_ids:
+                tags_table.remove(doc_ids=sorted(removed_ids))
+                db.table("tag_relations").remove(
+                    lambda row: int(row.get("parent_tag_id", 0)) in removed_ids
+                    or int(row.get("child_tag_id", 0)) in removed_ids
                 )
-            )
             after = len(tags_table)
             return max(0, before - after)
         finally:
@@ -1357,6 +1495,10 @@ class TinyDBStore:
                     is_cve_tag(tag.get("name"))
                     and tag.get("category") != VULNERABILITY_TAG_CATEGORY
                 ):
+                    db.table("tag_relations").remove(
+                        lambda row: int(row.get("parent_tag_id", 0)) == int(tag.doc_id)
+                        or int(row.get("child_tag_id", 0)) == int(tag.doc_id)
+                    )
                     tags_table.update(
                         {"category": VULNERABILITY_TAG_CATEGORY},
                         doc_ids=[tag.doc_id],

@@ -113,6 +113,16 @@ def _feed_http_client(feed_cfg: Dict[str, Any]) -> str:
     return http_client
 
 
+def _should_fetch_article_page(feed_cfg: Dict[str, Any]) -> bool:
+    """Return whether linked article pages should be fetched for this feed."""
+    configured = feed_cfg.get("fetch_article", True)
+    if not isinstance(configured, bool):
+        raise TypeError(
+            f"Ogiltig fetch_article {configured!r}; värdet måste vara true eller false"
+        )
+    return configured
+
+
 def _tls_1_3_config_warning(url: str) -> None:
     logger.warning(
         "HTTP 403 för %s med aiohttp, men hämtningen lyckades med curl och tvingad TLS 1.3. "
@@ -519,6 +529,7 @@ async def gather_articles_to_store(
         category_include / category_exclude (matchar entry.tags[].term m.fl.)
         tls_min_version (valfritt, "1.2" eller "1.3")
         http_client (valfritt, "aiohttp" eller "curl")
+        fetch_article (valfritt booleskt värde; false använder endast RSS-innehåll)
 
     ✅ Artikel-store ska bara hålla artiklar:
       - vi sätter inte summarized/summarized_at här längre
@@ -551,6 +562,7 @@ async def gather_articles_to_store(
             try:
                 ssl_context = _feed_ssl_context(f)
                 http_client = _feed_http_client(f)
+                fetch_article_page = _should_fetch_article_page(f)
                 logger.info(f"Hämtar RSS: {name}")
                 feed = await fetch_rss(feed_url, session, ssl_context, http_client)
             except Exception as e:
@@ -631,23 +643,28 @@ async def gather_articles_to_store(
                 text = None
                 fetch_error = None
 
-                # Try to fetch original article
-                try:
-                    async with http_limiter:
-                        html = await guarded_fetch_article(
-                            link,
-                            session,
-                            timeout_s,
-                            ssl_context,
-                            http_client,
-                        )
-                    text = extract_text_from_html(html, link, extraction_config)
-                except Exception as e:
-                    fetch_error = e
-                    logger.debug(f"Kunde inte hämta artikel {link}: {e}")
+                if fetch_article_page:
+                    # Try to fetch original article.
+                    try:
+                        async with http_limiter:
+                            html = await guarded_fetch_article(
+                                link,
+                                session,
+                                timeout_s,
+                                ssl_context,
+                                http_client,
+                            )
+                        text = extract_text_from_html(html, link, extraction_config)
+                    except Exception as e:
+                        fetch_error = e
+                        logger.debug(f"Kunde inte hämta artikel {link}: {e}")
+                else:
+                    text = extract_text_from_rss_entry(entry)
+                    if text:
+                        logger.info(f"Använder endast RSS-innehåll för: {title}")
 
                 # If original article fetch failed, try RSS content as fallback
-                if not text or len(text) < 200:
+                if fetch_article_page and (not text or len(text) < 200):
                     rss_text = extract_text_from_rss_entry(entry)
                     if rss_text and len(rss_text) >= 100:
                         text = rss_text

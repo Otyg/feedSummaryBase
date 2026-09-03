@@ -39,14 +39,35 @@ the summarization workflow.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from feedsummary_core.llm_client import LLMClient, has_local_embedding_provider
+from feedsummary_core.llm_client import (
+    LLMClient,
+    get_client_embedding_model,
+    has_local_embedding_provider,
+)
 from feedsummary_core.persistence import NewsStore
+from feedsummary_core.summarizer.batching import ensure_article_embedding
 from feedsummary_core.summarizer.tagging import TagManager
+from feedsummary_core.tagging_ml.embedding_sgd import (
+    EmbeddingClassifierSettings,
+    EmbeddingClassifierTagger,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _log_ml_event(level: int, event: str, **fields: Any) -> None:
+    """Write one searchable ML event with a stable JSON payload."""
+    logger.log(
+        level,
+        "%s %s",
+        event,
+        json.dumps(fields, ensure_ascii=False, sort_keys=True, default=str),
+    )
 
 
 async def tag_articles(
@@ -76,6 +97,37 @@ async def tag_articles(
     # Pass llm_client to TagManager to enable embedding-based matching
     tag_manager = TagManager(store, llm_client=llm_client if enable_embedding_matching else None)
     results: Dict[str, List[Dict[str, Any]]] = {}
+    ml_tagger: Optional[EmbeddingClassifierTagger] = None
+    try:
+        ml_settings = EmbeddingClassifierSettings.from_config(
+            config,
+            embedding_model=get_client_embedding_model(llm_client),
+        )
+        if ml_settings.enabled:
+            candidate = EmbeddingClassifierTagger(ml_settings)
+            if await asyncio.to_thread(candidate.refresh_from_store, store):
+                ml_tagger = candidate
+                _log_ml_event(
+                    logging.INFO,
+                    "ml_tagging.model_ready",
+                    **candidate.model_metadata,
+                )
+            else:
+                _log_ml_event(
+                    logging.WARNING,
+                    "ml_tagging.model_unavailable",
+                    classifier=ml_settings.algorithm,
+                    categories=list(ml_settings.categories),
+                    reason="no_compatible_artifact_or_training_data",
+                )
+    except Exception as e:
+        _log_ml_event(
+            logging.WARNING,
+            "ml_tagging.model_unavailable",
+            reason="initialization_error",
+            error_type=type(e).__name__,
+            error=str(e),
+        )
 
     for article_id in article_ids:
         try:
@@ -93,13 +145,98 @@ async def tag_articles(
                 logger.warning(f"Article {article_id} not found")
                 continue
 
-            # Generate tags
-            tags = await tag_manager.generate_tags_for_article(
+            ml_tags: List[Dict[str, Any]] = []
+            if ml_tagger and not ml_tagger.can_predict(article):
+                embed = getattr(llm_client, "embed", None)
+                if callable(embed):
+                    tagging_cfg = config.get("tagging", {}) or {}
+                    ml_cfg = tagging_cfg.get("ml", {}) or {}
+                    batching_cfg = config.get("batching", {}) or {}
+                    await ensure_article_embedding(
+                        article,
+                        embed,
+                        store=store,
+                        embedding_model=ml_tagger.settings.embedding_model,
+                        embedding_text_chars=int(
+                            ml_cfg.get(
+                                "embedding_text_chars",
+                                batching_cfg.get("embedding_text_chars", 2000),
+                            )
+                        ),
+                    )
+            if ml_tagger and ml_tagger.can_predict(article):
+                scores = ml_tagger.score_names(article)
+                ml_tags = ml_tagger.predict_tags(article, store, scores=scores)
+                _log_ml_event(
+                    logging.INFO,
+                    "ml_tagging.predictions",
+                    article_id=article_id,
+                    classifier=ml_tagger.settings.algorithm,
+                    categories=list(ml_tagger.settings.categories),
+                    threshold=ml_tagger.settings.threshold,
+                    suggestions=[
+                        {
+                            "tag": str(tag.get("name") or ""),
+                            "category": str(tag.get("category") or ""),
+                            "probability": (
+                                round(float(tag["ml_probability"]), 6)
+                                if isinstance(tag.get("ml_probability"), (int, float))
+                                else None
+                            ),
+                        }
+                        for tag in ml_tags
+                    ],
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    _log_ml_event(
+                        logging.DEBUG,
+                        "ml_tagging.below_threshold",
+                        article_id=article_id,
+                        threshold=ml_tagger.settings.threshold,
+                        candidates=[
+                            {"tag": name, "probability": round(probability, 6)}
+                            for name, probability in scores
+                            if probability < ml_tagger.settings.threshold
+                        ][:5],
+                    )
+            elif ml_tagger:
+                vector = article.get("embedding_vector")
+                _log_ml_event(
+                    logging.INFO,
+                    "ml_tagging.skipped",
+                    article_id=article_id,
+                    reason=ml_tagger.embedding_incompatibility_reason(article),
+                    expected_embedding_model=ml_tagger.model_metadata.get(
+                        "embedding_model"
+                    ),
+                    actual_embedding_model=str(article.get("embedding_model") or ""),
+                    expected_dimension=ml_tagger.model_metadata.get(
+                        "embedding_dimension"
+                    ),
+                    actual_dimension=len(vector) if isinstance(vector, list) else None,
+                )
+
+            # Let the LLM supplement ML predictions with existing tags in every
+            # category. Creation restrictions remain independently controlled by
+            # tagging.llm_new_tag_excluded_categories.
+            llm_budget = max(
+                0,
+                max_tags_per_article
+                - sum(1 for tag in ml_tags if str(tag.get("name") or "").strip()),
+            )
+            llm_tags = await tag_manager.generate_tags_for_article(
                 llm_client=llm_client,
                 article=article,
                 config=config,
-                max_tags=max_tags_per_article,
+                max_tags=llm_budget,
             )
+            tags = []
+            seen_tag_ids = set()
+            for tag in ml_tags + llm_tags:
+                tag_id = tag.get("id")
+                if tag_id and tag_id not in seen_tag_ids:
+                    seen_tag_ids.add(tag_id)
+                    tags.append(tag)
 
             if tags:
                 # Store tags with reasoning

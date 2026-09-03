@@ -42,6 +42,8 @@ class TinyDBToMongoDBMigrationTests(unittest.TestCase):
         source.update_job(job_id, status="done", summary_id=summary_id)
         source.save_temp_summary(job_id, "Draft", {"batch": 1})
         tag_id = source.add_tag("security")
+        child_id = source.add_tag("malware")
+        source.set_tag_relations(tag_id, child_ids=[child_id])
         source.update_tag_embedding(
             tag_id,
             [0.0, 1.0],
@@ -70,6 +72,7 @@ class TinyDBToMongoDBMigrationTests(unittest.TestCase):
             "temp_summaries",
             "tags",
             "article_tags",
+            "tag_relations",
             "tag_categories",
         ):
             self.assertEqual(
@@ -86,6 +89,10 @@ class TinyDBToMongoDBMigrationTests(unittest.TestCase):
         self.assertEqual(tag_id, target.get_tag_by_name("security")["id"])
         self.assertEqual("embedding-model", target.get_tag_by_name("security")["embedding_model"])
         self.assertEqual([tag_id], [tag["id"] for tag in target.get_article_tags("article-1")])
+        self.assertEqual(
+            ["malware"],
+            [tag["name"] for tag in target.get_tag_relations(tag_id)["children"]],
+        )
         self.assertEqual(category_id, target.get_category(category_id)["id"])
         self.assertGreater(target.create_job(), job_id)
 

@@ -64,6 +64,63 @@ def cached_embedding(
     return [float(value) for value in vector]
 
 
+def article_embedding_text(article: dict, embedding_text_chars: int = 2000) -> str:
+    """Build the canonical text used for persisted article embeddings."""
+    title = str(article.get("title", "") or "").strip()
+    article_body = (
+        article.get("text", "") or article.get("content", "") or article.get("summary", "")
+    )
+    body = text_clip(article_body, max(1, int(embedding_text_chars))).strip()
+    return "\n\n".join(part for part in (title, body) if part)
+
+
+async def ensure_article_embedding(
+    article: dict,
+    embed: Callable[[str], Awaitable[List[float]]],
+    *,
+    store: Any,
+    embedding_model: str,
+    embedding_text_chars: int = 2000,
+) -> Optional[List[float]]:
+    """Reuse or create the canonical embedding and persist it on the article."""
+    text = article_embedding_text(article, embedding_text_chars)
+    if not text:
+        return None
+    persisted = cached_embedding(article, text, embedding_model)
+    if persisted is not None:
+        return persisted
+    try:
+        vector = await embed(text)
+        if not vector or not all(isinstance(value, (int, float)) for value in vector):
+            return None
+        normalized = [float(value) for value in vector]
+        article_id = str(article.get("id") or "").strip()
+        source_hash = embedding_source_hash(text)
+        update_embedding = getattr(store, "update_article_embedding", None)
+        if article_id and callable(update_embedding):
+            update_embedding(
+                article_id,
+                normalized,
+                model=embedding_model,
+                source_hash=source_hash,
+            )
+        article.update(
+            {
+                "embedding_vector": normalized,
+                "embedding_model": embedding_model,
+                "embedding_source_hash": source_hash,
+            }
+        )
+        return normalized
+    except Exception as exc:
+        logger.warning(
+            "Kunde inte skapa eller spara artikel-embedding för %s: %s",
+            article.get("id"),
+            exc,
+        )
+        return None
+
+
 def batch_articles(
     articles: List[dict],
     max_chars_per_batch: int,
@@ -206,12 +263,7 @@ async def group_articles_by_similarity(
     """Embed articles and return stable groups that likely describe the same story."""
     embedding_inputs: List[str] = []
     for article in articles:
-        title = str(article.get("title", "") or "").strip()
-        article_body = (
-            article.get("text", "") or article.get("content", "") or article.get("summary", "")
-        )
-        body = text_clip(article_body, embedding_text_chars).strip()
-        embedding_inputs.append("\n\n".join(part for part in (title, body) if part))
+        embedding_inputs.append(article_embedding_text(article, embedding_text_chars))
 
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 

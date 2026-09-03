@@ -169,6 +169,8 @@ feeds:
     tls_min_version: "1.3"
     # Use native curl for servers that reject aiohttp's TLS fingerprint.
     http_client: "curl"
+    # Optional: use only text embedded in the RSS entry and never fetch its link.
+    fetch_article: false
 
 store:
   provider: "sqlite"  # sqlite, tinydb, or mongodb
@@ -196,6 +198,65 @@ tagging:
     similarity_threshold: 0.78
     max_shared_tags: 1
 ```
+
+### Embedding-based ML tagging
+
+The production ML path uses a classifier selected in configuration with
+persisted article embeddings. Both the classifier and the category scope are
+configuration-driven; `categories` accepts one or more database category names.
+On each tagging run, a corpus fingerprint detects changed article-tag
+associations, classifier settings, or category scope and atomically retrains the
+artifact when needed. Full retraining correctly handles tags that were removed
+or corrected.
+
+```yaml
+tagging:
+  # Existing tags in these categories may be selected by the LLM, but the LLM
+  # may not create new tags in them.
+  llm_new_tag_excluded_categories: [DOMAIN_ENTITY]
+  ml:
+    enabled: false
+    classifier: logistic_regression  # logistic_regression or sgd
+    representation: embedding
+    categories: [DOMAIN_ENTITY]
+    embedding_model: ""  # inherit from the local embedding provider
+    embedding_text_chars: 2000
+    model_path: data/tagging_ml/embedding_classifier.joblib
+    min_label_support: 3
+    min_training_articles: 30
+    max_tags_per_article: 5
+    threshold: 0.8014432738078289
+    regularization_c: 1.0  # logistic_regression only
+    alpha: 0.0001          # sgd only
+    max_iter: 2000
+    tolerance: 0.0001
+    random_state: 42
+    auto_retrain: true
+```
+
+To change or extend the scope, edit only the category list, for example
+`categories: [DOMAIN_ENTITY, LOCATION]`. The artifact is rejected and retrained
+when its configured classifier or category list no longer matches.
+
+When a compatible embedding or model is unavailable, tagging safely falls back
+to the existing LLM path. `llm_new_tag_excluded_categories` still applies to
+that fallback, so it may reuse an existing `DOMAIN_ENTITY` tag but cannot add a
+new one. Joblib artifacts must only be loaded from trusted local paths.
+
+ML tagging emits searchable JSON payloads after stable event names:
+
+- `ml_tagging.model_ready` records the classifier, categories, threshold, model
+  version, label count, and training corpus metadata.
+- `ml_tagging.predictions` records the article ID and every accepted ML tag with
+  category and probability. An empty `suggestions` list means that the model ran
+  but no score met the configured threshold.
+- `ml_tagging.skipped` records incompatible or missing article embeddings, while
+  `ml_tagging.model_unavailable` records initialization and training failures.
+- `ml_tagging.below_threshold` records the five strongest rejected candidates
+  at DEBUG level.
+
+No article text is included in these events. Accepted ML assignments also keep
+the classifier and rounded probability in the persisted `motivering` field.
 
 ### Benchmark classical ML tagging
 

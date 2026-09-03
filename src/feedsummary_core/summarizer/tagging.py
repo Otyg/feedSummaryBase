@@ -986,6 +986,7 @@ class TagManager:
         candidate_tags: List,  # Can be List[str] or List[Dict[str, str]]
         allow_new_tags: bool = True,
         article_text: str = "",
+        new_tag_excluded_categories: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Select the best tags for an article from a list of candidates.
@@ -1001,6 +1002,8 @@ class TagManager:
             candidate_tags: List of candidate tags (strings or dicts with 'name', 'type', and optional 'reasoning')
             allow_new_tags: If True, allow creating new relevant tags
             article_text: Optional source text used to reject ungrounded entity tags
+            new_tag_excluded_categories: Categories in which new tags may not be
+                created. Existing matching tags in those categories remain usable.
 
         Returns:
             List of selected tags as dicts with 'id', 'name', 'category', and optional 'reasoning' fields
@@ -1013,6 +1016,11 @@ class TagManager:
             str(category.get("name") or "").strip()
             for category in available_categories
             if str(category.get("name") or "").strip()
+        }
+        creation_excluded = {
+            str(category).strip().upper()
+            for category in new_tag_excluded_categories or set()
+            if str(category).strip()
         }
 
         for candidate in candidate_tags:
@@ -1113,6 +1121,15 @@ class TagManager:
                             f"[TagSelect] Rejected tag '{tag_name}': no valid database category"
                         )
                         continue
+
+                    if str(tag_category).strip().upper() in creation_excluded:
+                        logger.info(
+                            "[TagSelect] Rejected new tag '%s': creation in category %s "
+                            "is disabled",
+                            tag_name,
+                            tag_category,
+                        )
+                        continue
                     
                     if not self._is_valid_tag_name(tag_name, tag_category):
                         logger.debug(f"[TagSelect] Rejected tag '{tag_name}': exceeds word limit for {tag_type}")
@@ -1160,6 +1177,7 @@ class TagManager:
         candidate_tags: List,
         allow_new_tags: bool = True,
         article_text: str = "",
+        new_tag_excluded_categories: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Async selection path that precomputes embeddings before matching."""
         await self._cache_candidate_embeddings(candidate_tags)
@@ -1168,6 +1186,7 @@ class TagManager:
             candidate_tags=candidate_tags,
             allow_new_tags=allow_new_tags,
             article_text=article_text,
+            new_tag_excluded_categories=new_tag_excluded_categories,
         )
 
     def extract_tags_from_llm_response(self, response: str) -> List[Dict[str, str]]:
@@ -1307,6 +1326,7 @@ class TagManager:
         article: Dict[str, Any],
         config: Dict[str, Any],
         max_tags: int = 5,
+        excluded_categories: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate and select tags for an article using an LLM.
@@ -1341,22 +1361,52 @@ class TagManager:
             )
         ]
 
-        # Prepare prompt for tag generation
-        prompt = self._build_tagging_prompt(
-            text_context,
-            max_tags,
-            categories=self.get_all_categories(),
+        excluded = {
+            str(category).strip().upper()
+            for category in excluded_categories or set()
+            if str(category).strip()
+        }
+        tagging_config = (
+            config.get("tagging") if isinstance(config.get("tagging"), dict) else {}
         )
+        raw_creation_excluded = tagging_config.get(
+            "llm_new_tag_excluded_categories", []
+        )
+        if isinstance(raw_creation_excluded, str):
+            raw_creation_excluded = [raw_creation_excluded]
+        creation_excluded = {
+            str(category).strip().upper()
+            for category in raw_creation_excluded
+            if str(category).strip()
+        }
+        available_categories = self.get_all_categories()
+        prompt_categories = [
+            category
+            for category in available_categories
+            if str(category.get("name") or "").strip().upper() not in excluded
+        ]
 
-        try:
-            # Use chat() method instead of generate() for compatibility with FallbackLLMClient
-            response = await llm_client.chat(
-                [{"role": "user", "content": prompt}],
-                temperature=0.3
+        if prompt_categories or not available_categories:
+            # Prepare prompt for the categories that are not handled by ML.
+            prompt = self._build_tagging_prompt(
+                text_context,
+                max_tags,
+                categories=prompt_categories,
             )
-            candidate_tags = self.extract_tags_from_llm_response(response)
-        except Exception as e:
-            logger.error(f"Error generating LLM tags: {e}")
+
+            try:
+                # Use chat() for compatibility with FallbackLLMClient.
+                response = await llm_client.chat(
+                    [{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                )
+                candidate_tags = self.extract_tags_from_llm_response(response)
+            except Exception as e:
+                logger.error(f"Error generating LLM tags: {e}")
+                candidate_tags = []
+        else:
+            # Deterministic CVE extraction below still runs when ML covers every
+            # configured LLM category, but no LLM request is needed.
             candidate_tags = []
 
         try:
@@ -1367,6 +1417,7 @@ class TagManager:
                 candidate
                 for candidate in candidate_tags
                 if not is_cve_tag(candidate.get("name"))
+                and str(candidate.get("category") or "").strip().upper() not in excluded
                 and (
                     not self._candidate_requires_literal_evidence(candidate)
                     or self._article_mentions_tag(
@@ -1380,6 +1431,7 @@ class TagManager:
                 candidate_tags=cve_candidates + regular_candidates[:regular_limit * 2],
                 allow_new_tags=True,
                 article_text=text_context,
+                new_tag_excluded_categories=creation_excluded,
             )
 
             # Preserve selection order while applying the maximum only to non-CVE

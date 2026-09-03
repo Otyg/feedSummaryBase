@@ -33,12 +33,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
 from feedsummary_core.persistence.TinyDbStore import TinyDBStore
 from feedsummary_core.persistence.SqliteStore import SqliteStore
 from feedsummary_core.persistence.MongoDBStore import MongoDBStore
+from feedsummary_core.persistence.tag_relations import TagRelationError
 
 
 class StoreError(Exception):
@@ -66,6 +68,8 @@ class NewsStore(Protocol):
     def list_unsummarized_articles(self, limit: int = 200) -> List[Dict[str, Any]]: ...
 
     def list_articles(self, limit: int = 2000) -> List[Dict[str, Any]]: ...
+
+    def iter_articles(self, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]: ...
 
     def list_articles_by_filter(
         self,
@@ -114,6 +118,23 @@ class NewsStore(Protocol):
     def get_tag_by_name(self, name: str) -> Optional[Dict[str, Any]]: ...
 
     def get_all_tags(self) -> List[Dict[str, Any]]: ...
+
+    def get_tag_relations(self, tag_id: int) -> Dict[str, List[Dict[str, Any]]]: ...
+
+    def set_tag_relations(
+        self,
+        tag_id: int,
+        *,
+        parent_ids: Optional[List[int]] = None,
+        child_ids: Optional[List[int]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]: ...
+
+    def iter_articles_with_tags(
+        self,
+        *,
+        categories: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ): ...
 
     def add_article_tags(self, article_id: str, tag_ids: List) -> None: ...
 

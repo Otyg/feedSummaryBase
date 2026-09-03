@@ -4,11 +4,45 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from feedsummary_core.persistence import SqliteStore, TinyDBStore
-from feedsummary_core.summarizer.batching import cached_embedding, embedding_source_hash
+from feedsummary_core.summarizer.batching import (
+    cached_embedding,
+    embedding_source_hash,
+    ensure_article_embedding,
+)
 from feedsummary_core.summarizer.tagging import TagManager
 
 
 class EmbeddingPersistenceTests(unittest.TestCase):
+    def test_ensure_article_embedding_uses_canonical_text_and_persists_metadata(self):
+        article = {"id": "article-1", "title": "Title", "text": "Article body"}
+
+        class Store:
+            def __init__(self):
+                self.update = None
+
+            def update_article_embedding(self, article_id, vector, **metadata):
+                self.update = (article_id, vector, metadata)
+                return True
+
+        async def embed(text):
+            self.assertEqual("Title\n\nArticle body", text)
+            return [1.0, 0.0]
+
+        store = Store()
+        result = asyncio.run(
+            ensure_article_embedding(
+                article,
+                embed,
+                store=store,
+                embedding_model="embedding-model",
+            )
+        )
+
+        self.assertEqual([1.0, 0.0], result)
+        self.assertEqual("article-1", store.update[0])
+        self.assertEqual("embedding-model", store.update[2]["model"])
+        self.assertEqual([1.0, 0.0], article["embedding_vector"])
+
     def test_tag_manager_reuses_persisted_tag_embedding(self):
         class Config:
             embedding_model = "embedding-model"
