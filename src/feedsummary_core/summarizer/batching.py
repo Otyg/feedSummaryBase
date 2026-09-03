@@ -34,6 +34,7 @@ import asyncio
 import hashlib
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from feedsummary_core.summarizer.helpers import text_clip
@@ -655,6 +656,29 @@ def _compact_article_block(a: dict, *, idx: int) -> str:
         head += f" ({source})"
     if url:
         head += f" {url}"
+
+    enrichment = a.get("_summary_enrichment")
+    if isinstance(enrichment, dict):
+        matched_tags = ", ".join(
+            str(tag).strip()
+            for tag in enrichment.get("matched_tags") or []
+            if str(tag).strip()
+        )
+        published_ts = a.get("published_ts")
+        published_date = ""
+        if isinstance(published_ts, int) and published_ts > 0:
+            published_date = datetime.fromtimestamp(
+                published_ts, tz=timezone.utc
+            ).strftime("%Y-%m-%d")
+        details = [
+            "BERIKANDE SÅRBARHETSUNDERLAG",
+            "kan vara äldre än rapportens tidsfönster",
+        ]
+        if published_date:
+            details.append(f"publicerad {published_date}")
+        if matched_tags:
+            details.append(f"matchande tagg: {matched_tags}")
+        head += "\nMATERIALROLL: " + "; ".join(details)
 
     if text:
         return f"{head}\n{text}"

@@ -1439,7 +1439,14 @@ async def summarize_batches_then_meta_with_stats(
     meta_attempts = 8
     last_err: Optional[Exception] = None
     lookback_raw = str((config.get("ingest") or {}).get("lookback") or "").strip()
-    lookback = lookback_label_from_articles(lookback_raw, articles)
+    reporting_articles = [
+        article
+        for article in articles
+        if not isinstance(article.get("_summary_enrichment"), dict)
+    ]
+    lookback = lookback_label_from_articles(
+        lookback_raw, reporting_articles or articles
+    )
     for attempt in range(1, meta_attempts + 1):
         meta_user = _budgeted_meta_user(
             prompts=prompts,

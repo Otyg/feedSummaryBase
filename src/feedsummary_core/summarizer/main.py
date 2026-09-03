@@ -68,6 +68,16 @@ from feedsummary_core.summarizer.tagging_integration import tag_articles_safe
 setup_logging()
 logger = logging.getLogger(__name__)
 
+_VULNERABILITY_TOPICS = {
+    "sårbarhet",
+    "sårbarheter",
+    "vulnerability",
+    "vulnerabilities",
+}
+_GENERIC_VULNERABILITY_TAGS = _VULNERABILITY_TOPICS | {"cve"}
+_ENRICHMENT_SOURCES_KEY = "_summary_enrichment_sources"
+_ENRICHMENT_MARKER_KEY = "_summary_enrichment"
+
 
 def _published_ts(a: dict) -> int:
     ts = a.get("published_ts")
@@ -339,6 +349,14 @@ def _apply_overrides(config: Dict[str, Any], overrides: Optional[Dict[str, Any]]
 
     cfg = copy.deepcopy(config)
 
+    enrich = overrides.get("enrich")
+    if isinstance(enrich, bool):
+        summary_cfg = cfg.setdefault("summary", {})
+        if isinstance(summary_cfg, dict):
+            summary_cfg["enrich"] = enrich
+        if enrich:
+            cfg[_ENRICHMENT_SOURCES_KEY] = copy.deepcopy(_get_config_sources(cfg))
+
     lookback = overrides.get("lookback")
     if isinstance(lookback, str) and lookback.strip():
         ingest = cfg.setdefault("ingest", {})
@@ -413,11 +431,170 @@ def _selected_prompt_package(config: Dict[str, Any]) -> str:
 
 
 def _selection_doc(config: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    selection = {
         "lookback": str((config.get("ingest") or {}).get("lookback") or ""),
         "sources": _selected_source_names(config),
         "topics": _selected_topics_from_config(config),
         "prompt_package": _selected_prompt_package(config),
+    }
+    summary_cfg = config.get("summary") or {}
+    if isinstance(summary_cfg, dict) and bool(summary_cfg.get("enrich")):
+        selection["enrich"] = True
+    return selection
+
+
+def _vulnerability_source_names(config: Dict[str, Any]) -> set[str]:
+    sources = config.get(_ENRICHMENT_SOURCES_KEY)
+    if not isinstance(sources, list):
+        sources = _get_config_sources(config)
+
+    names: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        topics = {topic.casefold() for topic in _topics_of(source)}
+        if topics.intersection(_VULNERABILITY_TOPICS):
+            name = _name_of(source)
+            if name:
+                names.add(name)
+    return names
+
+
+def _is_enrichment_article(article: Dict[str, Any]) -> bool:
+    return isinstance(article.get(_ENRICHMENT_MARKER_KEY), dict)
+
+
+def _range_articles(articles: List[dict]) -> List[dict]:
+    """Exclude older enrichment-only material from the reporting period."""
+    primary = [article for article in articles if not _is_enrichment_article(article)]
+    return primary or articles
+
+
+def _vulnerability_tags_for_article(store: NewsStore, article: Dict[str, Any]) -> List[str]:
+    get_tags = getattr(store, "get_article_tags", None)
+    article_id = str(article.get("id") or "").strip()
+    if not article_id or not callable(get_tags):
+        return []
+
+    names: List[str] = []
+    seen: set[str] = set()
+    for tag in get_tags(article_id) or []:
+        if not isinstance(tag, dict):
+            continue
+        if str(tag.get("category") or "").strip().casefold() != "vulnerability":
+            continue
+        name = str(tag.get("name") or "").strip()
+        normalized = name.casefold()
+        if not name or normalized in _GENERIC_VULNERABILITY_TAGS or normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(name)
+    return names
+
+
+def _articles_for_tag_names(store: NewsStore, tag_names: List[str]) -> List[dict]:
+    get_by_tags = getattr(store, "get_articles_by_tags", None)
+    if not callable(get_by_tags):
+        return []
+
+    found: Dict[str, dict] = {}
+    # Keep SQLite parameter counts and backend query sizes bounded.
+    for offset in range(0, len(tag_names), 200):
+        chunk = tag_names[offset : offset + 200]
+        for article in get_by_tags(tag_names=chunk, match_mode="any") or []:
+            if not isinstance(article, dict):
+                continue
+            article_id = str(article.get("id") or "").strip()
+            if article_id and article_id not in found:
+                found[article_id] = article
+    return list(found.values())
+
+
+def _enrich_articles_with_vulnerabilities(
+    *,
+    config: Dict[str, Any],
+    store: NewsStore,
+    articles: List[dict],
+    now: int,
+    limit: int = 2000,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """Add matching vulnerability-feed material, regardless of its age."""
+    vulnerability_sources = _vulnerability_source_names(config)
+    if not vulnerability_sources:
+        return articles[:limit], {
+            "enrich": True,
+            "enriched_article_count": 0,
+            "enrichment_vulnerability_tags": [],
+        }
+
+    primary_articles = [
+        article
+        for article in articles
+        if str(article.get("source") or "").strip() not in vulnerability_sources
+    ][:limit]
+
+    topic_map = _source_topics_map(config)
+    tag_names_by_normalized: Dict[str, str] = {}
+    primary_topics_by_tag: Dict[str, str] = {}
+    for article in primary_articles:
+        primary_topic = _primary_topic_for_article(article, topic_map)
+        for tag_name in _vulnerability_tags_for_article(store, article):
+            normalized = tag_name.casefold()
+            tag_names_by_normalized.setdefault(normalized, tag_name)
+            primary_topics_by_tag.setdefault(normalized, primary_topic)
+
+    vulnerability_tag_names = list(tag_names_by_normalized.values())
+    if not vulnerability_tag_names or len(primary_articles) >= limit:
+        return primary_articles, {
+            "enrich": True,
+            "enriched_article_count": 0,
+            "enrichment_vulnerability_tags": vulnerability_tag_names,
+        }
+
+    primary_ids = {
+        str(article.get("id") or "").strip()
+        for article in primary_articles
+        if str(article.get("id") or "").strip()
+    }
+    enriched: List[dict] = []
+    for candidate in _articles_for_tag_names(store, vulnerability_tag_names):
+        candidate_id = str(candidate.get("id") or "").strip()
+        if (
+            not candidate_id
+            or candidate_id in primary_ids
+            or str(candidate.get("source") or "").strip() not in vulnerability_sources
+            or _published_ts(candidate) > now
+        ):
+            continue
+
+        candidate_tags = {
+            name.casefold(): name
+            for name in _vulnerability_tags_for_article(store, candidate)
+        }
+        matched_normalized = [
+            normalized
+            for normalized in tag_names_by_normalized
+            if normalized in candidate_tags
+        ]
+        if not matched_normalized:
+            continue
+
+        item = dict(candidate)
+        matched_names = [tag_names_by_normalized[name] for name in matched_normalized]
+        item[_ENRICHMENT_MARKER_KEY] = {
+            "kind": "vulnerability",
+            "matched_tags": matched_names,
+        }
+        item["_summary_primary_topic"] = primary_topics_by_tag[matched_normalized[0]]
+        enriched.append(item)
+
+    enriched.sort(key=_published_ts)
+    room = max(0, limit - len(primary_articles))
+    enriched = enriched[:room]
+    return primary_articles + enriched, {
+        "enrich": True,
+        "enriched_article_count": len(enriched),
+        "enrichment_vulnerability_tags": vulnerability_tag_names,
     }
 
 
@@ -456,6 +633,9 @@ def _select_articles_for_summary(
 
 
 def _primary_topic_for_article(a: Dict[str, Any], topic_map: Dict[str, List[str]]) -> str:
+    enriched_topic = str(a.get("_summary_primary_topic") or "").strip()
+    if enriched_topic:
+        return enriched_topic
     src = str(a.get("source") or "").strip()
     ts = topic_map.get(src) or []
     if ts:
@@ -728,7 +908,7 @@ async def _summarize_and_persist_like_refresh(
 
         ids = [a.get("id") for a in articles if a.get("id")]
 
-        pts = [_published_ts(a) for a in articles]
+        pts = [_published_ts(a) for a in _range_articles(articles)]
         pts2 = [p for p in pts if p > 0]
         from_ts = min(pts2) if pts2 else 0
         to_ts = max(pts2) if pts2 else 0
@@ -802,7 +982,7 @@ async def _summarize_and_persist_like_refresh(
         stitched_parts.append(f"_Tidsfönster: {lookback_str}_")
     stitched_parts.append("")
 
-    pts_all = [_published_ts(a) for a in articles]
+    pts_all = [_published_ts(a) for a in _range_articles(articles)]
     pts_all2 = [p for p in pts_all if p > 0]
     overall_from = min(pts_all2) if pts_all2 else 0
     overall_to = max(pts_all2) if pts_all2 else 0
@@ -848,7 +1028,7 @@ async def _summarize_and_persist_like_refresh(
                 for a in items
             ]
 
-            pts = [_published_ts(a) for a in items]
+            pts = [_published_ts(a) for a in _range_articles(items)]
             pts2 = [p for p in pts if p > 0]
             from_ts = min(pts2) if pts2 else 0
             to_ts = max(pts2) if pts2 else 0
@@ -1279,6 +1459,26 @@ async def run_pipeline(
             )
 
         to_sum = _select_articles_for_summary(config, store, limit=2000)
+        enrichment_info: Dict[str, Any] = {}
+        summary_cfg = config.get("summary") or {}
+        if isinstance(summary_cfg, dict) and bool(summary_cfg.get("enrich")):
+            primary_ids = [article.get("id") for article in to_sum if article.get("id")]
+            if primary_ids:
+                await tag_articles_safe(
+                    store=store,
+                    llm_client=llm,
+                    article_ids=primary_ids,
+                    config=config,
+                    job_id=job_id,
+                    max_tags_per_article=5,
+                )
+            to_sum, enrichment_info = _enrich_articles_with_vulnerabilities(
+                config=config,
+                store=store,
+                articles=to_sum,
+                now=int(time.time()),
+                limit=2000,
+            )
         if not to_sum:
             if job_id is not None:
                 store.update_job(
@@ -1291,6 +1491,7 @@ async def run_pipeline(
 
         topic_map = _source_topics_map(config)
         selection = _selection_doc(config)
+        selection.update(enrichment_info)
 
         if job_id is not None:
             _snapshot_topic_map_for_job(
@@ -1560,6 +1761,7 @@ async def run_tag_based_summary(
     config_dict: Optional[Dict[str, Any]] = None,
     llm=None,
     prompt_package: Optional[str] = None,
+    enrich: bool = False,
 ) -> Optional[str]:
     """
     Summarize articles with specific tags from a given time period (no new fetch).
@@ -1575,6 +1777,8 @@ async def run_tag_based_summary(
         config_dict: Optional config dict instead of loading from file
         llm: Optional LLM client to use
         prompt_package: Optional named package from the configured prompt root
+        enrich: Add vulnerability-feed articles only when their specific
+            vulnerability tags occur on an in-window primary article
         
     Returns: summary_id on success, None on failure
     """
@@ -1587,6 +1791,10 @@ async def run_tag_based_summary(
             config = config_dict
 
         config = load_feeds_into_config(config, base_config_path=config_path)
+
+        summary_cfg = config.setdefault("summary", {})
+        if isinstance(summary_cfg, dict):
+            summary_cfg["enrich"] = bool(enrich)
         
         # Override lookback if provided
         if lookback:
@@ -1631,7 +1839,7 @@ async def run_tag_based_summary(
                     for article in articles
                     if (since_ts <= 0 or _published_ts(article) >= since_ts)
                     and _published_ts(article) <= now
-                ][:2000]
+                ]
             else:
                 # Fallback: get all articles and filter by tags manually
                 all_articles = store.list_unsummarized_articles(limit=5000)
@@ -1649,7 +1857,19 @@ async def run_tag_based_summary(
                             tag_names_set = {t.get("name", "").lower() for t in (tags or [])}
                             if any(tn.lower() in tag_names_set for tn in tag_names):
                                 filtered_articles.append(article)
-                articles = filtered_articles[:2000]
+                articles = filtered_articles
+
+        enrichment_info: Dict[str, Any] = {}
+        if enrich:
+            articles, enrichment_info = _enrich_articles_with_vulnerabilities(
+                config=config,
+                store=store,
+                articles=articles,
+                now=now,
+                limit=2000,
+            )
+        else:
+            articles = articles[:2000]
 
         if not articles:
             msg = f"Inga artiklar hittades med taggar: {', '.join(tag_names or [])}"
@@ -1678,6 +1898,7 @@ async def run_tag_based_summary(
             "tags": list(tag_names or []),
             "prompt_package": _selected_prompt_package(config),
         }
+        selection.update(enrichment_info)
 
         # Generate summary
         summary_doc_id = await _summarize_and_persist_like_refresh(
