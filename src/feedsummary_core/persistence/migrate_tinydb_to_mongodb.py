@@ -55,6 +55,7 @@ MIGRATED_TABLES = (
     "temp_summaries",
     "tags",
     "article_tags",
+    "tag_relations",
     "tag_categories",
 )
 
@@ -336,6 +337,40 @@ def _prepare_source(
             doc.update({"_id": relation_id, "article_id": article_id, "tag_id": int(tag_id)})
             relations[relation_id] = doc
         prepared["article_tags"] = list(relations.values())
+
+        tag_relation_rows = _source_rows(db, "tag_relations")
+        report["collections"]["tag_relations"]["source"] = len(tag_relation_rows)
+        tag_relations: Dict[str, Dict[str, Any]] = {}
+        for _, source_doc in tag_relation_rows:
+            parent_id = tag_id_map.get(_safe_int(source_doc.get("parent_tag_id")))
+            child_id = tag_id_map.get(_safe_int(source_doc.get("child_tag_id")))
+            relation_type = str(source_doc.get("relation_type") or "parent_child")
+            if parent_id is None or child_id is None or parent_id == child_id:
+                report["collections"]["tag_relations"]["skipped"] += 1
+                report["warnings"].append("Skipped dangling or self-referential tag relation")
+                continue
+            parent_category = str(tags_by_id[int(parent_id)].get("category") or "GENERAL")
+            child_category = str(tags_by_id[int(child_id)].get("category") or "GENERAL")
+            if parent_category != child_category:
+                report["collections"]["tag_relations"]["skipped"] += 1
+                report["warnings"].append("Skipped cross-category tag relation")
+                continue
+            relation_id = f"{relation_type}:{parent_id}:{child_id}"
+            if relation_id in tag_relations:
+                report["collections"]["tag_relations"]["skipped"] += 1
+                continue
+            doc = dict(source_doc)
+            doc.pop("_id", None)
+            doc.update(
+                {
+                    "_id": relation_id,
+                    "relation_type": relation_type,
+                    "parent_tag_id": int(parent_id),
+                    "child_tag_id": int(child_id),
+                }
+            )
+            tag_relations[relation_id] = doc
+        prepared["tag_relations"] = list(tag_relations.values())
     finally:
         db.close()
 
@@ -413,6 +448,52 @@ def _resolve_target_conflicts(
             doc.update({"_id": relation_id, "article_id": article_id, "tag_id": tag_id})
             remapped_relations[relation_id] = doc
         prepared["article_tags"] = list(remapped_relations.values())
+
+    if tag_remaps:
+        remapped_tag_relations: Dict[str, Dict[str, Any]] = {}
+        for relation in prepared["tag_relations"]:
+            parent_id = tag_remaps.get(
+                int(relation["parent_tag_id"]), int(relation["parent_tag_id"])
+            )
+            child_id = tag_remaps.get(
+                int(relation["child_tag_id"]), int(relation["child_tag_id"])
+            )
+            if parent_id == child_id:
+                report["collections"]["tag_relations"]["skipped"] += 1
+                continue
+            relation_type = str(relation.get("relation_type") or "parent_child")
+            relation_id = f"{relation_type}:{parent_id}:{child_id}"
+            doc = dict(relation)
+            doc.update(
+                {
+                    "_id": relation_id,
+                    "parent_tag_id": parent_id,
+                    "child_tag_id": child_id,
+                }
+            )
+            remapped_tag_relations[relation_id] = doc
+        prepared["tag_relations"] = list(remapped_tag_relations.values())
+
+    target_categories = {
+        int(doc["_id"]): str(doc.get("category") or "GENERAL")
+        for doc in store.db.tags.find({}, {"_id": 1, "category": 1})
+        if isinstance(doc.get("_id"), int)
+    }
+    target_categories.update(
+        {
+            int(doc["_id"]): str(doc.get("category") or "GENERAL")
+            for doc in prepared["tags"]
+        }
+    )
+    valid_tag_relations = []
+    for relation in prepared["tag_relations"]:
+        if target_categories.get(int(relation["parent_tag_id"])) != target_categories.get(
+            int(relation["child_tag_id"])
+        ):
+            report["collections"]["tag_relations"]["skipped"] += 1
+            continue
+        valid_tag_relations.append(relation)
+    prepared["tag_relations"] = valid_tag_relations
 
     for name, documents in prepared.items():
         report["collections"][name]["prepared"] = len(documents)

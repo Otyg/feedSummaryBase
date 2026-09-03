@@ -40,6 +40,7 @@ from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
 from feedsummary_core.persistence.TinyDbStore import TinyDBStore
 from feedsummary_core.persistence.SqliteStore import SqliteStore
 from feedsummary_core.persistence.MongoDBStore import MongoDBStore
+from feedsummary_core.persistence.tag_relations import TagRelationError
 
 
 class StoreError(Exception):
@@ -117,6 +118,16 @@ class NewsStore(Protocol):
     def get_tag_by_name(self, name: str) -> Optional[Dict[str, Any]]: ...
 
     def get_all_tags(self) -> List[Dict[str, Any]]: ...
+
+    def get_tag_relations(self, tag_id: int) -> Dict[str, List[Dict[str, Any]]]: ...
+
+    def set_tag_relations(
+        self,
+        tag_id: int,
+        *,
+        parent_ids: Optional[List[int]] = None,
+        child_ids: Optional[List[int]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]: ...
 
     def iter_articles_with_tags(
         self,

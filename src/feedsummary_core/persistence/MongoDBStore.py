@@ -38,6 +38,10 @@ from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Tuple
 
 from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
+from feedsummary_core.persistence.tag_relations import (
+    PARENT_CHILD_RELATION,
+    proposed_parent_child_edges,
+)
 from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_tag
 
 try:
@@ -156,6 +160,16 @@ class MongoDBStore:
                 {"unique": True},
             ),
             (self.db.article_tags, [("tag_id", ASCENDING)], {}),
+            (
+                self.db.tag_relations,
+                [
+                    ("relation_type", ASCENDING),
+                    ("parent_tag_id", ASCENDING),
+                    ("child_tag_id", ASCENDING),
+                ],
+                {"unique": True},
+            ),
+            (self.db.tag_relations, [("child_tag_id", ASCENDING)], {}),
             (self.db.tag_categories, [("name", ASCENDING)], {"unique": True}),
         )
         for collection, keys, options in indexes:
@@ -479,6 +493,76 @@ class MongoDBStore:
     def get_all_tags(self) -> List[Dict[str, Any]]:
         return [self._tag_doc(doc) for doc in self.db.tags.find().sort("name", ASCENDING)]  # type: ignore[misc]
 
+    def get_tag_relations(self, tag_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        tag_id = int(tag_id)
+        rows = list(
+            self.db.tag_relations.find(
+                {
+                    "relation_type": PARENT_CHILD_RELATION,
+                    "$or": [{"parent_tag_id": tag_id}, {"child_tag_id": tag_id}],
+                }
+            )
+        )
+        parent_ids = [row["parent_tag_id"] for row in rows if row["child_tag_id"] == tag_id]
+        child_ids = [row["child_tag_id"] for row in rows if row["parent_tag_id"] == tag_id]
+        parents = [
+            self._tag_doc(doc)
+            for doc in self.db.tags.find({"_id": {"$in": parent_ids}}).sort("name", ASCENDING)
+        ]
+        children = [
+            self._tag_doc(doc)
+            for doc in self.db.tags.find({"_id": {"$in": child_ids}}).sort("name", ASCENDING)
+        ]
+        return {"parents": parents, "children": children}  # type: ignore[dict-item]
+
+    def set_tag_relations(
+        self,
+        tag_id: int,
+        *,
+        parent_ids: Optional[List[int]] = None,
+        child_ids: Optional[List[int]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        tag_id = int(tag_id)
+        tags_by_id = {
+            int(doc["_id"]): doc
+            for doc in self.db.tags.find({}, {"_id": 1, "category": 1})
+        }
+        existing_edges = {
+            (int(doc["parent_tag_id"]), int(doc["child_tag_id"]))
+            for doc in self.db.tag_relations.find(
+                {"relation_type": PARENT_CHILD_RELATION},
+                {"parent_tag_id": 1, "child_tag_id": 1},
+            )
+        }
+        proposed_edges = proposed_parent_child_edges(
+            tag_id,
+            parent_ids=parent_ids,
+            child_ids=child_ids,
+            tags_by_id=tags_by_id,
+            existing_edges=existing_edges,
+        )
+        self.db.tag_relations.delete_many(
+            {
+                "relation_type": PARENT_CHILD_RELATION,
+                "$or": [{"parent_tag_id": tag_id}, {"child_tag_id": tag_id}],
+            }
+        )
+        now = _now_ts()
+        rows = [
+            {
+                "_id": f"{PARENT_CHILD_RELATION}:{parent_id}:{child_id}",
+                "relation_type": PARENT_CHILD_RELATION,
+                "parent_tag_id": parent_id,
+                "child_tag_id": child_id,
+                "created_at": now,
+            }
+            for parent_id, child_id in proposed_edges
+            if parent_id == tag_id or child_id == tag_id
+        ]
+        if rows:
+            self.db.tag_relations.insert_many(rows)
+        return self.get_tag_relations(tag_id)
+
     def iter_articles_with_tags(
         self,
         *,
@@ -674,6 +758,13 @@ class MongoDBStore:
         if synonyms is not None:
             updates["synonyms"] = [str(item).strip().lower() for item in synonyms]
         if updates:
+            existing = self.db.tags.find_one({"_id": int(tag_id)}, {"category": 1})
+            if existing is None:
+                return None
+            new_category = updates.get("category")
+            category_changed = new_category is not None and new_category != str(
+                existing.get("category") or "GENERAL"
+            )
             updates["updated_at"] = _now_ts()
             try:
                 result = self.db.tags.update_one({"_id": int(tag_id)}, {"$set": updates})
@@ -681,6 +772,15 @@ class MongoDBStore:
                 return None
             if result.matched_count == 0:
                 return None
+            if category_changed:
+                self.db.tag_relations.delete_many(
+                    {
+                        "$or": [
+                            {"parent_tag_id": int(tag_id)},
+                            {"child_tag_id": int(tag_id)},
+                        ]
+                    }
+                )
         return self._tag_doc(self.db.tags.find_one({"_id": int(tag_id)}))
 
     def delete_tag(self, tag_id: int) -> bool:
@@ -688,6 +788,9 @@ class MongoDBStore:
             return False
         tag_id = int(tag_id)
         self.db.article_tags.delete_many({"tag_id": tag_id})
+        self.db.tag_relations.delete_many(
+            {"$or": [{"parent_tag_id": tag_id}, {"child_tag_id": tag_id}]}
+        )
         return self.db.tags.delete_one({"_id": tag_id}).deleted_count > 0
 
     def migrate_synonym_to_main_tag(
@@ -716,6 +819,14 @@ class MongoDBStore:
                 )
                 migrated += 1
             self.db.article_tags.delete_many({"tag_id": synonym_id})
+            self.db.tag_relations.delete_many(
+                {
+                    "$or": [
+                        {"parent_tag_id": synonym_id},
+                        {"child_tag_id": synonym_id},
+                    ]
+                }
+            )
             deleted += self.db.tags.delete_one({"_id": synonym_id}).deleted_count
         return migrated, deleted
 
@@ -795,6 +906,14 @@ class MongoDBStore:
             return 0
         result = self.db.tags.delete_many({"_id": {"$in": unused_ids}})
         self.db.article_tags.delete_many({"tag_id": {"$in": unused_ids}})
+        self.db.tag_relations.delete_many(
+            {
+                "$or": [
+                    {"parent_tag_id": {"$in": unused_ids}},
+                    {"child_tag_id": {"$in": unused_ids}},
+                ]
+            }
+        )
         return int(result.deleted_count)
 
     def get_articles_by_tags(
@@ -913,6 +1032,14 @@ class MongoDBStore:
 
         for tag in self.db.tags.find({}, {"_id": 1, "name": 1, "category": 1}):
             if is_cve_tag(tag.get("name")) and tag.get("category") != VULNERABILITY_TAG_CATEGORY:
+                self.db.tag_relations.delete_many(
+                    {
+                        "$or": [
+                            {"parent_tag_id": tag["_id"]},
+                            {"child_tag_id": tag["_id"]},
+                        ]
+                    }
+                )
                 self.db.tags.update_one(
                     {"_id": tag["_id"]},
                     {"$set": {"category": VULNERABILITY_TAG_CATEGORY, "updated_at": now}},

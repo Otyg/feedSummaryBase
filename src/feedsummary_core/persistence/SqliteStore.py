@@ -42,6 +42,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from feedsummary_core.persistence import CleanupPolicy
 from feedsummary_core.persistence.helpers import classify_summary_doc
+from feedsummary_core.persistence.tag_relations import (
+    PARENT_CHILD_RELATION,
+    proposed_parent_child_edges,
+)
 from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_tag
 
 logger = logging.getLogger(__name__)
@@ -208,6 +212,20 @@ class SqliteStore:
                 
                 CREATE INDEX IF NOT EXISTS idx_tags_category
                     ON tags(category);
+
+                CREATE TABLE IF NOT EXISTS tag_relations (
+                    parent_tag_id INTEGER NOT NULL,
+                    child_tag_id  INTEGER NOT NULL,
+                    relation_type TEXT NOT NULL DEFAULT 'parent_child',
+                    created_at    INTEGER,
+                    PRIMARY KEY (parent_tag_id, child_tag_id, relation_type),
+                    CHECK (parent_tag_id != child_tag_id),
+                    FOREIGN KEY (parent_tag_id) REFERENCES tags(id) ON DELETE CASCADE,
+                    FOREIGN KEY (child_tag_id) REFERENCES tags(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tag_relations_child
+                    ON tag_relations(child_tag_id, relation_type);
                 
                 CREATE TABLE IF NOT EXISTS article_tags (
                     article_id TEXT NOT NULL,
@@ -1058,6 +1076,108 @@ class SqliteStore:
         finally:
             con.close()
 
+    def get_tag_relations(self, tag_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        """Return the parents and children of a tag."""
+        tag_id = int(tag_id)
+        con = self._connect()
+        try:
+            rows = con.execute(
+                """
+                SELECT r.parent_tag_id, r.child_tag_id,
+                       p.name AS parent_name, p.category AS parent_category,
+                       p.description AS parent_description,
+                       c.name AS child_name, c.category AS child_category,
+                       c.description AS child_description
+                FROM tag_relations r
+                JOIN tags p ON p.id = r.parent_tag_id
+                JOIN tags c ON c.id = r.child_tag_id
+                WHERE r.relation_type = ?
+                  AND (r.parent_tag_id = ? OR r.child_tag_id = ?)
+                """,
+                (PARENT_CHILD_RELATION, tag_id, tag_id),
+            ).fetchall()
+            parents = [
+                {
+                    "id": int(row["parent_tag_id"]),
+                    "name": row["parent_name"],
+                    "category": row["parent_category"],
+                    "description": row["parent_description"],
+                }
+                for row in rows
+                if int(row["child_tag_id"]) == tag_id
+            ]
+            children = [
+                {
+                    "id": int(row["child_tag_id"]),
+                    "name": row["child_name"],
+                    "category": row["child_category"],
+                    "description": row["child_description"],
+                }
+                for row in rows
+                if int(row["parent_tag_id"]) == tag_id
+            ]
+            parents.sort(key=lambda tag: str(tag.get("name") or "").casefold())
+            children.sort(key=lambda tag: str(tag.get("name") or "").casefold())
+            return {"parents": parents, "children": children}
+        finally:
+            con.close()
+
+    def set_tag_relations(
+        self,
+        tag_id: int,
+        *,
+        parent_ids: Optional[List[int]] = None,
+        child_ids: Optional[List[int]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Replace either or both sides of a tag's parent-child relations."""
+        tag_id = int(tag_id)
+        con = self._connect()
+        try:
+            tags_by_id = {
+                int(row["id"]): dict(row)
+                for row in con.execute("SELECT id, category FROM tags").fetchall()
+            }
+            existing_edges = {
+                (int(row["parent_tag_id"]), int(row["child_tag_id"]))
+                for row in con.execute(
+                    """
+                    SELECT parent_tag_id, child_tag_id FROM tag_relations
+                    WHERE relation_type = ?
+                    """,
+                    (PARENT_CHILD_RELATION,),
+                ).fetchall()
+            }
+            proposed_edges = proposed_parent_child_edges(
+                tag_id,
+                parent_ids=parent_ids,
+                child_ids=child_ids,
+                tags_by_id=tags_by_id,
+                existing_edges=existing_edges,
+            )
+            con.execute(
+                """
+                DELETE FROM tag_relations
+                WHERE relation_type = ? AND (parent_tag_id = ? OR child_tag_id = ?)
+                """,
+                (PARENT_CHILD_RELATION, tag_id, tag_id),
+            )
+            now = _now_ts()
+            for parent_id, child_id in proposed_edges:
+                if parent_id != tag_id and child_id != tag_id:
+                    continue
+                con.execute(
+                    """
+                    INSERT INTO tag_relations
+                        (parent_tag_id, child_tag_id, relation_type, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (parent_id, child_id, PARENT_CHILD_RELATION, now),
+                )
+            con.commit()
+        finally:
+            con.close()
+        return self.get_tag_relations(tag_id)
+
     def add_article_tags(
         self,
         article_id: str,
@@ -1298,6 +1418,16 @@ class SqliteStore:
             values = list(updates.values())
             values.append(int(tag_id))
 
+            new_category = updates.get("category")
+            if new_category is not None and new_category != (row["category"] or "GENERAL"):
+                con.execute(
+                    """
+                    DELETE FROM tag_relations
+                    WHERE parent_tag_id = ? OR child_tag_id = ?
+                    """,
+                    (int(tag_id), int(tag_id)),
+                )
+
             con.execute(
                 f"UPDATE tags SET {', '.join(set_clauses)} WHERE id = ?",
                 values,
@@ -1332,6 +1462,10 @@ class SqliteStore:
         try:
             # Delete from article_tags first
             con.execute("DELETE FROM article_tags WHERE tag_id = ?", (int(tag_id),))
+            con.execute(
+                "DELETE FROM tag_relations WHERE parent_tag_id = ? OR child_tag_id = ?",
+                (int(tag_id), int(tag_id)),
+            )
             
             # Delete the tag
             cursor = con.execute("DELETE FROM tags WHERE id = ?", (int(tag_id),))
@@ -1798,6 +1932,13 @@ class SqliteStore:
                     is_cve_tag(tag_name)
                     and tag_category != VULNERABILITY_TAG_CATEGORY
                 ):
+                    con.execute(
+                        """
+                        DELETE FROM tag_relations
+                        WHERE parent_tag_id = ? OR child_tag_id = ?
+                        """,
+                        (int(tag_id), int(tag_id)),
+                    )
                     con.execute(
                         "UPDATE tags SET category = ? WHERE id = ?",
                         (VULNERABILITY_TAG_CATEGORY, int(tag_id)),
