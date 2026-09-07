@@ -57,7 +57,8 @@ class OllamaConfig:
 
     base_url: str = "http://localhost:11434"
     model: str = "gemma3:1b"
-    embedding_model: str = "embeddinggemma:latest"  # Model for embeddings
+    embedding_model: str = "qwen3-embedding:0.6b"  # Model for embeddings
+    embedding_dimensions: int = 1024
     max_rps: float = 1.0
 
     # Hur länge vi kan vänta på att Ollama börjar svara (första bytes/headers).
@@ -216,7 +217,13 @@ class OllamaLocalClient:
         self.log.info("LLM request done (chars=%d)", len(text))
         return text
 
-    async def embed(self, text: str) -> List[float]:
+    async def embed(
+        self,
+        text: str,
+        *,
+        instruction: str = "",
+        dimensions: Optional[int] = None,
+    ) -> List[float]:
         """
         Generate embeddings for a given text using the embedding model.
 
@@ -232,9 +239,16 @@ class OllamaLocalClient:
         await self._rate_gate()
         session = await self._get_session()
 
+        requested_dimensions = int(dimensions or self.cfg.embedding_dimensions)
+        embedding_input = (
+            f"Instruct: {instruction.strip()}\nQuery:{text}"
+            if instruction.strip()
+            else text
+        )
         payload = {
             "model": self.cfg.embedding_model,
-            "input": text,
+            "input": embedding_input,
+            "dimensions": requested_dimensions,
         }
 
         url = f"{self.cfg.base_url.rstrip('/')}/api/embed"
@@ -253,7 +267,19 @@ class OllamaLocalClient:
                     
                     # Ollama returns a list of embeddings, take the first one
                     if embeddings and len(embeddings) > 0:
-                        return list(embeddings[0]) if isinstance(embeddings[0], (list, tuple)) else []
+                        vector = (
+                            list(embeddings[0])
+                            if isinstance(embeddings[0], (list, tuple))
+                            else []
+                        )
+                        if vector and len(vector) != requested_dimensions:
+                            self.log.error(
+                                "Embedding dimension mismatch: requested=%d received=%d",
+                                requested_dimensions,
+                                len(vector),
+                            )
+                            return []
+                        return vector
                     
                     return []
         except Exception as e:

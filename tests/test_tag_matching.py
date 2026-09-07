@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from feedsummary_core.summarizer.tagging import TagManager
 
@@ -88,7 +89,56 @@ class TagMatchingTests(unittest.TestCase):
 
         self.assertEqual(["password spraying"], client.embed_calls)
         self.assertEqual([0.4, 0.6], store.similarity_calls[0][0])
+        self.assertEqual(0.8, store.similarity_calls[0][1])
         self.assertEqual("credential attack", selected[0]["name"])
+
+    def test_async_selection_forwards_configured_embedding_replacement_threshold(self):
+        semantic_match = {
+            "id": 1,
+            "name": "credential attack",
+            "category": "GENERAL",
+            "_similarity_score": 0.91,
+        }
+        store = MemoryTagStore([semantic_match], embedding_matches=[semantic_match])
+        client = FakeEmbeddingClient([0.4, 0.6])
+        manager = TagManager(store, llm_client=client)
+
+        selected = asyncio.run(
+            manager.select_tags_for_article_async(
+                "article-1",
+                [{"name": "password spraying", "type": "CATEGORY"}],
+                allow_new_tags=False,
+                embedding_replacement_threshold=0.87,
+            )
+        )
+
+        self.assertEqual(0.87, store.similarity_calls[0][1])
+        self.assertEqual("credential attack", selected[0]["name"])
+
+    @patch.object(
+        TagManager,
+        "select_tags_for_article_async",
+        new_callable=AsyncMock,
+        return_value=[],
+    )
+    def test_generation_reads_embedding_replacement_threshold_from_config(self, select):
+        manager = TagManager(MemoryTagStore([]))
+        client = FakeTaggingClient(
+            '{"tags": [{"tag": "security", "type": "CATEGORY"}]}'
+        )
+
+        asyncio.run(
+            manager.generate_tags_for_article(
+                client,
+                {"id": "article-1", "title": "Security update"},
+                {"tagging": {"embedding_replacement_threshold": 0.8}},
+            )
+        )
+
+        self.assertEqual(
+            0.8,
+            select.await_args.kwargs["embedding_replacement_threshold"],
+        )
 
     def test_embedding_failure_uses_safe_string_fallback(self):
         store = MemoryTagStore(

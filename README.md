@@ -315,20 +315,29 @@ batching:
   similarity_threshold: 0.78
   embedding_text_chars: 2000
   embedding_max_concurrency: 4
+  embedding_instruction: "Represent the specific real-world event described by this article."
+
+tagging:
+  ml:
+    embedding_instruction: "Represent the topics, industries or sectors, type of information, subjects and geographical regions discussed in this article."
 
 llm:
   provider: ollama_local
   model: qwen2.5:7b
-  embedding_model: embeddinggemma:latest
+  embedding_model: qwen3-embedding:0.6b
+  embedding_dimensions: 1024
 ```
 
 Set `similarity_enabled: false` to retain sequential batching. If embeddings
 cannot be generated, the summarizer automatically falls back to sequential
 batching.
 
-Article and tag embeddings are persisted by every storage backend. Cache entries
-contain `embedding_vector`, `embedding_model`, `embedding_source_hash`, and
-`embedding_updated_at`; they are reused until the embedded text or model changes.
+Every article has separate `similarity_embedding_*` and `tagging_embedding_*`
+cache fields. Similarity batching and related-article checks only read the first
+vector, while the ML classifier only reads the second. Each cache also records
+its model, instruction, source hash, and update time, and is reused only while
+all of those inputs and the configured dimension still match. Tag-name
+embeddings retain their existing `embedding_*` fields.
 
 ## Usage Examples
 

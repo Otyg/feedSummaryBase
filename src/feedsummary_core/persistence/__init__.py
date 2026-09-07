@@ -63,6 +63,8 @@ class NewsStore(Protocol):
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
+        purpose: str = "similarity",
+        instruction: Optional[str] = None,
     ) -> bool: ...
 
     def list_unsummarized_articles(self, limit: int = 200) -> List[Dict[str, Any]]: ...

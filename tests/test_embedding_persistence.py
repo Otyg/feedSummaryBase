@@ -5,6 +5,8 @@ from tempfile import TemporaryDirectory
 
 from feedsummary_core.persistence import SqliteStore, TinyDBStore
 from feedsummary_core.summarizer.batching import (
+    SIMILARITY_EMBEDDING_INSTRUCTION,
+    TAGGING_EMBEDDING_INSTRUCTION,
     cached_embedding,
     embedding_source_hash,
     ensure_article_embedding,
@@ -24,8 +26,10 @@ class EmbeddingPersistenceTests(unittest.TestCase):
                 self.update = (article_id, vector, metadata)
                 return True
 
-        async def embed(text):
+        async def embed(text, *, instruction, dimensions):
             self.assertEqual("Title\n\nArticle body", text)
+            self.assertEqual(TAGGING_EMBEDDING_INSTRUCTION, instruction)
+            self.assertEqual(2, dimensions)
             return [1.0, 0.0]
 
         store = Store()
@@ -35,13 +39,15 @@ class EmbeddingPersistenceTests(unittest.TestCase):
                 embed,
                 store=store,
                 embedding_model="embedding-model",
+                dimensions=2,
             )
         )
 
         self.assertEqual([1.0, 0.0], result)
         self.assertEqual("article-1", store.update[0])
         self.assertEqual("embedding-model", store.update[2]["model"])
-        self.assertEqual([1.0, 0.0], article["embedding_vector"])
+        self.assertEqual("tagging", store.update[2]["purpose"])
+        self.assertEqual([1.0, 0.0], article["tagging_embedding_vector"])
 
     def test_tag_manager_reuses_persisted_tag_embedding(self):
         class Config:
@@ -84,22 +90,75 @@ class EmbeddingPersistenceTests(unittest.TestCase):
 
     def _assert_embedding_round_trip(self, store):
         article_text = "Title\n\nArticle body"
-        article_hash = embedding_source_hash(article_text)
-        store.upsert_article({"id": "article-1", "title": "Title", "text": "Article body"})
+        similarity_hash = embedding_source_hash(
+            article_text, SIMILARITY_EMBEDDING_INSTRUCTION
+        )
+        tagging_hash = embedding_source_hash(article_text, TAGGING_EMBEDDING_INSTRUCTION)
+        store.upsert_article(
+            {
+                "id": "article-1",
+                "title": "Title",
+                "text": "Article body",
+                "embedding_vector": [9.0, 9.0],
+                "embedding_model": "legacy-model",
+            }
+        )
 
         self.assertTrue(
             store.update_article_embedding(
                 "article-1",
                 [1.0, 0.0],
                 model="embedding-model",
-                source_hash=article_hash,
+                source_hash=similarity_hash,
+                purpose="similarity",
+                instruction=SIMILARITY_EMBEDDING_INSTRUCTION,
+            )
+        )
+        self.assertTrue(
+            store.update_article_embedding(
+                "article-1",
+                [0.0, 1.0],
+                model="embedding-model",
+                source_hash=tagging_hash,
+                purpose="tagging",
+                instruction=TAGGING_EMBEDDING_INSTRUCTION,
             )
         )
         # A normal ingest upsert must not discard an already persisted cache entry.
         store.upsert_article({"id": "article-1", "title": "Title", "text": "Article body"})
         article = store.get_article("article-1")
-        self.assertEqual([1.0, 0.0], cached_embedding(article, article_text, "embedding-model"))
-        self.assertIsNone(cached_embedding(article, article_text, "different-model"))
+        self.assertNotIn("embedding_vector", article)
+        self.assertEqual(
+            [1.0, 0.0],
+            cached_embedding(
+                article,
+                article_text,
+                "embedding-model",
+                purpose="similarity",
+                instruction=SIMILARITY_EMBEDDING_INSTRUCTION,
+                dimensions=2,
+            ),
+        )
+        self.assertEqual(
+            [0.0, 1.0],
+            cached_embedding(
+                article,
+                article_text,
+                "embedding-model",
+                purpose="tagging",
+                instruction=TAGGING_EMBEDDING_INSTRUCTION,
+                dimensions=2,
+            ),
+        )
+        self.assertIsNone(
+            cached_embedding(
+                article,
+                article_text,
+                "different-model",
+                purpose="tagging",
+                instruction=TAGGING_EMBEDDING_INSTRUCTION,
+            )
+        )
 
         tag_id = store.add_tag("security")
         self.assertTrue(

@@ -38,6 +38,7 @@ from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tinydb import Query, TinyDB
+from tinydb.operations import delete as delete_field
 
 from feedsummary_core.persistence import CleanupPolicy
 from feedsummary_core.persistence.tag_relations import (
@@ -88,24 +89,41 @@ class TinyDBStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
+        purpose: str = "similarity",
+        instruction: Optional[str] = None,
     ) -> bool:
-        """Persist a reusable embedding for an existing article."""
+        """Persist a purpose-specific embedding for an existing article."""
         if not article_id or not embedding_vector or not all(
             isinstance(value, (int, float)) for value in embedding_vector
         ):
             return False
+        purpose = str(purpose).strip().lower()
+        if purpose not in {"similarity", "tagging"}:
+            raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+        prefix = f"{purpose}_embedding"
         db = self._db()
         try:
             A = Query()
             updated = db.table("articles").update(
                 {
-                    "embedding_vector": [float(value) for value in embedding_vector],
-                    "embedding_model": str(model or ""),
-                    "embedding_source_hash": str(source_hash or ""),
-                    "embedding_updated_at": int(time.time()),
+                    f"{prefix}_vector": [float(value) for value in embedding_vector],
+                    f"{prefix}_model": str(model or ""),
+                    f"{prefix}_source_hash": str(source_hash or ""),
+                    f"{prefix}_instruction": str(instruction or "").strip(),
+                    f"{prefix}_updated_at": int(time.time()),
                 },
                 A.id == str(article_id),
             )
+            for legacy_field in (
+                "embedding_vector",
+                "embedding_model",
+                "embedding_source_hash",
+                "embedding_updated_at",
+            ):
+                db.table("articles").update(
+                    delete_field(legacy_field),
+                    (A.id == str(article_id)) & A[legacy_field].exists(),
+                )
             return bool(updated)
         finally:
             db.close()

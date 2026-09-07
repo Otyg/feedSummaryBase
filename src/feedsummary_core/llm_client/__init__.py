@@ -82,8 +82,22 @@ def get_local_embedding_model(config: Dict[str, Any]) -> str:
             isinstance(item, dict)
             and str(item.get("provider") or "").strip().lower() == "ollama_local"
         ):
-            return str(item.get("embedding_model") or "embeddinggemma:latest").strip()
+            return str(item.get("embedding_model") or "qwen3-embedding:0.6b").strip()
     return ""
+
+
+def get_local_embedding_dimensions(config: Dict[str, Any]) -> int:
+    """Return the requested embedding size for the first local Ollama provider."""
+    configured = config.get("llm")
+    llm_configs = list(configured) if isinstance(configured, list) else [configured]
+    llm_configs.append(config.get("llm_fallback"))
+    for item in llm_configs:
+        if (
+            isinstance(item, dict)
+            and str(item.get("provider") or "").strip().lower() == "ollama_local"
+        ):
+            return max(1, int(item.get("embedding_dimensions", 1024)))
+    return 1024
 
 
 def get_client_embedding_model(client: Any) -> str:
@@ -91,6 +105,13 @@ def get_client_embedding_model(client: Any) -> str:
     embedding_client = getattr(client, "embedding_client", None) or client
     cfg = getattr(embedding_client, "cfg", None)
     return str(getattr(cfg, "embedding_model", "") or "").strip()
+
+
+def get_client_embedding_dimensions(client: Any) -> int:
+    """Return an embedding client's configured output size."""
+    embedding_client = getattr(client, "embedding_client", None) or client
+    cfg = getattr(embedding_client, "cfg", None)
+    return max(1, int(getattr(cfg, "embedding_dimensions", 1024) or 1024))
 
 
 def _create_single_llm(llm_cfg: Dict[str, Any]):
@@ -107,7 +128,8 @@ def _create_single_llm(llm_cfg: Dict[str, Any]):
         cfg = OllamaConfig(
             base_url=str(llm_cfg.get("base_url", "http://localhost:11434")),
             model=str(llm_cfg.get("model", "llama3.1:latest")),
-            embedding_model=str(llm_cfg.get("embedding_model", "embeddinggemma:latest")),
+            embedding_model=str(llm_cfg.get("embedding_model", "qwen3-embedding:0.6b")),
+            embedding_dimensions=max(1, int(llm_cfg.get("embedding_dimensions", 1024))),
             max_rps=float(llm_cfg.get("max_rps", 1.0)),
             first_byte_timeout_s=int(llm_cfg.get("first_byte_timeout_s", 900)),
             sock_read_timeout_s=int(llm_cfg.get("sock_read_timeout_s", 300)),

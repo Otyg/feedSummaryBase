@@ -46,12 +46,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from feedsummary_core.llm_client import (
     LLMClient,
     get_local_embedding_model,
+    get_local_embedding_dimensions,
     get_primary_llm_config,
     has_local_embedding_provider,
 )
 from feedsummary_core.persistence import NewsStore
 from feedsummary_core.summarizer.batching import (
     PromptTooLongStructural,
+    SIMILARITY_EMBEDDING_INSTRUCTION,
+    TAGGING_EMBEDDING_INSTRUCTION,
     _batch_article_ids_map,
     _budgeted_meta_user,
     _build_batches_from_checkpoint,
@@ -1256,6 +1259,19 @@ async def summarize_batches_then_meta_with_stats(
             max_concurrency=int(batching.get("embedding_max_concurrency", 4)),
             store=store,
             embedding_model=get_local_embedding_model(config),
+            embedding_dimensions=get_local_embedding_dimensions(config),
+            similarity_instruction=str(
+                batching.get(
+                    "embedding_instruction",
+                    SIMILARITY_EMBEDDING_INSTRUCTION,
+                )
+            ).strip(),
+            tagging_instruction=str(
+                ((config.get("tagging", {}) or {}).get("ml", {}) or {}).get(
+                    "embedding_instruction",
+                    TAGGING_EMBEDDING_INSTRUCTION,
+                )
+            ).strip(),
         )
 
     # batch resume

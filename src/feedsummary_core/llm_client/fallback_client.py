@@ -51,7 +51,13 @@ class LLMClient(Protocol):
 class EmbeddingClient(Protocol):
     """Minimal async embedding contract used by the fallback wrapper."""
 
-    async def embed(self, text: str) -> List[float]: ...
+    async def embed(
+        self,
+        text: str,
+        *,
+        instruction: str = "",
+        dimensions: Optional[int] = None,
+    ) -> List[float]: ...
 
 
 @dataclass
@@ -184,7 +190,13 @@ class FallbackLLMClient:
                     )
                     await asyncio.sleep(wait_s)
 
-    async def embed(self, text: str) -> List[float]:
+    async def embed(
+        self,
+        text: str,
+        *,
+        instruction: str = "",
+        dimensions: Optional[int] = None,
+    ) -> List[float]:
         """
         Generate embeddings exclusively through the configured local Ollama client.
 
@@ -201,7 +213,21 @@ class FallbackLLMClient:
                 "Embeddings kräver en ollama_local-konfiguration i LLM-kedjan."
             )
 
-        return await self.embedding_client.embed(text)
+        try:
+            return await self.embedding_client.embed(
+                text,
+                instruction=instruction,
+                dimensions=dimensions,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            formatted = (
+                f"Instruct: {instruction.strip()}\nQuery:{text}"
+                if instruction.strip()
+                else text
+            )
+            return await self.embedding_client.embed(formatted)
 
     async def aclose(self) -> None:
         """

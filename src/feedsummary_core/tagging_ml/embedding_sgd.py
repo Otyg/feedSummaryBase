@@ -158,7 +158,8 @@ class _TrainingRow:
 class EmbeddingClassifierTagger:
     """Train, persist, refresh, and use a configured embedding classifier."""
 
-    ARTIFACT_VERSION = 2
+    # Version 3 trains exclusively on instruction-specific tagging embeddings.
+    ARTIFACT_VERSION = 3
 
     def __init__(self, settings: EmbeddingClassifierSettings):
         self.settings = settings
@@ -201,11 +202,16 @@ class EmbeddingClassifierTagger:
         if not path.is_file():
             return False
         artifact = _ml_imports()["joblib"].load(path)
-        if (
-            not isinstance(artifact, dict)
-            or artifact.get("artifact_version") != self.ARTIFACT_VERSION
-        ):
+        if not isinstance(artifact, dict):
             raise ValueError(f"Unsupported ML tag artifact at {path}")
+        artifact_version = artifact.get("artifact_version")
+        if artifact_version != self.ARTIFACT_VERSION:
+            logger.info(
+                "ML tag artifact version changed (%r -> %d); retraining is required",
+                artifact_version,
+                self.ARTIFACT_VERSION,
+            )
+            return False
         if tuple(artifact.get("categories") or ()) != self.settings.categories:
             logger.info("ML tag artifact categories changed; retraining is required")
             return False
@@ -235,8 +241,8 @@ class EmbeddingClassifierTagger:
             if not isinstance(article, dict):
                 continue
             article_id = str(article.get("id") or "").strip()
-            vector = article.get("embedding_vector")
-            model = str(article.get("embedding_model") or "").strip()
+            vector = article.get("tagging_embedding_vector")
+            model = str(article.get("tagging_embedding_model") or "").strip()
             if not article_id or not isinstance(vector, list) or not vector:
                 continue
             if not all(isinstance(value, (int, float)) for value in vector):
@@ -269,7 +275,7 @@ class EmbeddingClassifierTagger:
                     article_id=article_id,
                     embedding=tuple(float(value) for value in vector),
                     labels=labels,
-                    source_hash=str(article.get("embedding_source_hash") or ""),
+                    source_hash=str(article.get("tagging_embedding_source_hash") or ""),
                 )
             )
 
@@ -431,7 +437,7 @@ class EmbeddingClassifierTagger:
         if not self.can_predict(article):
             return []
         assert self._artifact is not None
-        vector = article.get("embedding_vector")
+        vector = article.get("tagging_embedding_vector")
         assert isinstance(vector, list)
 
         ml = _ml_imports()
@@ -465,7 +471,7 @@ class EmbeddingClassifierTagger:
         """Explain why an article cannot be scored, or return ``None`` when compatible."""
         if not self._artifact:
             return "model_not_ready"
-        vector = article.get("embedding_vector")
+        vector = article.get("tagging_embedding_vector")
         if not isinstance(vector, list) or not vector:
             return "missing_embedding"
         if not all(isinstance(value, (int, float)) for value in vector):
@@ -473,7 +479,10 @@ class EmbeddingClassifierTagger:
         if len(vector) != int(self._artifact["embedding_dimension"]):
             return "embedding_dimension_mismatch"
         expected_model = str(self._artifact.get("embedding_model") or "")
-        if expected_model and str(article.get("embedding_model") or "") != expected_model:
+        if (
+            expected_model
+            and str(article.get("tagging_embedding_model") or "") != expected_model
+        ):
             return "embedding_model_mismatch"
         return None
 

@@ -8,8 +8,10 @@ from feedsummary_core.tagging_ml.embedding_sgd import (
 )
 
 try:
+    import joblib
     import sklearn
 except ImportError:  # pragma: no cover - optional dependency
+    joblib = None
     sklearn = None
 
 
@@ -28,9 +30,9 @@ class FakeTrainingStore:
                 {
                     "article": {
                         "id": f"article-{index}",
-                        "embedding_vector": vector,
-                        "embedding_model": "test-embedding",
-                        "embedding_source_hash": f"hash-{index}",
+                        "tagging_embedding_vector": vector,
+                        "tagging_embedding_model": "test-embedding",
+                        "tagging_embedding_source_hash": f"hash-{index}",
                     },
                     "tags": [self.tags[label].copy()],
                 }
@@ -132,8 +134,8 @@ class EmbeddingClassifierTaggerTests(unittest.TestCase):
             self.assertTrue(tagger.refresh_from_store(store))
             predictions = tagger.predict_tags(
                 {
-                    "embedding_vector": [3.0, 0.0],
-                    "embedding_model": "test-embedding",
+                    "tagging_embedding_vector": [3.0, 0.0],
+                    "tagging_embedding_model": "test-embedding",
                 },
                 store,
             )
@@ -162,8 +164,8 @@ class EmbeddingClassifierTaggerTests(unittest.TestCase):
             self.assertTrue(tagger.refresh_from_store(store))
             predictions = tagger.predict_tags(
                 {
-                    "embedding_vector": [3.0, 0.0],
-                    "embedding_model": "test-embedding",
+                    "tagging_embedding_vector": [3.0, 0.0],
+                    "tagging_embedding_model": "test-embedding",
                 },
                 store,
             )
@@ -203,6 +205,25 @@ class EmbeddingClassifierTaggerTests(unittest.TestCase):
 
             self.assertIsNot(first_classifier, tagger._artifact["classifier"])
 
+    def test_force_replaces_an_artifact_from_an_older_version(self):
+        with TemporaryDirectory() as directory:
+            store = FakeTrainingStore()
+            settings = self._settings(directory)
+            tagger = EmbeddingClassifierTagger(settings)
+            self.assertTrue(tagger.refresh_from_store(store))
+            model_path = Path(directory) / "model.joblib"
+            old_artifact = joblib.load(model_path)
+            old_artifact["artifact_version"] = tagger.ARTIFACT_VERSION - 1
+            joblib.dump(old_artifact, model_path)
+
+            replacement = EmbeddingClassifierTagger(settings)
+            self.assertTrue(replacement.refresh_from_store(store, force=True))
+
+            self.assertEqual(
+                replacement.ARTIFACT_VERSION,
+                joblib.load(model_path)["artifact_version"],
+            )
+
     def test_force_keeps_existing_artifact_when_corpus_is_too_small(self):
         with TemporaryDirectory() as directory:
             store = FakeTrainingStore()
@@ -225,12 +246,12 @@ class EmbeddingClassifierTaggerTests(unittest.TestCase):
             self.assertFalse(
                 tagger.can_predict(
                     {
-                        "embedding_vector": [3.0, 0.0],
-                        "embedding_model": "different-model",
+                        "tagging_embedding_vector": [3.0, 0.0],
+                        "tagging_embedding_model": "different-model",
                     }
                 )
             )
-            self.assertEqual([], tagger.predict_names({"embedding_vector": [3.0]}))
+            self.assertEqual([], tagger.predict_names({"tagging_embedding_vector": [3.0]}))
 
 
 if __name__ == "__main__":

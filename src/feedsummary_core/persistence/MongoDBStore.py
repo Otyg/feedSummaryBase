@@ -214,18 +214,30 @@ class MongoDBStore:
         existing = self.db.articles.find_one(
             {"_id": doc["_id"]},
             {
-                "embedding_vector": 1,
-                "embedding_model": 1,
-                "embedding_source_hash": 1,
-                "embedding_updated_at": 1,
+                "similarity_embedding_vector": 1,
+                "similarity_embedding_model": 1,
+                "similarity_embedding_source_hash": 1,
+                "similarity_embedding_instruction": 1,
+                "similarity_embedding_updated_at": 1,
+                "tagging_embedding_vector": 1,
+                "tagging_embedding_model": 1,
+                "tagging_embedding_source_hash": 1,
+                "tagging_embedding_instruction": 1,
+                "tagging_embedding_updated_at": 1,
             },
         )
         if existing:
             for field in (
-                "embedding_vector",
-                "embedding_model",
-                "embedding_source_hash",
-                "embedding_updated_at",
+                "similarity_embedding_vector",
+                "similarity_embedding_model",
+                "similarity_embedding_source_hash",
+                "similarity_embedding_instruction",
+                "similarity_embedding_updated_at",
+                "tagging_embedding_vector",
+                "tagging_embedding_model",
+                "tagging_embedding_source_hash",
+                "tagging_embedding_instruction",
+                "tagging_embedding_updated_at",
             ):
                 if field not in doc and field in existing:
                     doc[field] = existing[field]
@@ -239,23 +251,36 @@ class MongoDBStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
+        purpose: str = "similarity",
+        instruction: Optional[str] = None,
     ) -> bool:
-        """Persist a reusable embedding for an existing article."""
+        """Persist a purpose-specific embedding for an existing article."""
         if (
             not article_id
             or not embedding_vector
             or not all(isinstance(value, (int, float)) for value in embedding_vector)
         ):
             return False
+        purpose = str(purpose).strip().lower()
+        if purpose not in {"similarity", "tagging"}:
+            raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+        prefix = f"{purpose}_embedding"
         result = self.db.articles.update_one(
             {"_id": str(article_id)},
             {
                 "$set": {
-                    "embedding_vector": [float(value) for value in embedding_vector],
-                    "embedding_model": str(model or ""),
-                    "embedding_source_hash": str(source_hash or ""),
-                    "embedding_updated_at": _now_ts(),
-                }
+                    f"{prefix}_vector": [float(value) for value in embedding_vector],
+                    f"{prefix}_model": str(model or ""),
+                    f"{prefix}_source_hash": str(source_hash or ""),
+                    f"{prefix}_instruction": str(instruction or "").strip(),
+                    f"{prefix}_updated_at": _now_ts(),
+                },
+                "$unset": {
+                    "embedding_vector": "",
+                    "embedding_model": "",
+                    "embedding_source_hash": "",
+                    "embedding_updated_at": "",
+                },
             },
         )
         return result.matched_count > 0

@@ -165,20 +165,35 @@ class MongoDBStoreTests(unittest.TestCase):
         self.assertEqual([], store.db.list_collection_names())
 
     def test_article_and_tag_embedding_metadata_is_persisted(self):
-        self.store.upsert_article({"id": "article-1", "title": "Title"})
+        self.store.upsert_article(
+            {
+                "id": "article-1",
+                "title": "Title",
+                "embedding_vector": [9.0, 9.0],
+            }
+        )
         self.assertTrue(
             self.store.update_article_embedding(
                 "article-1",
                 [1.0, 0.0],
                 model="embedding-model",
-                source_hash=embedding_source_hash("Title"),
+                source_hash=embedding_source_hash("Title", "event instruction"),
+                purpose="similarity",
+                instruction="event instruction",
             )
         )
         article = self.store.get_article("article-1")
-        self.assertEqual("embedding-model", article["embedding_model"])
-        self.assertEqual([1.0, 0.0], article["embedding_vector"])
+        self.assertNotIn("embedding_vector", article)
+        self.assertEqual("embedding-model", article["similarity_embedding_model"])
+        self.assertEqual([1.0, 0.0], article["similarity_embedding_vector"])
+        self.assertEqual(
+            "event instruction", article["similarity_embedding_instruction"]
+        )
         self.store.upsert_article({"id": "article-1", "title": "Title"})
-        self.assertEqual([1.0, 0.0], self.store.get_article("article-1")["embedding_vector"])
+        self.assertEqual(
+            [1.0, 0.0],
+            self.store.get_article("article-1")["similarity_embedding_vector"],
+        )
 
         tag_id = self.store.add_tag("security")
         self.assertTrue(
