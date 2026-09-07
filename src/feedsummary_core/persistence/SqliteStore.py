@@ -110,16 +110,21 @@ class SqliteStore:
         path: str = "news_docs.sqlite",
         *,
         pragmas: Optional[Dict[str, str]] = None,
+        initialize_schema: bool = True,
     ):
         self.path = str(Path(path))
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        if initialize_schema:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        elif not Path(self.path).is_file():
+            raise FileNotFoundError(f"SQLite database does not exist: {self.path}")
         self._pragmas = pragmas or {
             "journal_mode": "WAL",
             "synchronous": "NORMAL",
             "temp_store": "MEMORY",
             "foreign_keys": "ON",
         }
-        self._init_db()
+        if initialize_schema:
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path)
@@ -251,6 +256,103 @@ class SqliteStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_articles_url
                     ON articles(url)
                     WHERE url IS NOT NULL AND url != '';
+
+                CREATE TABLE IF NOT EXISTS long_term_state (
+                    profile_id       TEXT PRIMARY KEY,
+                    cursor_fetched_at INTEGER NOT NULL DEFAULT 0,
+                    cursor_article_id TEXT NOT NULL DEFAULT '',
+                    lease_owner       TEXT,
+                    lease_until       INTEGER,
+                    updated_at        INTEGER NOT NULL,
+                    doc_json          TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS threat_clusters (
+                    id                  TEXT PRIMARY KEY,
+                    profile_id          TEXT NOT NULL,
+                    status              TEXT NOT NULL,
+                    last_seen_ts        INTEGER NOT NULL,
+                    embedding_model     TEXT NOT NULL,
+                    embedding_dimension INTEGER NOT NULL,
+                    embedding_instruction TEXT NOT NULL,
+                    membership_revision INTEGER NOT NULL,
+                    updated_at          INTEGER NOT NULL,
+                    doc_json            TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_threat_clusters_candidates
+                    ON threat_clusters(
+                        profile_id, status, embedding_model,
+                        embedding_dimension, last_seen_ts
+                    );
+
+                CREATE TABLE IF NOT EXISTS threat_cluster_memberships (
+                    profile_id TEXT NOT NULL,
+                    article_id TEXT NOT NULL,
+                    cluster_id TEXT NOT NULL,
+                    assigned_at INTEGER NOT NULL,
+                    doc_json TEXT NOT NULL,
+                    PRIMARY KEY (profile_id, article_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_threat_memberships_cluster
+                    ON threat_cluster_memberships(cluster_id, assigned_at);
+
+                CREATE TABLE IF NOT EXISTS long_term_article_quarantine (
+                    profile_id TEXT NOT NULL,
+                    article_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    resolved_at INTEGER,
+                    doc_json TEXT NOT NULL,
+                    PRIMARY KEY (profile_id, article_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_long_term_quarantine_profile_status
+                    ON long_term_article_quarantine(profile_id, status, last_seen_at);
+
+                CREATE TABLE IF NOT EXISTS threat_cluster_snapshots (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    cluster_id TEXT NOT NULL,
+                    membership_revision INTEGER NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    doc_json TEXT NOT NULL,
+                    UNIQUE (cluster_id, membership_revision, prompt_version)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_threat_snapshots_profile_created
+                    ON threat_cluster_snapshots(profile_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS threat_landscape_reports (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    period_end_ts INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    doc_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_threat_reports_profile_period
+                    ON threat_landscape_reports(profile_id, period_end_ts);
+
+                CREATE TABLE IF NOT EXISTS long_term_runs (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    run_type TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    doc_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_long_term_runs_profile_started
+                    ON long_term_runs(profile_id, run_type, started_at);
+
+                CREATE INDEX IF NOT EXISTS idx_long_term_runs_status
+                    ON long_term_runs(status);
                 """
             )
 
@@ -913,6 +1015,979 @@ class SqliteStore:
                 if aid in by_id:
                     ordered.append(by_id[aid])
             return ordered
+        finally:
+            con.close()
+
+    # Long-term threat-landscape analysis
+
+    def list_articles_for_long_term(
+        self,
+        *,
+        after_fetched_at: int = 0,
+        after_article_id: str = "",
+        until_fetched_at: Optional[int] = None,
+        sources: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        after_ts = max(0, _safe_int(after_fetched_at))
+        after_id = str(after_article_id or "")
+        until_ts = _safe_int(until_fetched_at) if until_fetched_at is not None else None
+        params: List[Any] = [after_ts, after_ts, after_id]
+        where = (
+            "(COALESCE(fetched_at, 0) > ? OR "
+            "(COALESCE(fetched_at, 0) = ? AND id > ?))"
+        )
+        if until_ts is not None:
+            where += " AND COALESCE(fetched_at, 0) <= ?"
+            params.append(until_ts)
+        normalized_sources = [
+            str(source).strip() for source in sources or [] if str(source).strip()
+        ]
+        if normalized_sources:
+            placeholders = ",".join("?" for _ in normalized_sources)
+            where += f" AND source IN ({placeholders})"
+            params.extend(normalized_sources)
+        params.append(max(1, _safe_int(limit, 200)))
+
+        con = self._connect()
+        try:
+            rows = con.execute(
+                f"""
+                SELECT doc_json FROM articles
+                WHERE {where}
+                ORDER BY COALESCE(fetched_at, 0) ASC, id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            return [
+                doc
+                for row in rows
+                if isinstance((doc := _json_loads(row["doc_json"])), dict)
+            ]
+        finally:
+            con.close()
+
+    def get_long_term_cursor(self, profile_id: str) -> Dict[str, Any]:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            raise ValueError("profile_id must not be empty")
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT doc_json FROM long_term_state WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            if row:
+                doc = _json_loads(row["doc_json"])
+                if isinstance(doc, dict):
+                    return doc
+            return {
+                "profile_id": profile_id,
+                "cursor_fetched_at": 0,
+                "cursor_article_id": "",
+                "lease_owner": None,
+                "lease_until": 0,
+                "updated_at": 0,
+            }
+        finally:
+            con.close()
+
+    def claim_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool:
+        profile_id = str(profile_id or "").strip()
+        owner_id = str(owner_id or "").strip()
+        if not profile_id or not owner_id or lease_seconds < 1:
+            raise ValueError("profile, owner and positive lease_seconds are required")
+        now_ts = _safe_int(now_ts)
+        lease_until = now_ts + int(lease_seconds)
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT doc_json FROM long_term_state WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            state = _json_loads(row["doc_json"]) if row else None
+            if not isinstance(state, dict):
+                state = {
+                    "profile_id": profile_id,
+                    "cursor_fetched_at": 0,
+                    "cursor_article_id": "",
+                    "lease_owner": None,
+                    "lease_until": 0,
+                }
+            current_owner = str(state.get("lease_owner") or "")
+            current_until = _safe_int(state.get("lease_until"))
+            if current_owner and current_owner != owner_id and current_until > now_ts:
+                con.rollback()
+                return False
+            state.update(
+                {
+                    "lease_owner": owner_id,
+                    "lease_until": lease_until,
+                    "updated_at": now_ts,
+                }
+            )
+            con.execute(
+                """
+                INSERT INTO long_term_state (
+                    profile_id, cursor_fetched_at, cursor_article_id,
+                    lease_owner, lease_until, updated_at, doc_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id) DO UPDATE SET
+                    cursor_fetched_at=excluded.cursor_fetched_at,
+                    cursor_article_id=excluded.cursor_article_id,
+                    lease_owner=excluded.lease_owner,
+                    lease_until=excluded.lease_until,
+                    updated_at=excluded.updated_at,
+                    doc_json=excluded.doc_json
+                """,
+                (
+                    profile_id,
+                    _safe_int(state.get("cursor_fetched_at")),
+                    str(state.get("cursor_article_id") or ""),
+                    owner_id,
+                    lease_until,
+                    now_ts,
+                    _json_dumps(state),
+                ),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def release_long_term_lease(self, profile_id: str, owner_id: str) -> bool:
+        profile_id = str(profile_id or "").strip()
+        owner_id = str(owner_id or "").strip()
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT doc_json FROM long_term_state WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            state = _json_loads(row["doc_json"]) if row else None
+            if not isinstance(state, dict) or state.get("lease_owner") != owner_id:
+                con.rollback()
+                return False
+            state.update({"lease_owner": None, "lease_until": 0, "updated_at": _now_ts()})
+            con.execute(
+                """
+                UPDATE long_term_state SET lease_owner=NULL, lease_until=0,
+                    updated_at=?, doc_json=? WHERE profile_id=? AND lease_owner=?
+                """,
+                (state["updated_at"], _json_dumps(state), profile_id, owner_id),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def advance_long_term_cursor(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        expected_fetched_at: int,
+        expected_article_id: str,
+        fetched_at: int,
+        article_id: str,
+        now_ts: int,
+    ) -> bool:
+        expected = (_safe_int(expected_fetched_at), str(expected_article_id or ""))
+        new_cursor = (_safe_int(fetched_at), str(article_id or ""))
+        if new_cursor < expected or new_cursor[0] < 1 or not new_cursor[1]:
+            raise ValueError("new cursor must be complete and cannot move backwards")
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT doc_json FROM long_term_state WHERE profile_id = ?",
+                (str(profile_id),),
+            ).fetchone()
+            state = _json_loads(row["doc_json"]) if row else None
+            if not isinstance(state, dict):
+                con.rollback()
+                return False
+            current = (
+                _safe_int(state.get("cursor_fetched_at")),
+                str(state.get("cursor_article_id") or ""),
+            )
+            if (
+                current != expected
+                or state.get("lease_owner") != str(owner_id)
+                or _safe_int(state.get("lease_until")) <= _safe_int(now_ts)
+            ):
+                con.rollback()
+                return False
+            state.update(
+                {
+                    "cursor_fetched_at": new_cursor[0],
+                    "cursor_article_id": new_cursor[1],
+                    "updated_at": _safe_int(now_ts),
+                }
+            )
+            con.execute(
+                """
+                UPDATE long_term_state SET cursor_fetched_at=?, cursor_article_id=?,
+                    updated_at=?, doc_json=? WHERE profile_id=?
+                """,
+                (
+                    new_cursor[0],
+                    new_cursor[1],
+                    _safe_int(now_ts),
+                    _json_dumps(state),
+                    str(profile_id),
+                ),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def get_threat_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("threat_clusters", str(cluster_id))
+
+    def list_threat_clusters(
+        self,
+        profile_id: str,
+        *,
+        statuses: Optional[List[str]] = None,
+        min_last_seen_ts: Optional[int] = None,
+        embedding_model: Optional[str] = None,
+        embedding_dimension: Optional[int] = None,
+        embedding_instruction: Optional[str] = None,
+        limit: int = 10000,
+    ) -> List[Dict[str, Any]]:
+        where = ["profile_id = ?"]
+        params: List[Any] = [str(profile_id)]
+        normalized_statuses = [str(status) for status in statuses or [] if str(status)]
+        if normalized_statuses:
+            where.append(f"status IN ({','.join('?' for _ in normalized_statuses)})")
+            params.extend(normalized_statuses)
+        if min_last_seen_ts is not None:
+            where.append("last_seen_ts >= ?")
+            params.append(_safe_int(min_last_seen_ts))
+        if embedding_model is not None:
+            where.append("embedding_model = ?")
+            params.append(str(embedding_model))
+        if embedding_dimension is not None:
+            where.append("embedding_dimension = ?")
+            params.append(_safe_int(embedding_dimension))
+        if embedding_instruction is not None:
+            where.append("embedding_instruction = ?")
+            params.append(str(embedding_instruction))
+        params.append(max(1, _safe_int(limit, 10000)))
+        con = self._connect()
+        try:
+            rows = con.execute(
+                f"""
+                SELECT doc_json FROM threat_clusters WHERE {' AND '.join(where)}
+                ORDER BY last_seen_ts DESC, id ASC LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            return [
+                doc
+                for row in rows
+                if isinstance((doc := _json_loads(row["doc_json"])), dict)
+            ]
+        finally:
+            con.close()
+
+    def save_threat_cluster(
+        self,
+        cluster_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool:
+        required = (
+            "id",
+            "profile_id",
+            "status",
+            "last_seen_ts",
+            "embedding_model",
+            "embedding_dimension",
+            "embedding_instruction",
+            "membership_revision",
+        )
+        doc = dict(cluster_doc or {})
+        missing = [field for field in required if doc.get(field) is None]
+        if missing:
+            raise ValueError(f"cluster document is missing: {', '.join(missing)}")
+        doc.setdefault("updated_at", _now_ts())
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            existing = con.execute(
+                "SELECT membership_revision FROM threat_clusters WHERE id = ?",
+                (str(doc["id"]),),
+            ).fetchone()
+            if existing is None and expected_membership_revision is not None:
+                con.rollback()
+                return False
+            if existing is not None and (
+                expected_membership_revision is None
+                or int(existing["membership_revision"]) != int(expected_membership_revision)
+            ):
+                con.rollback()
+                return False
+            values = (
+                str(doc["id"]),
+                str(doc["profile_id"]),
+                str(doc["status"]),
+                _safe_int(doc["last_seen_ts"]),
+                str(doc["embedding_model"]),
+                _safe_int(doc["embedding_dimension"]),
+                str(doc["embedding_instruction"]),
+                _safe_int(doc["membership_revision"]),
+                _safe_int(doc["updated_at"]),
+                _json_dumps(doc),
+            )
+            if existing is None:
+                con.execute(
+                    """
+                    INSERT INTO threat_clusters (
+                        id, profile_id, status, last_seen_ts, embedding_model,
+                        embedding_dimension, embedding_instruction,
+                        membership_revision, updated_at, doc_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            else:
+                con.execute(
+                    """
+                    UPDATE threat_clusters SET profile_id=?, status=?, last_seen_ts=?,
+                        embedding_model=?, embedding_dimension=?, embedding_instruction=?,
+                        membership_revision=?, updated_at=?, doc_json=? WHERE id=?
+                    """,
+                    (*values[1:], values[0]),
+                )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def get_cluster_membership(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]:
+        con = self._connect()
+        try:
+            row = con.execute(
+                """
+                SELECT doc_json FROM threat_cluster_memberships
+                WHERE profile_id=? AND article_id=?
+                """,
+                (str(profile_id), str(article_id)),
+            ).fetchone()
+            doc = _json_loads(row["doc_json"]) if row else None
+            return doc if isinstance(doc, dict) else None
+        finally:
+            con.close()
+
+    def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool:
+        doc = dict(membership_doc or {})
+        required = ("profile_id", "article_id", "cluster_id", "assigned_at")
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("membership document is incomplete")
+        con = self._connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO threat_cluster_memberships (
+                    profile_id, article_id, cluster_id, assigned_at, doc_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(doc["profile_id"]),
+                    str(doc["article_id"]),
+                    str(doc["cluster_id"]),
+                    _safe_int(doc["assigned_at"]),
+                    _json_dumps(doc),
+                ),
+            )
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            con.rollback()
+            return False
+        finally:
+            con.close()
+
+    def save_cluster_assignment(
+        self,
+        cluster_doc: Dict[str, Any],
+        membership_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool:
+        """Atomically persist one membership and its resulting cluster revision."""
+
+        cluster = dict(cluster_doc or {})
+        membership = dict(membership_doc or {})
+        cluster_required = (
+            "id",
+            "profile_id",
+            "status",
+            "last_seen_ts",
+            "embedding_model",
+            "embedding_dimension",
+            "embedding_instruction",
+            "membership_revision",
+        )
+        membership_required = ("profile_id", "article_id", "cluster_id", "assigned_at")
+        if any(cluster.get(field) is None for field in cluster_required):
+            raise ValueError("cluster document is incomplete")
+        if any(membership.get(field) is None for field in membership_required):
+            raise ValueError("membership document is incomplete")
+        if (
+            str(cluster["id"]) != str(membership["cluster_id"])
+            or str(cluster["profile_id"]) != str(membership["profile_id"])
+        ):
+            raise ValueError("cluster and membership identities do not match")
+
+        cluster.setdefault("updated_at", _now_ts())
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            duplicate = con.execute(
+                """
+                SELECT 1 FROM threat_cluster_memberships
+                WHERE profile_id=? AND article_id=?
+                """,
+                (str(membership["profile_id"]), str(membership["article_id"])),
+            ).fetchone()
+            if duplicate:
+                con.rollback()
+                return False
+
+            existing = con.execute(
+                "SELECT membership_revision FROM threat_clusters WHERE id=?",
+                (str(cluster["id"]),),
+            ).fetchone()
+            if existing is None and expected_membership_revision is not None:
+                con.rollback()
+                return False
+            if existing is not None and (
+                expected_membership_revision is None
+                or int(existing["membership_revision"])
+                != int(expected_membership_revision)
+            ):
+                con.rollback()
+                return False
+
+            values = (
+                str(cluster["id"]),
+                str(cluster["profile_id"]),
+                str(cluster["status"]),
+                _safe_int(cluster["last_seen_ts"]),
+                str(cluster["embedding_model"]),
+                _safe_int(cluster["embedding_dimension"]),
+                str(cluster["embedding_instruction"]),
+                _safe_int(cluster["membership_revision"]),
+                _safe_int(cluster["updated_at"]),
+                _json_dumps(cluster),
+            )
+            if existing is None:
+                con.execute(
+                    """
+                    INSERT INTO threat_clusters (
+                        id, profile_id, status, last_seen_ts, embedding_model,
+                        embedding_dimension, embedding_instruction,
+                        membership_revision, updated_at, doc_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            else:
+                con.execute(
+                    """
+                    UPDATE threat_clusters SET profile_id=?, status=?, last_seen_ts=?,
+                        embedding_model=?, embedding_dimension=?, embedding_instruction=?,
+                        membership_revision=?, updated_at=?, doc_json=? WHERE id=?
+                    """,
+                    (*values[1:], values[0]),
+                )
+            con.execute(
+                """
+                INSERT INTO threat_cluster_memberships (
+                    profile_id, article_id, cluster_id, assigned_at, doc_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(membership["profile_id"]),
+                    str(membership["article_id"]),
+                    str(membership["cluster_id"]),
+                    _safe_int(membership["assigned_at"]),
+                    _json_dumps(membership),
+                ),
+            )
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            con.rollback()
+            return False
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def list_cluster_memberships(
+        self, cluster_id: str, *, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "threat_cluster_memberships",
+            "cluster_id",
+            str(cluster_id),
+            "assigned_at ASC, article_id ASC",
+            limit,
+        )
+
+    def get_long_term_quarantine(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]:
+        con = self._connect()
+        try:
+            row = con.execute(
+                """
+                SELECT doc_json FROM long_term_article_quarantine
+                WHERE profile_id=? AND article_id=?
+                """,
+                (str(profile_id), str(article_id)),
+            ).fetchone()
+            doc = _json_loads(row["doc_json"]) if row else None
+            return doc if isinstance(doc, dict) else None
+        finally:
+            con.close()
+
+    def save_long_term_quarantine(self, quarantine_doc: Dict[str, Any]) -> bool:
+        doc = dict(quarantine_doc or {})
+        required = ("profile_id", "article_id", "reason", "observed_at")
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("quarantine document is incomplete")
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                """
+                SELECT doc_json FROM long_term_article_quarantine
+                WHERE profile_id=? AND article_id=?
+                """,
+                (str(doc["profile_id"]), str(doc["article_id"])),
+            ).fetchone()
+            existing = _json_loads(row["doc_json"]) if row else None
+            observed_at = _safe_int(doc["observed_at"])
+            merged = {
+                **(existing if isinstance(existing, dict) else {}),
+                **doc,
+                "status": "open",
+                "first_seen_at": _safe_int(
+                    existing.get("first_seen_at") if isinstance(existing, dict) else observed_at,
+                    observed_at,
+                ),
+                "last_seen_at": observed_at,
+                "attempt_count": _safe_int(
+                    existing.get("attempt_count") if isinstance(existing, dict) else 0
+                )
+                + 1,
+                "resolved_at": None,
+            }
+            con.execute(
+                """
+                INSERT INTO long_term_article_quarantine (
+                    profile_id, article_id, status, reason, first_seen_at,
+                    last_seen_at, attempt_count, resolved_at, doc_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id, article_id) DO UPDATE SET
+                    status=excluded.status, reason=excluded.reason,
+                    first_seen_at=excluded.first_seen_at,
+                    last_seen_at=excluded.last_seen_at,
+                    attempt_count=excluded.attempt_count,
+                    resolved_at=excluded.resolved_at, doc_json=excluded.doc_json
+                """,
+                (
+                    str(merged["profile_id"]),
+                    str(merged["article_id"]),
+                    str(merged["status"]),
+                    str(merged["reason"]),
+                    _safe_int(merged["first_seen_at"]),
+                    _safe_int(merged["last_seen_at"]),
+                    _safe_int(merged["attempt_count"]),
+                    None,
+                    _json_dumps(merged),
+                ),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def resolve_long_term_quarantine(
+        self, profile_id: str, article_id: str, *, resolved_at: int
+    ) -> bool:
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                """
+                SELECT doc_json FROM long_term_article_quarantine
+                WHERE profile_id=? AND article_id=? AND status='open'
+                """,
+                (str(profile_id), str(article_id)),
+            ).fetchone()
+            if row is None:
+                con.rollback()
+                return False
+            doc = _json_loads(row["doc_json"]) or {}
+            doc.update({"status": "resolved", "resolved_at": _safe_int(resolved_at)})
+            con.execute(
+                """
+                UPDATE long_term_article_quarantine
+                SET status='resolved', resolved_at=?, doc_json=?
+                WHERE profile_id=? AND article_id=? AND status='open'
+                """,
+                (
+                    _safe_int(resolved_at),
+                    _json_dumps(doc),
+                    str(profile_id),
+                    str(article_id),
+                ),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def list_long_term_quarantine(
+        self,
+        profile_id: str,
+        *,
+        status: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        where = "profile_id=?"
+        params: List[Any] = [str(profile_id)]
+        if status is not None:
+            where += " AND status=?"
+            params.append(str(status))
+        params.append(max(1, _safe_int(limit, 1000)))
+        con = self._connect()
+        try:
+            rows = con.execute(
+                f"""
+                SELECT doc_json FROM long_term_article_quarantine
+                WHERE {where} ORDER BY last_seen_at DESC, article_id ASC LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            return [
+                doc
+                for row in rows
+                if isinstance((doc := _json_loads(row["doc_json"])), dict)
+            ]
+        finally:
+            con.close()
+
+    def save_cluster_snapshot(self, snapshot_doc: Dict[str, Any]) -> bool:
+        doc = dict(snapshot_doc or {})
+        required = (
+            "id",
+            "profile_id",
+            "cluster_id",
+            "membership_revision",
+            "prompt_version",
+            "created_at",
+        )
+        return self._insert_long_term_doc(
+            "threat_cluster_snapshots",
+            doc,
+            required,
+            (
+                "id",
+                "profile_id",
+                "cluster_id",
+                "membership_revision",
+                "prompt_version",
+                "created_at",
+            ),
+        )
+
+    def save_cluster_snapshot_revision(
+        self,
+        cluster_doc: Dict[str, Any],
+        snapshot_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: int,
+        expected_summarized_revision: int,
+    ) -> bool:
+        """Atomically insert a snapshot and advance its cluster summary revision."""
+
+        cluster = dict(cluster_doc or {})
+        snapshot = dict(snapshot_doc or {})
+        if (
+            not cluster.get("id")
+            or not snapshot.get("id")
+            or str(cluster.get("id")) != str(snapshot.get("cluster_id"))
+            or str(cluster.get("profile_id")) != str(snapshot.get("profile_id"))
+            or int(cluster.get("membership_revision") or -1)
+            != int(expected_membership_revision)
+            or int(cluster.get("summarized_revision") or -1)
+            != int(snapshot.get("membership_revision") or -1)
+            or not int(expected_summarized_revision)
+            < int(cluster.get("summarized_revision") or -1)
+            <= int(expected_membership_revision)
+        ):
+            raise ValueError("snapshot and cluster revisions or identities do not match")
+        cluster.setdefault("updated_at", _now_ts())
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT doc_json FROM threat_clusters WHERE id=?",
+                (str(cluster["id"]),),
+            ).fetchone()
+            current = _json_loads(row["doc_json"]) if row else None
+            if not isinstance(current, dict) or (
+                int(current.get("membership_revision") or 0)
+                != int(expected_membership_revision)
+                or int(current.get("summarized_revision") or 0)
+                != int(expected_summarized_revision)
+            ):
+                con.rollback()
+                return False
+            con.execute(
+                """
+                INSERT INTO threat_cluster_snapshots (
+                    id, profile_id, cluster_id, membership_revision,
+                    prompt_version, created_at, doc_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(snapshot["id"]),
+                    str(snapshot["profile_id"]),
+                    str(snapshot["cluster_id"]),
+                    _safe_int(snapshot["membership_revision"]),
+                    str(snapshot["prompt_version"]),
+                    _safe_int(snapshot["created_at"]),
+                    _json_dumps(snapshot),
+                ),
+            )
+            con.execute(
+                """
+                UPDATE threat_clusters SET profile_id=?, status=?, last_seen_ts=?,
+                    embedding_model=?, embedding_dimension=?, embedding_instruction=?,
+                    membership_revision=?, updated_at=?, doc_json=? WHERE id=?
+                """,
+                (
+                    str(cluster["profile_id"]),
+                    str(cluster["status"]),
+                    _safe_int(cluster["last_seen_ts"]),
+                    str(cluster["embedding_model"]),
+                    _safe_int(cluster["embedding_dimension"]),
+                    str(cluster["embedding_instruction"]),
+                    _safe_int(cluster["membership_revision"]),
+                    _safe_int(cluster["updated_at"]),
+                    _json_dumps(cluster),
+                    str(cluster["id"]),
+                ),
+            )
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            con.rollback()
+            return False
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def list_cluster_snapshots(
+        self,
+        profile_id: str,
+        *,
+        cluster_id: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        con = self._connect()
+        try:
+            params: List[Any] = [str(profile_id)]
+            where = "profile_id=?"
+            if cluster_id is not None:
+                where += " AND cluster_id=?"
+                params.append(str(cluster_id))
+            params.append(max(1, _safe_int(limit, 1000)))
+            rows = con.execute(
+                f"""
+                SELECT doc_json FROM threat_cluster_snapshots WHERE {where}
+                ORDER BY created_at DESC, id ASC LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            return [
+                doc
+                for row in rows
+                if isinstance((doc := _json_loads(row["doc_json"])), dict)
+            ]
+        finally:
+            con.close()
+
+    def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool:
+        doc = dict(report_doc or {})
+        required = ("id", "profile_id", "period_end_ts", "created_at")
+        return self._insert_long_term_doc(
+            "threat_landscape_reports",
+            doc,
+            required,
+            ("id", "profile_id", "period_end_ts", "created_at"),
+        )
+
+    def get_threat_landscape_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("threat_landscape_reports", str(report_id))
+
+    def list_threat_landscape_reports(
+        self, profile_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "threat_landscape_reports",
+            "profile_id",
+            str(profile_id),
+            "period_end_ts DESC, id ASC",
+            limit,
+        )
+
+    def create_long_term_run(self, run_doc: Dict[str, Any]) -> bool:
+        doc = dict(run_doc or {})
+        required = ("id", "profile_id", "run_type", "started_at", "status")
+        return self._insert_long_term_doc(
+            "long_term_runs",
+            doc,
+            required,
+            ("id", "profile_id", "run_type", "started_at", "status"),
+        )
+
+    def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("long_term_runs", str(run_id))
+
+    def update_long_term_run(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        fields: Dict[str, Any],
+    ) -> bool:
+        updates = dict(fields or {})
+        updates.pop("id", None)
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT doc_json FROM long_term_runs WHERE id=? AND status=?",
+                (str(run_id), str(expected_status)),
+            ).fetchone()
+            doc = _json_loads(row["doc_json"]) if row else None
+            if not isinstance(doc, dict):
+                con.rollback()
+                return False
+            doc.update(updates)
+            status = str(doc.get("status") or expected_status)
+            con.execute(
+                "UPDATE long_term_runs SET status=?, doc_json=? WHERE id=? AND status=?",
+                (status, _json_dumps(doc), str(run_id), str(expected_status)),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def _get_long_term_doc(self, table: str, document_id: str) -> Optional[Dict[str, Any]]:
+        con = self._connect()
+        try:
+            row = con.execute(
+                f"SELECT doc_json FROM {table} WHERE id=?", (str(document_id),)
+            ).fetchone()
+            doc = _json_loads(row["doc_json"]) if row else None
+            return doc if isinstance(doc, dict) else None
+        finally:
+            con.close()
+
+    def _list_long_term_docs(
+        self,
+        table: str,
+        field: str,
+        value: str,
+        order_by: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        con = self._connect()
+        try:
+            rows = con.execute(
+                f"SELECT doc_json FROM {table} WHERE {field}=? ORDER BY {order_by} LIMIT ?",
+                (value, max(1, _safe_int(limit, 1000))),
+            ).fetchall()
+            return [
+                doc
+                for row in rows
+                if isinstance((doc := _json_loads(row["doc_json"])), dict)
+            ]
+        finally:
+            con.close()
+
+    def _insert_long_term_doc(
+        self,
+        table: str,
+        doc: Dict[str, Any],
+        required: Tuple[str, ...],
+        columns: Tuple[str, ...],
+    ) -> bool:
+        missing = [field for field in required if doc.get(field) is None]
+        if missing:
+            raise ValueError(f"document is missing: {', '.join(missing)}")
+        placeholders = ",".join("?" for _ in range(len(columns) + 1))
+        values = [doc[column] for column in columns]
+        values.append(_json_dumps(doc))
+        con = self._connect()
+        try:
+            con.execute(
+                f"INSERT INTO {table} ({','.join(columns)},doc_json) VALUES ({placeholders})",
+                tuple(values),
+            )
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            con.rollback()
+            return False
         finally:
             con.close()
 

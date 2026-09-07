@@ -145,6 +145,7 @@ class MongoDBStore:
         indexes = (
             (self.db.articles, [("source", ASCENDING), ("_mongo_sort_ts", ASCENDING)], {}),
             (self.db.articles, [("_mongo_sort_ts", ASCENDING)], {}),
+            (self.db.articles, [("fetched_at", ASCENDING), ("_id", ASCENDING)], {}),
             (
                 self.db.articles,
                 [("url", ASCENDING)],
@@ -171,6 +172,66 @@ class MongoDBStore:
             ),
             (self.db.tag_relations, [("child_tag_id", ASCENDING)], {}),
             (self.db.tag_categories, [("name", ASCENDING)], {"unique": True}),
+            (
+                self.db.threat_clusters,
+                [
+                    ("profile_id", ASCENDING),
+                    ("status", ASCENDING),
+                    ("embedding_model", ASCENDING),
+                    ("embedding_dimension", ASCENDING),
+                    ("last_seen_ts", DESCENDING),
+                ],
+                {},
+            ),
+            (
+                self.db.threat_cluster_memberships,
+                [("profile_id", ASCENDING), ("article_id", ASCENDING)],
+                {"unique": True},
+            ),
+            (
+                self.db.threat_cluster_memberships,
+                [("cluster_id", ASCENDING), ("assigned_at", ASCENDING)],
+                {},
+            ),
+            (
+                self.db.long_term_article_quarantine,
+                [("profile_id", ASCENDING), ("article_id", ASCENDING)],
+                {"unique": True},
+            ),
+            (
+                self.db.long_term_article_quarantine,
+                [("profile_id", ASCENDING), ("status", ASCENDING), ("last_seen_at", DESCENDING)],
+                {},
+            ),
+            (
+                self.db.threat_cluster_snapshots,
+                [
+                    ("cluster_id", ASCENDING),
+                    ("membership_revision", ASCENDING),
+                    ("prompt_version", ASCENDING),
+                ],
+                {"unique": True},
+            ),
+            (
+                self.db.threat_cluster_snapshots,
+                [("profile_id", ASCENDING), ("created_at", DESCENDING)],
+                {},
+            ),
+            (
+                self.db.threat_landscape_reports,
+                [("profile_id", ASCENDING), ("period_end_ts", DESCENDING)],
+                {},
+            ),
+            (
+                self.db.long_term_runs,
+                [
+                    ("profile_id", ASCENDING),
+                    ("run_type", ASCENDING),
+                    ("started_at", DESCENDING),
+                ],
+                {},
+            ),
+            (self.db.long_term_runs, [("status", ASCENDING)], {}),
         )
         for collection, keys, options in indexes:
             collection.create_index(keys, **options)
@@ -345,6 +406,634 @@ class MongoDBStore:
             for doc in self.db.articles.find({"_id": {"$in": ids}})
         }
         return [found[article_id] for article_id in ids if article_id in found]  # type: ignore[misc]
+
+    # Long-term threat-landscape analysis
+
+    def list_articles_for_long_term(
+        self,
+        *,
+        after_fetched_at: int = 0,
+        after_article_id: str = "",
+        until_fetched_at: Optional[int] = None,
+        sources: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        after_ts = max(0, _safe_int(after_fetched_at))
+        query: Dict[str, Any] = {
+            "$or": [
+                {"fetched_at": {"$gt": after_ts}},
+                {"fetched_at": after_ts, "_id": {"$gt": str(after_article_id or "")}},
+            ]
+        }
+        if until_fetched_at is not None:
+            query = {
+                "$and": [query, {"fetched_at": {"$lte": _safe_int(until_fetched_at)}}]
+            }
+        normalized_sources = [
+            str(source).strip() for source in sources or [] if str(source).strip()
+        ]
+        if normalized_sources:
+            source_query = {"source": {"$in": normalized_sources}}
+            query = {"$and": [query, source_query]}
+        cursor = (
+            self.db.articles.find(query)
+            .sort([("fetched_at", ASCENDING), ("_id", ASCENDING)])
+            .limit(max(1, int(limit)))
+        )
+        return [_public_doc(doc) for doc in cursor]  # type: ignore[misc]
+
+    def get_long_term_cursor(self, profile_id: str) -> Dict[str, Any]:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            raise ValueError("profile_id must not be empty")
+        doc = _public_doc(self.db.long_term_state.find_one({"_id": profile_id}))
+        if doc:
+            return doc
+        return {
+            "profile_id": profile_id,
+            "cursor_fetched_at": 0,
+            "cursor_article_id": "",
+            "lease_owner": None,
+            "lease_until": 0,
+            "updated_at": 0,
+        }
+
+    def claim_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool:
+        profile_id = str(profile_id or "").strip()
+        owner_id = str(owner_id or "").strip()
+        if not profile_id or not owner_id or lease_seconds < 1:
+            raise ValueError("profile, owner and positive lease_seconds are required")
+        now_ts = _safe_int(now_ts)
+        try:
+            result = self.db.long_term_state.find_one_and_update(
+                {
+                    "_id": profile_id,
+                    "$or": [
+                        {"lease_owner": owner_id},
+                        {"lease_owner": None},
+                        {"lease_owner": {"$exists": False}},
+                        {"lease_until": {"$lte": now_ts}},
+                    ],
+                },
+                {
+                    "$setOnInsert": {
+                        "profile_id": profile_id,
+                        "cursor_fetched_at": 0,
+                        "cursor_article_id": "",
+                    },
+                    "$set": {
+                        "lease_owner": owner_id,
+                        "lease_until": now_ts + int(lease_seconds),
+                        "updated_at": now_ts,
+                    },
+                },
+                upsert=True,
+                return_document=True,
+            )
+            return result is not None
+        except DuplicateKeyError:
+            return False
+
+    def release_long_term_lease(self, profile_id: str, owner_id: str) -> bool:
+        result = self.db.long_term_state.update_one(
+            {"_id": str(profile_id), "lease_owner": str(owner_id)},
+            {
+                "$set": {
+                    "lease_owner": None,
+                    "lease_until": 0,
+                    "updated_at": _now_ts(),
+                }
+            },
+        )
+        return result.matched_count > 0
+
+    def advance_long_term_cursor(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        expected_fetched_at: int,
+        expected_article_id: str,
+        fetched_at: int,
+        article_id: str,
+        now_ts: int,
+    ) -> bool:
+        expected = (_safe_int(expected_fetched_at), str(expected_article_id or ""))
+        new_cursor = (_safe_int(fetched_at), str(article_id or ""))
+        if new_cursor < expected or new_cursor[0] < 1 or not new_cursor[1]:
+            raise ValueError("new cursor must be complete and cannot move backwards")
+        result = self.db.long_term_state.update_one(
+            {
+                "_id": str(profile_id),
+                "lease_owner": str(owner_id),
+                "lease_until": {"$gt": _safe_int(now_ts)},
+                "cursor_fetched_at": expected[0],
+                "cursor_article_id": expected[1],
+            },
+            {
+                "$set": {
+                    "cursor_fetched_at": new_cursor[0],
+                    "cursor_article_id": new_cursor[1],
+                    "updated_at": _safe_int(now_ts),
+                }
+            },
+        )
+        return result.matched_count > 0
+
+    def get_threat_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
+        return _public_doc(self.db.threat_clusters.find_one({"_id": str(cluster_id)}))
+
+    def list_threat_clusters(
+        self,
+        profile_id: str,
+        *,
+        statuses: Optional[List[str]] = None,
+        min_last_seen_ts: Optional[int] = None,
+        embedding_model: Optional[str] = None,
+        embedding_dimension: Optional[int] = None,
+        embedding_instruction: Optional[str] = None,
+        limit: int = 10000,
+    ) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {"profile_id": str(profile_id)}
+        normalized_statuses = [str(status) for status in statuses or [] if str(status)]
+        if normalized_statuses:
+            query["status"] = {"$in": normalized_statuses}
+        if min_last_seen_ts is not None:
+            query["last_seen_ts"] = {"$gte": _safe_int(min_last_seen_ts)}
+        if embedding_model is not None:
+            query["embedding_model"] = str(embedding_model)
+        if embedding_dimension is not None:
+            query["embedding_dimension"] = _safe_int(embedding_dimension)
+        if embedding_instruction is not None:
+            query["embedding_instruction"] = str(embedding_instruction)
+        cursor = (
+            self.db.threat_clusters.find(query)
+            .sort([("last_seen_ts", DESCENDING), ("_id", ASCENDING)])
+            .limit(max(1, int(limit)))
+        )
+        return [_public_doc(doc) for doc in cursor]  # type: ignore[misc]
+
+    def save_threat_cluster(
+        self,
+        cluster_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool:
+        required = (
+            "id",
+            "profile_id",
+            "status",
+            "last_seen_ts",
+            "embedding_model",
+            "embedding_dimension",
+            "embedding_instruction",
+            "membership_revision",
+        )
+        doc = dict(cluster_doc or {})
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("cluster document is incomplete")
+        doc["id"] = str(doc["id"])
+        doc["_id"] = doc["id"]
+        doc.setdefault("updated_at", _now_ts())
+        if expected_membership_revision is None:
+            try:
+                self.db.threat_clusters.insert_one(doc)
+                return True
+            except DuplicateKeyError:
+                return False
+        result = self.db.threat_clusters.replace_one(
+            {
+                "_id": doc["_id"],
+                "membership_revision": int(expected_membership_revision),
+            },
+            doc,
+        )
+        return result.matched_count > 0
+
+    def get_cluster_membership(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return _public_doc(
+            self.db.threat_cluster_memberships.find_one(
+                {"profile_id": str(profile_id), "article_id": str(article_id)}
+            )
+        )
+
+    def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool:
+        doc = dict(membership_doc or {})
+        required = ("profile_id", "article_id", "cluster_id", "assigned_at")
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("membership document is incomplete")
+        doc["_id"] = f"{doc['profile_id']}:{doc['article_id']}"
+        try:
+            self.db.threat_cluster_memberships.insert_one(doc)
+            return True
+        except DuplicateKeyError:
+            return False
+
+    def _apply_cluster_assignment(self, operation: Dict[str, Any]) -> bool:
+        cluster = dict(operation["cluster"])
+        membership = dict(operation["membership"])
+        expected = operation.get("expected_membership_revision")
+        cluster["id"] = str(cluster["id"])
+        cluster["_id"] = cluster["id"]
+        membership["_id"] = f"{membership['profile_id']}:{membership['article_id']}"
+
+        existing_membership = self.db.threat_cluster_memberships.find_one(
+            {"_id": membership["_id"]}
+        )
+        if existing_membership is not None and str(
+            existing_membership.get("cluster_id")
+        ) != cluster["id"]:
+            return False
+
+        existing_cluster = self.db.threat_clusters.find_one(
+            {"_id": cluster["_id"]}, {"membership_revision": 1}
+        )
+        target_revision = int(cluster["membership_revision"])
+        if existing_cluster is None:
+            if expected is not None:
+                return False
+            try:
+                self.db.threat_clusters.insert_one(cluster)
+            except DuplicateKeyError:
+                return False
+        else:
+            current_revision = int(existing_cluster.get("membership_revision") or 0)
+            if current_revision != target_revision:
+                if expected is None or current_revision != int(expected):
+                    return False
+                result = self.db.threat_clusters.replace_one(
+                    {"_id": cluster["_id"], "membership_revision": int(expected)},
+                    cluster,
+                )
+                if result.matched_count < 1:
+                    return False
+
+        if existing_membership is None:
+            try:
+                self.db.threat_cluster_memberships.insert_one(membership)
+            except DuplicateKeyError:
+                return False
+        return True
+
+    def save_cluster_assignment(
+        self,
+        cluster_doc: Dict[str, Any],
+        membership_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool:
+        """Persist a recoverable cluster/membership pair using a write journal."""
+
+        cluster = dict(cluster_doc or {})
+        membership = dict(membership_doc or {})
+        cluster_required = (
+            "id",
+            "profile_id",
+            "status",
+            "last_seen_ts",
+            "embedding_model",
+            "embedding_dimension",
+            "embedding_instruction",
+            "membership_revision",
+        )
+        membership_required = ("profile_id", "article_id", "cluster_id", "assigned_at")
+        if any(cluster.get(field) is None for field in cluster_required):
+            raise ValueError("cluster document is incomplete")
+        if any(membership.get(field) is None for field in membership_required):
+            raise ValueError("membership document is incomplete")
+        if (
+            str(cluster["id"]) != str(membership["cluster_id"])
+            or str(cluster["profile_id"]) != str(membership["profile_id"])
+        ):
+            raise ValueError("cluster and membership identities do not match")
+        cluster.setdefault("updated_at", _now_ts())
+        operation_id = f"{membership['profile_id']}:{membership['article_id']}"
+        operation = {
+            "_id": operation_id,
+            "id": operation_id,
+            "cluster": cluster,
+            "membership": membership,
+            "expected_membership_revision": expected_membership_revision,
+            "created_at": _now_ts(),
+        }
+
+        for pending in self.db.long_term_assignment_journal.find().sort(
+            [("created_at", ASCENDING), ("_id", ASCENDING)]
+        ):
+            if self._apply_cluster_assignment(pending):
+                self.db.long_term_assignment_journal.delete_one({"_id": pending["_id"]})
+
+        if self.db.threat_cluster_memberships.find_one(
+            {"_id": operation_id}, {"_id": 1}
+        ):
+            return False
+        try:
+            self.db.long_term_assignment_journal.insert_one(operation)
+        except DuplicateKeyError:
+            return False
+        if not self._apply_cluster_assignment(operation):
+            return False
+        self.db.long_term_assignment_journal.delete_one({"_id": operation_id})
+        return True
+
+    def list_cluster_memberships(
+        self, cluster_id: str, *, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
+        cursor = (
+            self.db.threat_cluster_memberships.find({"cluster_id": str(cluster_id)})
+            .sort([("assigned_at", ASCENDING), ("article_id", ASCENDING)])
+            .limit(max(1, int(limit)))
+        )
+        return [_public_doc(doc) for doc in cursor]  # type: ignore[misc]
+
+    def get_long_term_quarantine(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return _public_doc(
+            self.db.long_term_article_quarantine.find_one(
+                {"profile_id": str(profile_id), "article_id": str(article_id)}
+            )
+        )
+
+    def save_long_term_quarantine(self, quarantine_doc: Dict[str, Any]) -> bool:
+        doc = dict(quarantine_doc or {})
+        required = ("profile_id", "article_id", "reason", "observed_at")
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("quarantine document is incomplete")
+        observed_at = _safe_int(doc.pop("observed_at"))
+        profile_id = str(doc["profile_id"])
+        article_id = str(doc["article_id"])
+        self.db.long_term_article_quarantine.update_one(
+            {"profile_id": profile_id, "article_id": article_id},
+            {
+                "$setOnInsert": {
+                    "_id": f"{profile_id}:{article_id}",
+                    "first_seen_at": observed_at,
+                    "attempt_count": 0,
+                },
+                "$set": {
+                    **doc,
+                    "profile_id": profile_id,
+                    "article_id": article_id,
+                    "status": "open",
+                    "last_seen_at": observed_at,
+                    "resolved_at": None,
+                },
+                "$inc": {"attempt_count": 1},
+            },
+            upsert=True,
+        )
+        return True
+
+    def resolve_long_term_quarantine(
+        self, profile_id: str, article_id: str, *, resolved_at: int
+    ) -> bool:
+        result = self.db.long_term_article_quarantine.update_one(
+            {
+                "profile_id": str(profile_id),
+                "article_id": str(article_id),
+                "status": "open",
+            },
+            {"$set": {"status": "resolved", "resolved_at": _safe_int(resolved_at)}},
+        )
+        return result.matched_count > 0
+
+    def list_long_term_quarantine(
+        self,
+        profile_id: str,
+        *,
+        status: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {"profile_id": str(profile_id)}
+        if status is not None:
+            query["status"] = str(status)
+        cursor = (
+            self.db.long_term_article_quarantine.find(query)
+            .sort([("last_seen_at", DESCENDING), ("article_id", ASCENDING)])
+            .limit(max(1, int(limit)))
+        )
+        return [_public_doc(doc) for doc in cursor]  # type: ignore[misc]
+
+    def save_cluster_snapshot(self, snapshot_doc: Dict[str, Any]) -> bool:
+        return self._insert_long_term_document(
+            self.db.threat_cluster_snapshots,
+            snapshot_doc,
+            (
+                "id",
+                "profile_id",
+                "cluster_id",
+                "membership_revision",
+                "prompt_version",
+                "created_at",
+            ),
+        )
+
+    def _apply_snapshot_revision(self, operation: Dict[str, Any]) -> bool:
+        cluster = dict(operation["cluster"])
+        snapshot = dict(operation["snapshot"])
+        expected_membership = int(operation["expected_membership_revision"])
+        expected_summarized = int(operation["expected_summarized_revision"])
+        cluster["_id"] = str(cluster["id"])
+        snapshot["_id"] = str(snapshot["id"])
+        current = self.db.threat_clusters.find_one(
+            {"_id": cluster["_id"]},
+            {"membership_revision": 1, "summarized_revision": 1},
+        )
+        if current is None or int(current.get("membership_revision") or 0) != expected_membership:
+            return False
+        current_summarized = int(current.get("summarized_revision") or 0)
+        target_summarized = int(cluster["summarized_revision"])
+        if current_summarized not in {expected_summarized, target_summarized}:
+            return False
+        existing_snapshot = self.db.threat_cluster_snapshots.find_one(
+            {
+                "$or": [
+                    {"_id": snapshot["_id"]},
+                    {
+                        "cluster_id": str(snapshot["cluster_id"]),
+                        "membership_revision": int(snapshot["membership_revision"]),
+                        "prompt_version": str(snapshot["prompt_version"]),
+                    },
+                ]
+            }
+        )
+        if existing_snapshot is None:
+            try:
+                self.db.threat_cluster_snapshots.insert_one(snapshot)
+            except DuplicateKeyError:
+                return False
+        elif str(existing_snapshot.get("_id")) != snapshot["_id"]:
+            return False
+        if current_summarized != target_summarized:
+            cluster_filter: Dict[str, Any] = {
+                "_id": cluster["_id"],
+                "membership_revision": expected_membership,
+            }
+            if expected_summarized:
+                cluster_filter["summarized_revision"] = expected_summarized
+            else:
+                cluster_filter["$or"] = [
+                    {"summarized_revision": 0},
+                    {"summarized_revision": {"$exists": False}},
+                ]
+            result = self.db.threat_clusters.replace_one(
+                cluster_filter,
+                cluster,
+            )
+            if result.matched_count < 1:
+                return False
+        return True
+
+    def save_cluster_snapshot_revision(
+        self,
+        cluster_doc: Dict[str, Any],
+        snapshot_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: int,
+        expected_summarized_revision: int,
+    ) -> bool:
+        """Journal a snapshot and its cluster summary revision as one operation."""
+
+        cluster = dict(cluster_doc or {})
+        snapshot = dict(snapshot_doc or {})
+        if (
+            not cluster.get("id")
+            or not snapshot.get("id")
+            or str(cluster.get("id")) != str(snapshot.get("cluster_id"))
+            or str(cluster.get("profile_id")) != str(snapshot.get("profile_id"))
+            or int(cluster.get("membership_revision") or -1)
+            != int(expected_membership_revision)
+            or int(cluster.get("summarized_revision") or -1)
+            != int(snapshot.get("membership_revision") or -1)
+            or not int(expected_summarized_revision)
+            < int(cluster.get("summarized_revision") or -1)
+            <= int(expected_membership_revision)
+        ):
+            raise ValueError("snapshot and cluster revisions or identities do not match")
+        operation_id = f"{cluster['id']}:{expected_membership_revision}:{snapshot['prompt_version']}"
+        operation = {
+            "_id": operation_id,
+            "id": operation_id,
+            "cluster": cluster,
+            "snapshot": snapshot,
+            "expected_membership_revision": int(expected_membership_revision),
+            "expected_summarized_revision": int(expected_summarized_revision),
+            "created_at": _now_ts(),
+        }
+        for pending in self.db.long_term_snapshot_journal.find().sort(
+            [("created_at", ASCENDING), ("_id", ASCENDING)]
+        ):
+            if self._apply_snapshot_revision(pending):
+                self.db.long_term_snapshot_journal.delete_one({"_id": pending["_id"]})
+        current = self.db.threat_clusters.find_one(
+            {"_id": str(cluster["id"])},
+            {"membership_revision": 1, "summarized_revision": 1},
+        )
+        if current is None or (
+            int(current.get("membership_revision") or 0)
+            != int(expected_membership_revision)
+            or int(current.get("summarized_revision") or 0)
+            != int(expected_summarized_revision)
+        ):
+            return False
+        try:
+            self.db.long_term_snapshot_journal.insert_one(operation)
+        except DuplicateKeyError:
+            return False
+        if not self._apply_snapshot_revision(operation):
+            return False
+        self.db.long_term_snapshot_journal.delete_one({"_id": operation_id})
+        return True
+
+    def list_cluster_snapshots(
+        self,
+        profile_id: str,
+        *,
+        cluster_id: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {"profile_id": str(profile_id)}
+        if cluster_id is not None:
+            query["cluster_id"] = str(cluster_id)
+        cursor = (
+            self.db.threat_cluster_snapshots.find(query)
+            .sort([("created_at", DESCENDING), ("_id", ASCENDING)])
+            .limit(max(1, int(limit)))
+        )
+        return [_public_doc(doc) for doc in cursor]  # type: ignore[misc]
+
+    def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool:
+        return self._insert_long_term_document(
+            self.db.threat_landscape_reports,
+            report_doc,
+            ("id", "profile_id", "period_end_ts", "created_at"),
+        )
+
+    def get_threat_landscape_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+        return _public_doc(
+            self.db.threat_landscape_reports.find_one({"_id": str(report_id)})
+        )
+
+    def list_threat_landscape_reports(
+        self, profile_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        cursor = (
+            self.db.threat_landscape_reports.find({"profile_id": str(profile_id)})
+            .sort([("period_end_ts", DESCENDING), ("_id", ASCENDING)])
+            .limit(max(1, int(limit)))
+        )
+        return [_public_doc(doc) for doc in cursor]  # type: ignore[misc]
+
+    def create_long_term_run(self, run_doc: Dict[str, Any]) -> bool:
+        return self._insert_long_term_document(
+            self.db.long_term_runs,
+            run_doc,
+            ("id", "profile_id", "run_type", "started_at", "status"),
+        )
+
+    def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        return _public_doc(self.db.long_term_runs.find_one({"_id": str(run_id)}))
+
+    def update_long_term_run(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        fields: Dict[str, Any],
+    ) -> bool:
+        updates = dict(fields or {})
+        updates.pop("id", None)
+        updates.pop("_id", None)
+        if not updates:
+            return False
+        result = self.db.long_term_runs.update_one(
+            {"_id": str(run_id), "status": str(expected_status)},
+            {"$set": updates},
+        )
+        return result.matched_count > 0
+
+    @staticmethod
+    def _insert_long_term_document(collection, document, required) -> bool:
+        doc = dict(document or {})
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("document is incomplete")
+        doc["id"] = str(doc["id"])
+        doc["_id"] = doc["id"]
+        try:
+            collection.insert_one(doc)
+            return True
+        except DuplicateKeyError:
+            return False
 
     # Summary documents
 

@@ -33,7 +33,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
+from contextlib import contextmanager
 from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -48,6 +51,32 @@ from feedsummary_core.persistence.tag_relations import (
 from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_tag
 
 logger = logging.getLogger(__name__)
+_LONG_TERM_LOCKS: Dict[str, threading.Lock] = {}
+_LONG_TERM_LOCKS_GUARD = threading.Lock()
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
+
+@contextmanager
+def _long_term_file_lock(database_path: str):
+    """Serialize TinyDB long-term writes across threads and, on Unix, processes."""
+
+    resolved = os.path.abspath(database_path)
+    with _LONG_TERM_LOCKS_GUARD:
+        thread_lock = _LONG_TERM_LOCKS.setdefault(resolved, threading.Lock())
+    with thread_lock:
+        lock_path = f"{resolved}.long-term.lock"
+        with open(lock_path, "a+", encoding="utf-8") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _normalize_summary_id(value: Any) -> Optional[str]:
@@ -345,6 +374,711 @@ class TinyDBStore:
                 out.append(rows[0])
         db.close()
         return out
+
+    # Long-term threat-landscape analysis
+
+    def list_articles_for_long_term(
+        self,
+        *,
+        after_fetched_at: int = 0,
+        after_article_id: str = "",
+        until_fetched_at: Optional[int] = None,
+        sources: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        after = (int(after_fetched_at), str(after_article_id or ""))
+        until = int(until_fetched_at) if until_fetched_at is not None else None
+        source_set = {str(source).strip() for source in sources or [] if str(source).strip()}
+        db = self._db()
+        try:
+            rows = []
+            for raw in db.table("articles"):
+                row = dict(raw)
+                cursor = (int(row.get("fetched_at") or 0), str(row.get("id") or ""))
+                if cursor <= after or (until is not None and cursor[0] > until):
+                    continue
+                if source_set and str(row.get("source") or "") not in source_set:
+                    continue
+                rows.append(row)
+            rows.sort(key=lambda row: (int(row.get("fetched_at") or 0), str(row.get("id") or "")))
+            return rows[: max(1, int(limit))]
+        finally:
+            db.close()
+
+    def get_long_term_cursor(self, profile_id: str) -> Dict[str, Any]:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            raise ValueError("profile_id must not be empty")
+        db = self._db()
+        try:
+            row = db.table("long_term_state").get(Query().profile_id == profile_id)
+            if row:
+                return dict(row)
+            return {
+                "profile_id": profile_id,
+                "cursor_fetched_at": 0,
+                "cursor_article_id": "",
+                "lease_owner": None,
+                "lease_until": 0,
+                "updated_at": 0,
+            }
+        finally:
+            db.close()
+
+    def claim_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool:
+        profile_id = str(profile_id or "").strip()
+        owner_id = str(owner_id or "").strip()
+        if not profile_id or not owner_id or lease_seconds < 1:
+            raise ValueError("profile, owner and positive lease_seconds are required")
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("long_term_state")
+                query = Query()
+                existing = table.get(query.profile_id == profile_id)
+                state = dict(existing) if existing else {
+                    "profile_id": profile_id,
+                    "cursor_fetched_at": 0,
+                    "cursor_article_id": "",
+                }
+                current_owner = str(state.get("lease_owner") or "")
+                current_until = int(state.get("lease_until") or 0)
+                if current_owner and current_owner != owner_id and current_until > int(now_ts):
+                    return False
+                state.update(
+                    {
+                        "lease_owner": owner_id,
+                        "lease_until": int(now_ts) + int(lease_seconds),
+                        "updated_at": int(now_ts),
+                    }
+                )
+                table.upsert(state, query.profile_id == profile_id)
+                return True
+            finally:
+                db.close()
+
+    def release_long_term_lease(self, profile_id: str, owner_id: str) -> bool:
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("long_term_state")
+                query = Query()
+                row = table.get(query.profile_id == str(profile_id))
+                if not row or row.get("lease_owner") != str(owner_id):
+                    return False
+                state = dict(row)
+                state.update({"lease_owner": None, "lease_until": 0, "updated_at": int(time.time())})
+                table.update(state, query.profile_id == str(profile_id))
+                return True
+            finally:
+                db.close()
+
+    def advance_long_term_cursor(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        expected_fetched_at: int,
+        expected_article_id: str,
+        fetched_at: int,
+        article_id: str,
+        now_ts: int,
+    ) -> bool:
+        expected = (int(expected_fetched_at), str(expected_article_id or ""))
+        new_cursor = (int(fetched_at), str(article_id or ""))
+        if new_cursor < expected or new_cursor[0] < 1 or not new_cursor[1]:
+            raise ValueError("new cursor must be complete and cannot move backwards")
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("long_term_state")
+                query = Query()
+                row = table.get(query.profile_id == str(profile_id))
+                if not row:
+                    return False
+                state = dict(row)
+                current = (
+                    int(state.get("cursor_fetched_at") or 0),
+                    str(state.get("cursor_article_id") or ""),
+                )
+                if (
+                    current != expected
+                    or state.get("lease_owner") != str(owner_id)
+                    or int(state.get("lease_until") or 0) <= int(now_ts)
+                ):
+                    return False
+                state.update(
+                    {
+                        "cursor_fetched_at": new_cursor[0],
+                        "cursor_article_id": new_cursor[1],
+                        "updated_at": int(now_ts),
+                    }
+                )
+                table.update(state, query.profile_id == str(profile_id))
+                return True
+            finally:
+                db.close()
+
+    def get_threat_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("threat_clusters", str(cluster_id))
+
+    def list_threat_clusters(
+        self,
+        profile_id: str,
+        *,
+        statuses: Optional[List[str]] = None,
+        min_last_seen_ts: Optional[int] = None,
+        embedding_model: Optional[str] = None,
+        embedding_dimension: Optional[int] = None,
+        embedding_instruction: Optional[str] = None,
+        limit: int = 10000,
+    ) -> List[Dict[str, Any]]:
+        status_set = {str(status) for status in statuses or [] if str(status)}
+        db = self._db()
+        try:
+            rows = []
+            for raw in db.table("threat_clusters"):
+                row = dict(raw)
+                if str(row.get("profile_id")) != str(profile_id):
+                    continue
+                if status_set and str(row.get("status")) not in status_set:
+                    continue
+                if min_last_seen_ts is not None and int(row.get("last_seen_ts") or 0) < int(
+                    min_last_seen_ts
+                ):
+                    continue
+                if embedding_model is not None and row.get("embedding_model") != embedding_model:
+                    continue
+                if embedding_dimension is not None and int(
+                    row.get("embedding_dimension") or 0
+                ) != int(embedding_dimension):
+                    continue
+                if (
+                    embedding_instruction is not None
+                    and row.get("embedding_instruction") != embedding_instruction
+                ):
+                    continue
+                rows.append(row)
+            rows.sort(key=lambda row: (-int(row.get("last_seen_ts") or 0), str(row.get("id"))))
+            return rows[: max(1, int(limit))]
+        finally:
+            db.close()
+
+    def save_threat_cluster(
+        self,
+        cluster_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool:
+        doc = dict(cluster_doc or {})
+        required = (
+            "id",
+            "profile_id",
+            "status",
+            "last_seen_ts",
+            "embedding_model",
+            "embedding_dimension",
+            "embedding_instruction",
+            "membership_revision",
+        )
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("cluster document is incomplete")
+        doc.setdefault("updated_at", int(time.time()))
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("threat_clusters")
+                query = Query()
+                existing = table.get(query.id == str(doc["id"]))
+                if existing is None and expected_membership_revision is not None:
+                    return False
+                if existing is not None and (
+                    expected_membership_revision is None
+                    or int(existing.get("membership_revision") or 0)
+                    != int(expected_membership_revision)
+                ):
+                    return False
+                if existing is None:
+                    table.insert(doc)
+                else:
+                    def replace_document(row):
+                        row.clear()
+                        row.update(doc)
+
+                    table.update(replace_document, query.id == str(doc["id"]))
+                return True
+            finally:
+                db.close()
+
+    def get_cluster_membership(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]:
+        db = self._db()
+        try:
+            row = db.table("threat_cluster_memberships").get(
+                (Query().profile_id == str(profile_id)) & (Query().article_id == str(article_id))
+            )
+            return dict(row) if row else None
+        finally:
+            db.close()
+
+    def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool:
+        doc = dict(membership_doc or {})
+        required = ("profile_id", "article_id", "cluster_id", "assigned_at")
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("membership document is incomplete")
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("threat_cluster_memberships")
+                query = Query()
+                match = (query.profile_id == str(doc["profile_id"])) & (
+                    query.article_id == str(doc["article_id"])
+                )
+                if table.contains(match):
+                    return False
+                table.insert(doc)
+                return True
+            finally:
+                db.close()
+
+    @staticmethod
+    def _apply_cluster_assignment(db: TinyDB, operation: Dict[str, Any]) -> bool:
+        cluster = dict(operation["cluster"])
+        membership = dict(operation["membership"])
+        expected = operation.get("expected_membership_revision")
+        cluster_table = db.table("threat_clusters")
+        membership_table = db.table("threat_cluster_memberships")
+        query = Query()
+        membership_match = (query.profile_id == str(membership["profile_id"])) & (
+            query.article_id == str(membership["article_id"])
+        )
+        existing_membership = membership_table.get(membership_match)
+        if existing_membership is not None and str(
+            existing_membership.get("cluster_id")
+        ) != str(cluster["id"]):
+            return False
+
+        cluster_match = query.id == str(cluster["id"])
+        existing_cluster = cluster_table.get(cluster_match)
+        target_revision = int(cluster["membership_revision"])
+        if existing_cluster is None:
+            if expected is not None:
+                return False
+            cluster_table.insert(cluster)
+        else:
+            current_revision = int(existing_cluster.get("membership_revision") or 0)
+            if current_revision == target_revision:
+                pass
+            elif expected is None or current_revision != int(expected):
+                return False
+            else:
+
+                def replace_document(row):
+                    row.clear()
+                    row.update(cluster)
+
+                cluster_table.update(replace_document, cluster_match)
+
+        if existing_membership is None:
+            membership_table.insert(membership)
+        return True
+
+    def save_cluster_assignment(
+        self,
+        cluster_doc: Dict[str, Any],
+        membership_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool:
+        """Persist an assignment under a process lock and recoverable journal."""
+
+        cluster = dict(cluster_doc or {})
+        membership = dict(membership_doc or {})
+        cluster_required = (
+            "id",
+            "profile_id",
+            "status",
+            "last_seen_ts",
+            "embedding_model",
+            "embedding_dimension",
+            "embedding_instruction",
+            "membership_revision",
+        )
+        membership_required = ("profile_id", "article_id", "cluster_id", "assigned_at")
+        if any(cluster.get(field) is None for field in cluster_required):
+            raise ValueError("cluster document is incomplete")
+        if any(membership.get(field) is None for field in membership_required):
+            raise ValueError("membership document is incomplete")
+        if (
+            str(cluster["id"]) != str(membership["cluster_id"])
+            or str(cluster["profile_id"]) != str(membership["profile_id"])
+        ):
+            raise ValueError("cluster and membership identities do not match")
+        cluster.setdefault("updated_at", int(time.time()))
+        operation_id = f"{membership['profile_id']}:{membership['article_id']}"
+        operation = {
+            "id": operation_id,
+            "cluster": cluster,
+            "membership": membership,
+            "expected_membership_revision": expected_membership_revision,
+            "created_at": int(time.time()),
+        }
+
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                journal = db.table("long_term_assignment_journal")
+                query = Query()
+                for pending in list(journal):
+                    if self._apply_cluster_assignment(db, dict(pending)):
+                        journal.remove(query.id == str(pending.get("id")))
+
+                membership_match = (
+                    query.profile_id == str(membership["profile_id"])
+                ) & (query.article_id == str(membership["article_id"]))
+                if db.table("threat_cluster_memberships").contains(membership_match):
+                    return False
+                if journal.contains(query.id == operation_id):
+                    return False
+                journal.insert(operation)
+                if not self._apply_cluster_assignment(db, operation):
+                    return False
+                journal.remove(query.id == operation_id)
+                return True
+            finally:
+                db.close()
+
+    def list_cluster_memberships(
+        self, cluster_id: str, *, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "threat_cluster_memberships",
+            lambda row: row.get("cluster_id") == str(cluster_id),
+            lambda row: (int(row.get("assigned_at") or 0), str(row.get("article_id") or "")),
+            limit,
+        )
+
+    def get_long_term_quarantine(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]:
+        db = self._db()
+        try:
+            query = Query()
+            row = db.table("long_term_article_quarantine").get(
+                (query.profile_id == str(profile_id))
+                & (query.article_id == str(article_id))
+            )
+            return dict(row) if row else None
+        finally:
+            db.close()
+
+    def save_long_term_quarantine(self, quarantine_doc: Dict[str, Any]) -> bool:
+        doc = dict(quarantine_doc or {})
+        required = ("profile_id", "article_id", "reason", "observed_at")
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("quarantine document is incomplete")
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("long_term_article_quarantine")
+                query = Query()
+                match = (query.profile_id == str(doc["profile_id"])) & (
+                    query.article_id == str(doc["article_id"])
+                )
+                existing = table.get(match)
+                observed_at = int(doc["observed_at"])
+                merged = {
+                    **(dict(existing) if existing else {}),
+                    **doc,
+                    "status": "open",
+                    "first_seen_at": int(existing.get("first_seen_at") or observed_at)
+                    if existing
+                    else observed_at,
+                    "last_seen_at": observed_at,
+                    "attempt_count": int(existing.get("attempt_count") or 0) + 1
+                    if existing
+                    else 1,
+                    "resolved_at": None,
+                }
+                if existing:
+                    table.update(merged, match)
+                else:
+                    table.insert(merged)
+                return True
+            finally:
+                db.close()
+
+    def resolve_long_term_quarantine(
+        self, profile_id: str, article_id: str, *, resolved_at: int
+    ) -> bool:
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("long_term_article_quarantine")
+                query = Query()
+                match = (
+                    (query.profile_id == str(profile_id))
+                    & (query.article_id == str(article_id))
+                    & (query.status == "open")
+                )
+                if not table.contains(match):
+                    return False
+                table.update(
+                    {"status": "resolved", "resolved_at": int(resolved_at)},
+                    match,
+                )
+                return True
+            finally:
+                db.close()
+
+    def list_long_term_quarantine(
+        self,
+        profile_id: str,
+        *,
+        status: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "long_term_article_quarantine",
+            lambda row: row.get("profile_id") == str(profile_id)
+            and (status is None or row.get("status") == str(status)),
+            lambda row: (-int(row.get("last_seen_at") or 0), str(row.get("article_id") or "")),
+            limit,
+        )
+
+    def save_cluster_snapshot(self, snapshot_doc: Dict[str, Any]) -> bool:
+        doc = dict(snapshot_doc or {})
+        required = (
+            "id",
+            "profile_id",
+            "cluster_id",
+            "membership_revision",
+            "prompt_version",
+            "created_at",
+        )
+        uniqueness = lambda row: (
+            row.get("id") == doc.get("id")
+            or (
+                row.get("cluster_id") == doc.get("cluster_id")
+                and row.get("membership_revision") == doc.get("membership_revision")
+                and row.get("prompt_version") == doc.get("prompt_version")
+            )
+        )
+        return self._insert_long_term_doc(
+            "threat_cluster_snapshots", doc, required, uniqueness
+        )
+
+    @staticmethod
+    def _apply_snapshot_revision(db: TinyDB, operation: Dict[str, Any]) -> bool:
+        cluster = dict(operation["cluster"])
+        snapshot = dict(operation["snapshot"])
+        expected_membership = int(operation["expected_membership_revision"])
+        expected_summarized = int(operation["expected_summarized_revision"])
+        query = Query()
+        cluster_table = db.table("threat_clusters")
+        snapshot_table = db.table("threat_cluster_snapshots")
+        cluster_match = query.id == str(cluster["id"])
+        current = cluster_table.get(cluster_match)
+        if current is None or int(current.get("membership_revision") or 0) != expected_membership:
+            return False
+        current_summarized = int(current.get("summarized_revision") or 0)
+        target_summarized = int(cluster["summarized_revision"])
+        if current_summarized not in {expected_summarized, target_summarized}:
+            return False
+        snapshot_match = (query.id == str(snapshot["id"])) | (
+            (query.cluster_id == str(snapshot["cluster_id"]))
+            & (query.membership_revision == int(snapshot["membership_revision"]))
+            & (query.prompt_version == str(snapshot["prompt_version"]))
+        )
+        existing_snapshot = snapshot_table.get(snapshot_match)
+        if existing_snapshot is None:
+            snapshot_table.insert(snapshot)
+        elif str(existing_snapshot.get("id")) != str(snapshot["id"]):
+            return False
+        if current_summarized != target_summarized:
+
+            def replace_document(row):
+                row.clear()
+                row.update(cluster)
+
+            cluster_table.update(replace_document, cluster_match)
+        return True
+
+    def save_cluster_snapshot_revision(
+        self,
+        cluster_doc: Dict[str, Any],
+        snapshot_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: int,
+        expected_summarized_revision: int,
+    ) -> bool:
+        """Journal a snapshot and its cluster summary revision as one operation."""
+
+        cluster = dict(cluster_doc or {})
+        snapshot = dict(snapshot_doc or {})
+        if (
+            not cluster.get("id")
+            or not snapshot.get("id")
+            or str(cluster.get("id")) != str(snapshot.get("cluster_id"))
+            or str(cluster.get("profile_id")) != str(snapshot.get("profile_id"))
+            or int(cluster.get("membership_revision") or -1)
+            != int(expected_membership_revision)
+            or int(cluster.get("summarized_revision") or -1)
+            != int(snapshot.get("membership_revision") or -1)
+            or not int(expected_summarized_revision)
+            < int(cluster.get("summarized_revision") or -1)
+            <= int(expected_membership_revision)
+        ):
+            raise ValueError("snapshot and cluster revisions or identities do not match")
+        operation_id = f"{cluster['id']}:{expected_membership_revision}:{snapshot['prompt_version']}"
+        operation = {
+            "id": operation_id,
+            "cluster": cluster,
+            "snapshot": snapshot,
+            "expected_membership_revision": int(expected_membership_revision),
+            "expected_summarized_revision": int(expected_summarized_revision),
+            "created_at": int(time.time()),
+        }
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                journal = db.table("long_term_snapshot_journal")
+                query = Query()
+                for pending in list(journal):
+                    if self._apply_snapshot_revision(db, dict(pending)):
+                        journal.remove(query.id == str(pending.get("id")))
+                current = db.table("threat_clusters").get(
+                    query.id == str(cluster["id"])
+                )
+                if current is None or (
+                    int(current.get("membership_revision") or 0)
+                    != int(expected_membership_revision)
+                    or int(current.get("summarized_revision") or 0)
+                    != int(expected_summarized_revision)
+                ):
+                    return False
+                if journal.contains(query.id == operation_id):
+                    return False
+                journal.insert(operation)
+                if not self._apply_snapshot_revision(db, operation):
+                    return False
+                journal.remove(query.id == operation_id)
+                return True
+            finally:
+                db.close()
+
+    def list_cluster_snapshots(
+        self,
+        profile_id: str,
+        *,
+        cluster_id: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "threat_cluster_snapshots",
+            lambda row: row.get("profile_id") == str(profile_id)
+            and (cluster_id is None or row.get("cluster_id") == str(cluster_id)),
+            lambda row: (-int(row.get("created_at") or 0), str(row.get("id") or "")),
+            limit,
+        )
+
+    def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool:
+        doc = dict(report_doc or {})
+        return self._insert_long_term_doc(
+            "threat_landscape_reports",
+            doc,
+            ("id", "profile_id", "period_end_ts", "created_at"),
+            lambda row: row.get("id") == doc.get("id"),
+        )
+
+    def get_threat_landscape_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("threat_landscape_reports", str(report_id))
+
+    def list_threat_landscape_reports(
+        self, profile_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "threat_landscape_reports",
+            lambda row: row.get("profile_id") == str(profile_id),
+            lambda row: (-int(row.get("period_end_ts") or 0), str(row.get("id") or "")),
+            limit,
+        )
+
+    def create_long_term_run(self, run_doc: Dict[str, Any]) -> bool:
+        doc = dict(run_doc or {})
+        return self._insert_long_term_doc(
+            "long_term_runs",
+            doc,
+            ("id", "profile_id", "run_type", "started_at", "status"),
+            lambda row: row.get("id") == doc.get("id"),
+        )
+
+    def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("long_term_runs", str(run_id))
+
+    def update_long_term_run(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        fields: Dict[str, Any],
+    ) -> bool:
+        updates = dict(fields or {})
+        updates.pop("id", None)
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("long_term_runs")
+                query = Query()
+                match = (query.id == str(run_id)) & (query.status == str(expected_status))
+                row = table.get(match)
+                if not row:
+                    return False
+                doc = dict(row)
+                doc.update(updates)
+                table.update(doc, match)
+                return True
+            finally:
+                db.close()
+
+    def _get_long_term_doc(self, table_name: str, document_id: str) -> Optional[Dict[str, Any]]:
+        db = self._db()
+        try:
+            row = db.table(table_name).get(Query().id == str(document_id))
+            return dict(row) if row else None
+        finally:
+            db.close()
+
+    def _list_long_term_docs(self, table_name, predicate, sort_key, limit):
+        db = self._db()
+        try:
+            rows = [dict(row) for row in db.table(table_name) if predicate(row)]
+            rows.sort(key=sort_key)
+            return rows[: max(1, int(limit))]
+        finally:
+            db.close()
+
+    def _insert_long_term_doc(self, table_name, doc, required, uniqueness) -> bool:
+        if any(doc.get(field) is None for field in required):
+            raise ValueError("document is incomplete")
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table(table_name)
+                if table.contains(uniqueness):
+                    return False
+                table.insert(doc)
+                return True
+            finally:
+                db.close()
 
     def put_temp_summary(self, job_id: int, payload: Dict[str, Any]) -> None:
         db = self._db()

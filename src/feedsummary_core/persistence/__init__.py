@@ -214,6 +214,138 @@ class NewsStore(Protocol):
 
     def initialize_default_categories(self) -> None: ...
 
+    # Long-term threat-landscape analysis
+    def list_articles_for_long_term(
+        self,
+        *,
+        after_fetched_at: int = 0,
+        after_article_id: str = "",
+        until_fetched_at: Optional[int] = None,
+        sources: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]: ...
+
+    def get_long_term_cursor(self, profile_id: str) -> Dict[str, Any]: ...
+
+    def claim_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool: ...
+
+    def release_long_term_lease(self, profile_id: str, owner_id: str) -> bool: ...
+
+    def advance_long_term_cursor(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        expected_fetched_at: int,
+        expected_article_id: str,
+        fetched_at: int,
+        article_id: str,
+        now_ts: int,
+    ) -> bool: ...
+
+    def get_threat_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]: ...
+
+    def list_threat_clusters(
+        self,
+        profile_id: str,
+        *,
+        statuses: Optional[List[str]] = None,
+        min_last_seen_ts: Optional[int] = None,
+        embedding_model: Optional[str] = None,
+        embedding_dimension: Optional[int] = None,
+        embedding_instruction: Optional[str] = None,
+        limit: int = 10000,
+    ) -> List[Dict[str, Any]]: ...
+
+    def save_threat_cluster(
+        self,
+        cluster_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool: ...
+
+    def get_cluster_membership(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]: ...
+
+    def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool: ...
+
+    def save_cluster_assignment(
+        self,
+        cluster_doc: Dict[str, Any],
+        membership_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: Optional[int] = None,
+    ) -> bool: ...
+
+    def get_long_term_quarantine(
+        self, profile_id: str, article_id: str
+    ) -> Optional[Dict[str, Any]]: ...
+
+    def save_long_term_quarantine(self, quarantine_doc: Dict[str, Any]) -> bool: ...
+
+    def resolve_long_term_quarantine(
+        self, profile_id: str, article_id: str, *, resolved_at: int
+    ) -> bool: ...
+
+    def list_long_term_quarantine(
+        self,
+        profile_id: str,
+        *,
+        status: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]: ...
+
+    def list_cluster_memberships(
+        self, cluster_id: str, *, limit: int = 10000
+    ) -> List[Dict[str, Any]]: ...
+
+    def save_cluster_snapshot(self, snapshot_doc: Dict[str, Any]) -> bool: ...
+
+    def save_cluster_snapshot_revision(
+        self,
+        cluster_doc: Dict[str, Any],
+        snapshot_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: int,
+        expected_summarized_revision: int,
+    ) -> bool: ...
+
+    def list_cluster_snapshots(
+        self,
+        profile_id: str,
+        *,
+        cluster_id: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]: ...
+
+    def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool: ...
+
+    def get_threat_landscape_report(self, report_id: str) -> Optional[Dict[str, Any]]: ...
+
+    def list_threat_landscape_reports(
+        self, profile_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]: ...
+
+    def create_long_term_run(self, run_doc: Dict[str, Any]) -> bool: ...
+
+    def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]: ...
+
+    def update_long_term_run(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        fields: Dict[str, Any],
+    ) -> bool: ...
+
 
 def _expand_path(p: str) -> str:
     expanded = os.path.expandvars(os.path.expanduser(p))
@@ -224,18 +356,21 @@ def create_store(cfg: Dict[str, Any]) -> NewsStore:
     """Instantiate the configured storage backend and ensure its parent path exists."""
 
     provider = (cfg.get("provider") or cfg.get("type") or "tinydb").lower()
+    initialize_schema = bool(cfg.get("initialize_schema", True))
 
     if provider == "tinydb":
         raw_path = cfg.get("path", "news_docs.json")
         path = _expand_path(raw_path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        if initialize_schema:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        elif not Path(path).is_file():
+            raise FileNotFoundError(f"TinyDB database does not exist: {path}")
         return TinyDBStore(path=path)  # type: ignore
 
     if provider in ("sqlite", "sqlite3"):
         raw_path = cfg.get("path", "news_docs.sqlite")
         path = _expand_path(raw_path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        return SqliteStore(path=path)  # type: ignore
+        return SqliteStore(path=path, initialize_schema=initialize_schema)  # type: ignore
 
     if provider in ("mongo", "mongodb"):
         return MongoDBStore(
@@ -243,7 +378,7 @@ def create_store(cfg: Dict[str, Any]) -> NewsStore:
             database=cfg.get("database") or cfg.get("database_name") or "feedsummary",
             client=cfg.get("client"),
             connect_timeout_ms=int(cfg.get("connect_timeout_ms", 5000)),
-            initialize_schema=bool(cfg.get("initialize_schema", True)),
+            initialize_schema=initialize_schema,
         )  # type: ignore
 
     raise ValueError(f"Unsupported store provider: {provider}")
