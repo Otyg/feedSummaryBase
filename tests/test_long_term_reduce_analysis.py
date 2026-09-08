@@ -3,6 +3,8 @@ import copy
 import json
 import unittest
 
+from feedsummary_core.llm_client.fallback_client import FallbackLLMClient, FallbackPolicy
+from feedsummary_core.llm_client.ollama_cloud import LLMUnavailableError
 from feedsummary_core.long_term import (
     ReduceResult,
     ReduceSettings,
@@ -58,9 +60,23 @@ class FakeLLM:
         self.responses = list(responses)
         self.calls = []
 
-    async def chat(self, messages, *, temperature=0.0):
-        self.calls.append((messages, temperature))
+    async def chat(self, messages, *, temperature=0.0, max_output_tokens=None):
+        self.calls.append((messages, temperature, max_output_tokens))
         return self.responses.pop(0)
+
+
+class LostLeaseGuard:
+    async def ensure_owned(self):
+        raise RuntimeError("lease lost")
+
+
+class UnavailableProvider:
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        raise LLMUnavailableError("provider timeout")
 
 
 class LongTermReduceAnalysisTests(unittest.TestCase):
@@ -177,7 +193,7 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
             ],
         }
 
-    def run_reduce(self, store, llm, *, settings=None):
+    def run_reduce(self, store, llm, *, settings=None, lease_guard=None):
         return asyncio.run(
             run_landscape_reduce(
                 store,
@@ -191,6 +207,7 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
                 now_ts=2_000_100,
                 settings=settings,
                 mirror_to_summary_docs=True,
+                lease_guard=lease_guard,
             )
         )
 
@@ -249,6 +266,7 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
         self.assertTrue(result.repair_attempted)
         self.assertEqual(2, result.llm_call_count)
         self.assertEqual(1, len(store.reports))
+        self.assertEqual([2500, 2500], [call[2] for call in llm.calls])
 
     def test_invalid_final_response_never_creates_report(self):
         store = FakeStore(self.snapshots)
@@ -261,6 +279,38 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
                 settings=ReduceSettings(format_repair_attempts=0),
             )
         self.assertEqual([], store.reports)
+
+    def test_lost_lease_blocks_report_and_mirror_persistence(self):
+        store = FakeStore(self.snapshots)
+
+        with self.assertRaisesRegex(RuntimeError, "lease lost"):
+            self.run_reduce(
+                store,
+                FakeLLM([json.dumps(self.report())]),
+                lease_guard=LostLeaseGuard(),
+            )
+
+        self.assertEqual([], store.reports)
+        self.assertEqual({}, store.summaries)
+
+    def test_exhausted_timeout_fallback_never_persists_report(self):
+        store = FakeStore(self.snapshots)
+        primary = UnavailableProvider()
+        fallback = UnavailableProvider()
+        llm = FallbackLLMClient(
+            [primary, fallback],
+            policy=FallbackPolicy(max_quota_retries=0, default_wait_s=0),
+        )
+
+        with self.assertRaisesRegex(LLMUnavailableError, "timeout"):
+            self.run_reduce(store, llm)
+
+        self.assertEqual(1, len(primary.calls))
+        self.assertEqual(1, len(fallback.calls))
+        self.assertEqual(2500, primary.calls[0][1]["max_output_tokens"])
+        self.assertEqual(2500, fallback.calls[0][1]["max_output_tokens"])
+        self.assertEqual([], store.reports)
+        self.assertEqual({}, store.summaries)
 
     def test_large_input_is_segmented_before_final_reduce(self):
         snapshots = copy.deepcopy(self.snapshots)
@@ -286,6 +336,7 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
         self.assertEqual(3, result.segment_count)
         self.assertEqual(4, result.llm_call_count)
         self.assertEqual("landscape-segment-v1", store.reports[0]["segment_prompt_version"])
+        self.assertEqual([200, 200, 200, 200], [call[2] for call in llm.calls])
 
     def test_missing_snapshot_disables_trend_claims_and_is_recorded(self):
         store = FakeStore(self.snapshots[:2])

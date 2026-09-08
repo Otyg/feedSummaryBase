@@ -98,6 +98,46 @@ class LongTermStoreContract:
             )
         )
 
+    def test_lease_renewal_requires_current_owner_and_unexpired_lease(self):
+        self.assertTrue(
+            self.store.claim_long_term_lease(
+                "renew-profile", "worker-a", now_ts=100, lease_seconds=50
+            )
+        )
+        self.assertFalse(
+            self.store.renew_long_term_lease(
+                "renew-profile", "worker-b", now_ts=120, lease_seconds=50
+            )
+        )
+        self.assertTrue(
+            self.store.renew_long_term_lease(
+                "renew-profile", "worker-a", now_ts=120, lease_seconds=50
+            )
+        )
+        self.assertEqual(
+            170, self.store.get_long_term_cursor("renew-profile")["lease_until"]
+        )
+        self.assertFalse(
+            self.store.claim_long_term_lease(
+                "renew-profile", "worker-b", now_ts=160, lease_seconds=50
+            )
+        )
+        self.assertFalse(
+            self.store.renew_long_term_lease(
+                "renew-profile", "worker-a", now_ts=170, lease_seconds=50
+            )
+        )
+        self.assertTrue(
+            self.store.claim_long_term_lease(
+                "renew-profile", "worker-b", now_ts=170, lease_seconds=50
+            )
+        )
+        self.assertFalse(
+            self.store.renew_long_term_lease(
+                "renew-profile", "worker-a", now_ts=171, lease_seconds=50
+            )
+        )
+
     def test_cluster_revision_and_membership_are_idempotent(self):
         cluster = self.cluster_doc()
         self.assertTrue(self.store.save_threat_cluster(cluster))

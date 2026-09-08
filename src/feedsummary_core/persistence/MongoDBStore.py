@@ -514,6 +514,34 @@ class MongoDBStore:
         )
         return result.matched_count > 0
 
+    def renew_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool:
+        profile_id = str(profile_id or "").strip()
+        owner_id = str(owner_id or "").strip()
+        if not profile_id or not owner_id or lease_seconds < 1:
+            raise ValueError("profile, owner and positive lease_seconds are required")
+        now_ts = _safe_int(now_ts)
+        result = self.db.long_term_state.update_one(
+            {
+                "_id": profile_id,
+                "lease_owner": owner_id,
+                "lease_until": {"$gt": now_ts},
+            },
+            {
+                "$set": {
+                    "lease_until": now_ts + int(lease_seconds),
+                    "updated_at": now_ts,
+                }
+            },
+        )
+        return result.matched_count > 0
+
     def advance_long_term_cursor(
         self,
         profile_id: str,

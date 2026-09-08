@@ -43,6 +43,11 @@ from feedsummary_core.long_term.clustering import (
     create_cluster,
     stable_cluster_id,
 )
+from feedsummary_core.long_term.lease import (
+    LeaseGuard,
+    LeaseLostError,
+    LongTermLeaseHeartbeat,
+)
 from feedsummary_core.long_term.map_analysis import (
     MapSettings,
     MapUpdateResult,
@@ -109,7 +114,10 @@ __all__ = [
     "IncrementalBatchResult",
     "IncrementalSettings",
     "LandscapeMetricSettings",
+    "LeaseGuard",
+    "LeaseLostError",
     "LeaseUnavailableError",
+    "LongTermLeaseHeartbeat",
     "MapSettings",
     "MapUpdateResult",
     "PromptBudgetError",

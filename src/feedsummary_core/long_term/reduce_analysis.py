@@ -39,6 +39,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from feedsummary_core.long_term.lease import LeaseGuard
 from feedsummary_core.long_term.reporting import (
     ReportValidationError,
     build_landscape_report_document,
@@ -75,7 +76,11 @@ class ReduceStore(Protocol):
 
 class ReduceLLM(Protocol):
     async def chat(
-        self, messages: list[dict[str, str]], *, temperature: float = 0.0
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
     ) -> str: ...
 
 
@@ -421,6 +426,7 @@ async def _repair_json(
     error: Exception,
     output_schema: dict[str, Any],
     identity: dict[str, Any],
+    max_output_tokens: int,
 ) -> str:
     messages = [
         {
@@ -444,7 +450,11 @@ async def _repair_json(
             ),
         },
     ]
-    return await llm.chat(messages, temperature=0.0)
+    return await llm.chat(
+        messages,
+        temperature=0.0,
+        max_output_tokens=max_output_tokens,
+    )
 
 
 async def run_landscape_reduce(
@@ -461,6 +471,7 @@ async def run_landscape_reduce(
     forecast_horizon_days: frozenset[int] = frozenset({30, 90}),
     settings: ReduceSettings | None = None,
     mirror_to_summary_docs: bool = False,
+    lease_guard: LeaseGuard | None = None,
 ) -> ReduceResult:
     """Generate, validate and idempotently save one frozen landscape report."""
 
@@ -509,6 +520,7 @@ async def run_landscape_reduce(
             raw_segment = await llm.chat(
                 segment_messages,
                 temperature=float(segment_prompt_package.get("temperature", 0.0)),
+                max_output_tokens=settings.max_output_tokens,
             )
             llm_call_count += 1
             try:
@@ -535,6 +547,7 @@ async def run_landscape_reduce(
                         "segment_id": segment_id,
                         "snapshot_ids": sorted(str(row["id"]) for row in group),
                     },
+                    max_output_tokens=settings.max_output_tokens,
                 )
                 llm_call_count += 1
                 compact.extend(
@@ -560,6 +573,7 @@ async def run_landscape_reduce(
     raw_report = await llm.chat(
         messages,
         temperature=float(final_prompt_package.get("temperature", 0.0)),
+        max_output_tokens=settings.max_output_tokens,
     )
     llm_call_count += 1
     try:
@@ -584,6 +598,7 @@ async def run_landscape_reduce(
                 "period_end_ts": period_end_ts,
                 "cluster_ids": sorted(str(row["cluster_id"]) for row in snapshots),
             },
+            max_output_tokens=settings.max_output_tokens,
         )
         llm_call_count += 1
         report = validate_landscape_report(
@@ -614,6 +629,8 @@ async def run_landscape_reduce(
             else None
         ),
     )
+    if lease_guard is not None:
+        await lease_guard.ensure_owned()
     saved = store.save_threat_landscape_report(document)
     canonical = document
     if not saved:

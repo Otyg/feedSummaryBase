@@ -45,7 +45,13 @@ log = logging.getLogger(__name__)
 class LLMClient(Protocol):
     """Minimal async chat contract used by the fallback wrapper."""
 
-    async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str: ...
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+    ) -> str: ...
 
 
 class EmbeddingClient(Protocol):
@@ -123,7 +129,13 @@ class FallbackLLMClient:
         )
         return next_idx
 
-    async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str:
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+    ) -> str:
         provider_idx = self._next_provider_idx(self._active_idx)
         if provider_idx is None:
             raise RuntimeError(
@@ -136,7 +148,13 @@ class FallbackLLMClient:
             attempt = 0
             while True:
                 try:
-                    return await active.chat(messages, temperature=temperature)
+                    if max_output_tokens is None:
+                        return await active.chat(messages, temperature=temperature)
+                    return await active.chat(
+                        messages,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                    )
                 except LLMUnavailableError as e:
                     attempt += 1
                     wait_s = int(self.policy.default_wait_s)

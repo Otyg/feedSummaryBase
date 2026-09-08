@@ -152,15 +152,28 @@ class OllamaLocalClient:
         ),
         reraise=True,
     )
-    async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str:
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+    ) -> str:
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive")
+
         await self._rate_gate()
         session = await self._get_session()
+
+        options = {"temperature": temperature}
+        if max_output_tokens is not None:
+            options["num_predict"] = int(max_output_tokens)
 
         payload = {
             "model": self.cfg.model,
             "messages": messages,
             "stream": True,
-            "options": {"temperature": temperature},
+            "options": options,
         }
 
         url = f"{self.cfg.base_url.rstrip('/')}/api/chat"

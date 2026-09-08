@@ -36,6 +36,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from math import ceil
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
@@ -56,6 +57,7 @@ from feedsummary_core.long_term.models import (
     EmbeddingSignature,
     ThreatCluster,
 )
+from feedsummary_core.long_term.lease import LeaseLostError
 
 _CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 _STRONG_TAG_CATEGORIES = frozenset(
@@ -75,6 +77,15 @@ class LongTermStore(Protocol):
     def get_article_tags(self, article_id: str) -> list[dict[str, Any]]: ...
 
     def claim_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool: ...
+
+    def renew_long_term_lease(
         self,
         profile_id: str,
         owner_id: str,
@@ -341,6 +352,8 @@ def run_incremental_clustering(
     if since_fetched_at is not None:
         scan_cursor_pair = max(scan_cursor_pair, (int(since_fetched_at), ""))
     lease_claimed = False
+    lease_started_monotonic = time.monotonic()
+    lease_last_renewed_monotonic = lease_started_monotonic
     run_id = None if dry_run else f"long_term_run_{uuid.uuid4().hex}"
     if not dry_run:
         lease_claimed = store.claim_long_term_lease(
@@ -365,6 +378,27 @@ def run_incremental_clustering(
         ):
             store.release_long_term_lease(profile_id, owner_id)
             raise ConcurrentAssignmentError("could not create long-term run record")
+
+    def ensure_lease_owned(*, force: bool = False) -> None:
+        nonlocal lease_last_renewed_monotonic
+        if dry_run or not lease_claimed:
+            return
+        current_monotonic = time.monotonic()
+        renewal_interval = max(0.1, settings.lease_seconds / 3)
+        if (
+            not force
+            and current_monotonic - lease_last_renewed_monotonic < renewal_interval
+        ):
+            return
+        elapsed = max(0, ceil(current_monotonic - lease_started_monotonic))
+        if not store.renew_long_term_lease(
+            profile_id,
+            owner_id,
+            now_ts=now_ts + elapsed,
+            lease_seconds=settings.lease_seconds,
+        ):
+            raise LeaseLostError(f"profile lease was lost: {profile_id}")
+        lease_last_renewed_monotonic = current_monotonic
 
     assignments: list[ArticleAssignment] = []
     counts = {
@@ -420,6 +454,7 @@ def run_incremental_clustering(
         )
         ordered = sorted(rows, key=lambda row: (_article_time(row), str(row.get("id") or "")))
         for article in ordered:
+            ensure_lease_owned()
             article_id = str(article.get("id") or "").strip()
             article_tags = store.get_article_tags(article_id) if article_id else []
             if normalized_required_tags and not _matches_required_tags(
@@ -599,6 +634,7 @@ def run_incremental_clustering(
             statuses=[ClusterStatus.ACTIVE.value, ClusterStatus.DORMANT.value],
         )
         for document in lifecycle_docs:
+            ensure_lease_owned()
             current = ThreatCluster.from_document(document)
             status = cluster_status_at(
                 current,
@@ -624,6 +660,7 @@ def run_incremental_clustering(
             and not dry_run
             and fetched_cursor > stored_cursor_pair
         ):
+            ensure_lease_owned(force=True)
             if not store.advance_long_term_cursor(
                 profile_id,
                 owner_id,
@@ -637,6 +674,7 @@ def run_incremental_clustering(
             final_cursor = fetched_cursor
 
         if not dry_run:
+            ensure_lease_owned(force=True)
             store.update_long_term_run(
                 run_id,
                 expected_status="running",

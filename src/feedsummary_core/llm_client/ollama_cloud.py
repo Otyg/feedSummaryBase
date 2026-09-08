@@ -218,7 +218,13 @@ class OllamaCloudClient:
                 ) from e
             raise LLMUnavailableError(f"Ollama Cloud preflight misslyckades: {e}") from e
 
-    async def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+    ) -> str:
         """
         Returnerar en enda textsträng.
         Hanterar:
@@ -227,6 +233,9 @@ class OllamaCloudClient:
         - optional preflight
         - tydlig 429/auth/server-timeout-hantering
         """
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive")
+
         sync = self._get_loop_sync()
         async with sync.concurrency_sem:
             await self._throttle()
@@ -234,6 +243,8 @@ class OllamaCloudClient:
 
             self.log.info("LLM request start (model=%s)", self.cfg.model)
             payload_options = {"temperature": temperature}
+            if max_output_tokens is not None:
+                payload_options["num_predict"] = int(max_output_tokens)
 
             try:
                 resp = await self._client.chat(

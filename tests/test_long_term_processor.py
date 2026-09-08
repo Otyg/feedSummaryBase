@@ -1,11 +1,16 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
+from unittest.mock import patch
 
 from feedsummary_core.long_term import (
     ClusteringSettings,
     EmbeddingSignature,
     IncrementalSettings,
+    LeaseLostError,
+    LeaseUnavailableError,
     create_cluster,
     run_incremental_clustering,
 )
@@ -81,6 +86,175 @@ class LongTermProcessorTests(unittest.TestCase):
         self.assertEqual(0, replay.fetched)
         self.assertEqual(0, replay.assigned)
         self.assertEqual(2, len(self.store.list_threat_clusters("profile")))
+
+    def test_clustering_renews_lease_before_cursor_commit(self):
+        self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))
+
+        with patch.object(
+            self.store,
+            "renew_long_term_lease",
+            wraps=self.store.renew_long_term_lease,
+        ) as renew:
+            result = run_incremental_clustering(
+                self.store,
+                profile_id="profile",
+                owner_id="worker",
+                until_fetched_at=500,
+                now_ts=500,
+                settings=self.settings(),
+            )
+
+        self.assertEqual((100, "article-a"), (result.cursor_fetched_at, result.cursor_article_id))
+        self.assertGreaterEqual(renew.call_count, 2)
+
+    def test_lost_lease_blocks_cursor_commit(self):
+        self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))
+
+        with (
+            patch.object(self.store, "renew_long_term_lease", return_value=False),
+            self.assertRaisesRegex(LeaseLostError, "lease was lost"),
+        ):
+            run_incremental_clustering(
+                self.store,
+                profile_id="profile",
+                owner_id="worker",
+                until_fetched_at=500,
+                now_ts=500,
+                settings=self.settings(),
+            )
+
+        cursor = self.store.get_long_term_cursor("profile")
+        self.assertEqual((0, ""), (cursor["cursor_fetched_at"], cursor["cursor_article_id"]))
+
+    def test_two_concurrent_starts_allow_exactly_one_profile_owner(self):
+        entered = Event()
+        release = Event()
+        original_create_run = self.store.create_long_term_run
+
+        def hold_first_run(document):
+            created = original_create_run(document)
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("concurrency test timed out")
+            return created
+
+        def run(owner):
+            return run_incremental_clustering(
+                self.store,
+                profile_id="profile",
+                owner_id=owner,
+                until_fetched_at=500,
+                now_ts=500,
+                settings=self.settings(),
+            )
+
+        with (
+            patch.object(
+                self.store,
+                "create_long_term_run",
+                side_effect=hold_first_run,
+            ),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            first = pool.submit(run, "worker-a")
+            self.assertTrue(entered.wait(1))
+            second = pool.submit(run, "worker-b")
+            with self.assertRaises(LeaseUnavailableError):
+                second.result(timeout=1)
+            release.set()
+            winner = first.result(timeout=1)
+
+        self.assertEqual("profile", winner.profile_id)
+
+    def test_cursor_write_failure_replays_existing_assignment_without_duplicate(self):
+        self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))
+
+        with (
+            patch.object(
+                self.store,
+                "advance_long_term_cursor",
+                side_effect=RuntimeError("cursor database failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "cursor database failure"),
+        ):
+            run_incremental_clustering(
+                self.store,
+                profile_id="profile",
+                owner_id="worker-a",
+                until_fetched_at=500,
+                now_ts=500,
+                settings=self.settings(),
+            )
+
+        self.assertIsNotNone(self.store.get_cluster_membership("profile", "article-a"))
+        self.assertEqual(0, self.store.get_long_term_cursor("profile")["cursor_fetched_at"])
+
+        replay = run_incremental_clustering(
+            self.store,
+            profile_id="profile",
+            owner_id="worker-b",
+            until_fetched_at=500,
+            now_ts=501,
+            settings=self.settings(),
+        )
+
+        self.assertEqual(0, replay.assigned)
+        self.assertEqual(1, replay.existing)
+        self.assertEqual((100, "article-a"), (replay.cursor_fetched_at, replay.cursor_article_id))
+        clusters = self.store.list_threat_clusters("profile")
+        self.assertEqual(1, len(clusters))
+        self.assertEqual(1, clusters[0]["member_count"])
+
+    def test_failure_after_cursor_commit_does_not_reprocess_or_duplicate(self):
+        self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))
+        original_update_run = self.store.update_long_term_run
+        failed_once = False
+
+        def fail_after_cursor(run_id, *, expected_status, fields):
+            nonlocal failed_once
+            if fields.get("status") == "done" and not failed_once:
+                failed_once = True
+                raise RuntimeError("run status database failure")
+            return original_update_run(
+                run_id,
+                expected_status=expected_status,
+                fields=fields,
+            )
+
+        with (
+            patch.object(
+                self.store,
+                "update_long_term_run",
+                side_effect=fail_after_cursor,
+            ),
+            self.assertRaisesRegex(RuntimeError, "run status database failure"),
+        ):
+            run_incremental_clustering(
+                self.store,
+                profile_id="profile",
+                owner_id="worker-a",
+                until_fetched_at=500,
+                now_ts=500,
+                settings=self.settings(),
+            )
+
+        cursor = self.store.get_long_term_cursor("profile")
+        self.assertEqual((100, "article-a"), (cursor["cursor_fetched_at"], cursor["cursor_article_id"]))
+
+        replay = run_incremental_clustering(
+            self.store,
+            profile_id="profile",
+            owner_id="worker-b",
+            until_fetched_at=500,
+            now_ts=501,
+            settings=self.settings(),
+        )
+
+        self.assertEqual(0, replay.fetched)
+        self.assertEqual(0, replay.assigned)
+        clusters = self.store.list_threat_clusters("profile")
+        self.assertEqual(1, len(clusters))
+        self.assertEqual(1, clusters[0]["member_count"])
 
     def test_dry_run_predicts_without_writes_or_cursor_movement(self):
         self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))

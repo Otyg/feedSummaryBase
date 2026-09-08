@@ -56,7 +56,13 @@ class LLMError(Exception):
 class LLMClient(Protocol):
     """Protocol implemented by asynchronous chat-oriented LLM clients."""
 
-    async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str: ...
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+    ) -> str: ...
 
 
 def has_local_embedding_provider(config: Dict[str, Any]) -> bool:

@@ -480,6 +480,43 @@ class TinyDBStore:
             finally:
                 db.close()
 
+    def renew_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool:
+        profile_id = str(profile_id or "").strip()
+        owner_id = str(owner_id or "").strip()
+        if not profile_id or not owner_id or lease_seconds < 1:
+            raise ValueError("profile, owner and positive lease_seconds are required")
+        now_ts = int(now_ts)
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("long_term_state")
+                query = Query()
+                row = table.get(query.profile_id == profile_id)
+                if (
+                    not row
+                    or row.get("lease_owner") != owner_id
+                    or int(row.get("lease_until") or 0) <= now_ts
+                ):
+                    return False
+                state = dict(row)
+                state.update(
+                    {
+                        "lease_until": now_ts + int(lease_seconds),
+                        "updated_at": now_ts,
+                    }
+                )
+                table.update(state, query.profile_id == profile_id)
+                return True
+            finally:
+                db.close()
+
     def advance_long_term_cursor(
         self,
         profile_id: str,

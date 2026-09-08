@@ -38,6 +38,7 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+from feedsummary_core.long_term.lease import LeaseGuard
 from feedsummary_core.long_term.models import ThreatCluster
 from feedsummary_core.long_term.snapshot_validation import (
     SnapshotValidationError,
@@ -72,7 +73,11 @@ class MapStore(Protocol):
 
 class MapLLM(Protocol):
     async def chat(
-        self, messages: list[dict[str, str]], *, temperature: float = 0.0
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
     ) -> str: ...
 
 
@@ -193,6 +198,7 @@ async def update_cluster_map_snapshot(
     now_ts: int,
     settings: MapSettings | None = None,
     force: bool = False,
+    lease_guard: LeaseGuard | None = None,
 ) -> MapUpdateResult:
     """Generate, validate and atomically persist one bounded cluster snapshot."""
 
@@ -302,6 +308,7 @@ async def update_cluster_map_snapshot(
     raw = await llm.chat(
         messages,
         temperature=float(prompt_package.get("temperature", 0.0)),
+        max_output_tokens=settings.max_output_tokens,
     )
     repair_attempted = False
     try:
@@ -337,7 +344,11 @@ async def update_cluster_map_snapshot(
                 ),
             },
         ]
-        repaired = await llm.chat(repair_messages, temperature=0.0)
+        repaired = await llm.chat(
+            repair_messages,
+            temperature=0.0,
+            max_output_tokens=settings.max_output_tokens,
+        )
         payload = validate_cluster_snapshot(
             parse_snapshot_json(repaired),
             profile_id=cluster.profile_id,
@@ -366,6 +377,8 @@ async def update_cluster_map_snapshot(
         latest_snapshot_id=snapshot_id,
         last_summarized_at=int(now_ts),
     )
+    if lease_guard is not None:
+        await lease_guard.ensure_owned()
     if not store.save_cluster_snapshot_revision(
         updated_cluster.to_document(),
         snapshot,

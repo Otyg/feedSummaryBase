@@ -236,6 +236,15 @@ class NewsStore(Protocol):
         lease_seconds: int,
     ) -> bool: ...
 
+    def renew_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool: ...
+
     def release_long_term_lease(self, profile_id: str, owner_id: str) -> bool: ...
 
     def advance_long_term_cursor(

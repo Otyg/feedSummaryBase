@@ -1197,6 +1197,61 @@ class SqliteStore:
         finally:
             con.close()
 
+    def renew_long_term_lease(
+        self,
+        profile_id: str,
+        owner_id: str,
+        *,
+        now_ts: int,
+        lease_seconds: int,
+    ) -> bool:
+        profile_id = str(profile_id or "").strip()
+        owner_id = str(owner_id or "").strip()
+        if not profile_id or not owner_id or lease_seconds < 1:
+            raise ValueError("profile, owner and positive lease_seconds are required")
+        now_ts = _safe_int(now_ts)
+        lease_until = now_ts + int(lease_seconds)
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT doc_json FROM long_term_state WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            state = _json_loads(row["doc_json"]) if row else None
+            if (
+                not isinstance(state, dict)
+                or state.get("lease_owner") != owner_id
+                or _safe_int(state.get("lease_until")) <= now_ts
+            ):
+                con.rollback()
+                return False
+            state.update({"lease_until": lease_until, "updated_at": now_ts})
+            result = con.execute(
+                """
+                UPDATE long_term_state SET lease_until=?, updated_at=?, doc_json=?
+                WHERE profile_id=? AND lease_owner=? AND lease_until>?
+                """,
+                (
+                    lease_until,
+                    now_ts,
+                    _json_dumps(state),
+                    profile_id,
+                    owner_id,
+                    now_ts,
+                ),
+            )
+            if result.rowcount != 1:
+                con.rollback()
+                return False
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
     def advance_long_term_cursor(
         self,
         profile_id: str,
