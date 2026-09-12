@@ -53,7 +53,11 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from feedsummary_core.llm_client import LLMClient, get_client_embedding_model
+from feedsummary_core.llm_client import (
+    LLMClient,
+    get_client_embedding_dimensions,
+    get_client_embedding_model,
+)
 from feedsummary_core.persistence import NewsStore
 from feedsummary_core.summarizer.batching import (
     cached_embedding,
@@ -410,6 +414,7 @@ class TagManager:
             max_concurrency=max(1, embedding_max_concurrency),
             store=self.store,
             embedding_model=get_client_embedding_model(self.llm_client),
+            embedding_dimensions=get_client_embedding_dimensions(self.llm_client),
         )
         add_tag_to_article = getattr(self.store, "add_tag_to_article", None)
         if not callable(add_tag_to_article):
@@ -564,7 +569,7 @@ class TagManager:
     def _find_similar_existing_tags(
         self,
         tag_name: str,
-        similarity_threshold: float = 0.6,
+        similarity_threshold: float = 0.8,
         allow_fuzzy_matching: bool = True,
     ) -> List[Dict[str, Any]]:
         """
@@ -578,7 +583,7 @@ class TagManager:
 
         Args:
             tag_name: Tag name to find matches for
-            similarity_threshold: Minimum similarity score (0.0-1.0)
+            similarity_threshold: Minimum embedding similarity score (0.0-1.0)
             allow_fuzzy_matching: If False, only exact names and configured
                 synonyms are considered. Named entities use this stricter mode
                 so one company or product cannot be replaced by another based
@@ -641,7 +646,9 @@ class TagManager:
                         try:
                             similar_by_embedding = fn(
                                 candidate_embedding,
-                                similarity_threshold=max(0.6, similarity_threshold - 0.1),
+                                similarity_threshold=min(
+                                    1.0, max(0.0, similarity_threshold)
+                                ),
                                 limit=5,
                                 model=get_client_embedding_model(self.llm_client),
                             )
@@ -649,7 +656,9 @@ class TagManager:
                             # Compatibility with external stores implementing the older API.
                             similar_by_embedding = fn(
                                 candidate_embedding,
-                                similarity_threshold=max(0.6, similarity_threshold - 0.1),
+                                similarity_threshold=min(
+                                    1.0, max(0.0, similarity_threshold)
+                                ),
                                 limit=5,
                             )
                         
@@ -671,7 +680,10 @@ class TagManager:
                             )
                             return similar_by_embedding
                         else:
-                            logger.debug(f"[TagMatch] No embedding matches found for '{tag_name}' (threshold={max(0.6, similarity_threshold - 0.1):.2f})")
+                            logger.debug(
+                                f"[TagMatch] No embedding matches found for '{tag_name}' "
+                                f"(threshold={min(1.0, max(0.0, similarity_threshold)):.2f})"
+                            )
                 else:
                     logger.debug(f"[TagMatch] Failed to compute embedding for '{tag_name}'")
             except Exception as e:
@@ -700,7 +712,7 @@ class TagManager:
             # Levenshtein-based similarity (much better than char-set similarity)
             # Only accept matches with very high similarity (0.75+) to avoid false positives
             similarity = self._simple_similarity(tag_lower, tag_name_str)
-            if similarity >= max(0.75, similarity_threshold):
+            if similarity >= 0.75:
                 logger.debug(f"[TagMatch] Levenshtein similarity: '{tag_name}' vs '{tag_name_str}' = {similarity:.3f}")
                 matches.append((tag, similarity))
 
@@ -987,6 +999,7 @@ class TagManager:
         allow_new_tags: bool = True,
         article_text: str = "",
         new_tag_excluded_categories: Optional[Set[str]] = None,
+        embedding_replacement_threshold: float = 0.8,
     ) -> List[Dict[str, Any]]:
         """
         Select the best tags for an article from a list of candidates.
@@ -1004,6 +1017,8 @@ class TagManager:
             article_text: Optional source text used to reject ungrounded entity tags
             new_tag_excluded_categories: Categories in which new tags may not be
                 created. Existing matching tags in those categories remain usable.
+            embedding_replacement_threshold: Minimum embedding similarity for
+                replacing a proposed tag with an existing tag.
 
         Returns:
             List of selected tags as dicts with 'id', 'name', 'category', and optional 'reasoning' fields
@@ -1056,6 +1071,7 @@ class TagManager:
             # Try to find existing similar tags
             similar_tags = self._find_similar_existing_tags(
                 tag_name,
+                similarity_threshold=embedding_replacement_threshold,
                 allow_fuzzy_matching=tag_type != "NAMED_ENTITY",
             )
 
@@ -1178,6 +1194,7 @@ class TagManager:
         allow_new_tags: bool = True,
         article_text: str = "",
         new_tag_excluded_categories: Optional[Set[str]] = None,
+        embedding_replacement_threshold: float = 0.8,
     ) -> List[Dict[str, Any]]:
         """Async selection path that precomputes embeddings before matching."""
         await self._cache_candidate_embeddings(candidate_tags)
@@ -1187,6 +1204,7 @@ class TagManager:
             allow_new_tags=allow_new_tags,
             article_text=article_text,
             new_tag_excluded_categories=new_tag_excluded_categories,
+            embedding_replacement_threshold=embedding_replacement_threshold,
         )
 
     def extract_tags_from_llm_response(self, response: str) -> List[Dict[str, str]]:
@@ -1379,6 +1397,13 @@ class TagManager:
             for category in raw_creation_excluded
             if str(category).strip()
         }
+        embedding_replacement_threshold = min(
+            1.0,
+            max(
+                0.0,
+                float(tagging_config.get("embedding_replacement_threshold", 0.8)),
+            ),
+        )
         available_categories = self.get_all_categories()
         prompt_categories = [
             category
@@ -1432,6 +1457,7 @@ class TagManager:
                 allow_new_tags=True,
                 article_text=text_context,
                 new_tag_excluded_categories=creation_excluded,
+                embedding_replacement_threshold=embedding_replacement_threshold,
             )
 
             # Preserve selection order while applying the maximum only to non-CVE

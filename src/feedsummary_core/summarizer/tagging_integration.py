@@ -46,11 +46,18 @@ from typing import Any, Dict, List, Optional
 
 from feedsummary_core.llm_client import (
     LLMClient,
+    get_client_embedding_dimensions,
     get_client_embedding_model,
     has_local_embedding_provider,
 )
 from feedsummary_core.persistence import NewsStore
-from feedsummary_core.summarizer.batching import ensure_article_embedding
+from feedsummary_core.summarizer.batching import (
+    SIMILARITY_EMBEDDING_INSTRUCTION,
+    SIMILARITY_EMBEDDING_PURPOSE,
+    TAGGING_EMBEDDING_INSTRUCTION,
+    TAGGING_EMBEDDING_PURPOSE,
+    ensure_article_embedding,
+)
 from feedsummary_core.summarizer.tagging import TagManager
 from feedsummary_core.tagging_ml.embedding_sgd import (
     EmbeddingClassifierSettings,
@@ -98,6 +105,66 @@ async def tag_articles(
     tag_manager = TagManager(store, llm_client=llm_client if enable_embedding_matching else None)
     results: Dict[str, List[Dict[str, Any]]] = {}
     ml_tagger: Optional[EmbeddingClassifierTagger] = None
+    tagging_cfg = config.get("tagging", {}) or {}
+    ml_cfg = tagging_cfg.get("ml", {}) or {}
+    batching_cfg = config.get("batching", {}) or {}
+    embed = getattr(llm_client, "embed", None)
+    if callable(embed) and has_local_embedding_provider(config):
+        embedding_model = get_client_embedding_model(llm_client)
+        dimensions = get_client_embedding_dimensions(llm_client)
+        embedding_text_chars = int(
+            ml_cfg.get(
+                "embedding_text_chars",
+                batching_cfg.get("embedding_text_chars", 2000),
+            )
+        )
+        similarity_instruction = str(
+            batching_cfg.get(
+                "embedding_instruction", SIMILARITY_EMBEDDING_INSTRUCTION
+            )
+        ).strip()
+        tagging_instruction = str(
+            ml_cfg.get("embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION)
+        ).strip()
+        semaphore = asyncio.Semaphore(
+            max(
+                1,
+                int(
+                    ml_cfg.get(
+                        "embedding_max_concurrency",
+                        batching_cfg.get("embedding_max_concurrency", 4),
+                    )
+                ),
+            )
+        )
+
+        async def ensure_embeddings(article_id: str) -> None:
+            article = store.get_article(article_id)
+            if not article:
+                return
+            async with semaphore:
+                await ensure_article_embedding(
+                    article,
+                    embed,
+                    store=store,
+                    embedding_model=embedding_model,
+                    embedding_text_chars=embedding_text_chars,
+                    purpose=SIMILARITY_EMBEDDING_PURPOSE,
+                    instruction=similarity_instruction,
+                    dimensions=dimensions,
+                )
+                await ensure_article_embedding(
+                    article,
+                    embed,
+                    store=store,
+                    embedding_model=embedding_model,
+                    embedding_text_chars=embedding_text_chars,
+                    purpose=TAGGING_EMBEDDING_PURPOSE,
+                    instruction=tagging_instruction,
+                    dimensions=dimensions,
+                )
+
+        await asyncio.gather(*(ensure_embeddings(article_id) for article_id in article_ids))
     try:
         ml_settings = EmbeddingClassifierSettings.from_config(
             config,
@@ -147,11 +214,7 @@ async def tag_articles(
 
             ml_tags: List[Dict[str, Any]] = []
             if ml_tagger and not ml_tagger.can_predict(article):
-                embed = getattr(llm_client, "embed", None)
                 if callable(embed):
-                    tagging_cfg = config.get("tagging", {}) or {}
-                    ml_cfg = tagging_cfg.get("ml", {}) or {}
-                    batching_cfg = config.get("batching", {}) or {}
                     await ensure_article_embedding(
                         article,
                         embed,
@@ -163,6 +226,13 @@ async def tag_articles(
                                 batching_cfg.get("embedding_text_chars", 2000),
                             )
                         ),
+                        purpose=TAGGING_EMBEDDING_PURPOSE,
+                        instruction=str(
+                            ml_cfg.get(
+                                "embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION
+                            )
+                        ).strip(),
+                        dimensions=get_client_embedding_dimensions(llm_client),
                     )
             if ml_tagger and ml_tagger.can_predict(article):
                 scores = ml_tagger.score_names(article)
@@ -200,7 +270,7 @@ async def tag_articles(
                         ][:5],
                     )
             elif ml_tagger:
-                vector = article.get("embedding_vector")
+                vector = article.get("tagging_embedding_vector")
                 _log_ml_event(
                     logging.INFO,
                     "ml_tagging.skipped",
@@ -209,7 +279,9 @@ async def tag_articles(
                     expected_embedding_model=ml_tagger.model_metadata.get(
                         "embedding_model"
                     ),
-                    actual_embedding_model=str(article.get("embedding_model") or ""),
+                    actual_embedding_model=str(
+                        article.get("tagging_embedding_model") or ""
+                    ),
                     expected_dimension=ml_tagger.model_metadata.get(
                         "embedding_dimension"
                     ),

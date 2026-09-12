@@ -37,10 +37,16 @@ class FakeStore:
 
 
 class FakeEmbeddingClient:
+    class Config:
+        embedding_model = "test-model"
+        embedding_dimensions = 2
+
+    cfg = Config()
+
     def __init__(self, vectors):
         self.vectors = vectors
 
-    async def embed(self, text):
+    async def embed(self, text, **_kwargs):
         return self.vectors[text]
 
 
