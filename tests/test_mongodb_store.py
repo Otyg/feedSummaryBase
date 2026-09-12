@@ -208,6 +208,22 @@ class MongoDBStoreTests(unittest.TestCase):
         self.assertEqual("embedding-model", tag["embedding_model"])
         self.assertEqual(embedding_source_hash("security"), tag["embedding_source_hash"])
 
+    def test_legacy_article_embedding_path_remains_supported(self):
+        self.store.upsert_article({"id": "legacy-article"})
+
+        self.assertTrue(
+            self.store.update_article_embedding(
+                "legacy-article",
+                [0.5, 0.5],
+                model="legacy-model",
+                source_hash=embedding_source_hash("Legacy content"),
+            )
+        )
+
+        article = self.store.get_article("legacy-article")
+        self.assertEqual([0.5, 0.5], article["embedding_vector"])
+        self.assertEqual("legacy-model", article["embedding_model"])
+
     def test_cleanup_honors_each_retention_window(self):
         now = int(time.time())
         old = now - 100 * 86400

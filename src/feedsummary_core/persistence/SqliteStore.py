@@ -426,13 +426,6 @@ class SqliteStore:
             if not row:
                 return None
             doc = _json_loads(row["doc_json"]) or {}
-            for legacy_field in (
-                "embedding_vector",
-                "embedding_model",
-                "embedding_source_hash",
-                "embedding_updated_at",
-            ):
-                doc.pop(legacy_field, None)
             if "id" not in doc:
                 doc["id"] = str(article_id)
             return doc
@@ -568,7 +561,7 @@ class SqliteStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
-        purpose: str = "similarity",
+        purpose: Optional[str] = None,
         instruction: Optional[str] = None,
     ) -> bool:
         """Persist a purpose-specific embedding for an existing article."""
@@ -577,13 +570,13 @@ class SqliteStore:
         ):
             return False
         normalized = [float(value) for value in embedding_vector]
-        purpose = str(purpose).strip().lower()
-        if purpose not in {"similarity", "tagging"}:
-            raise ValueError(f"Unsupported article embedding purpose: {purpose}")
-        prefix = f"{purpose}_embedding"
         updated_at = _now_ts()
         con = self._connect()
         try:
+            existing_columns = {
+                str(column["name"])
+                for column in con.execute("PRAGMA table_info(articles)").fetchall()
+            }
             row = con.execute(
                 "SELECT doc_json FROM articles WHERE id = ?", (str(article_id),)
             ).fetchone()
@@ -596,39 +589,73 @@ class SqliteStore:
                 "embedding_source_hash",
                 "embedding_updated_at",
             ):
-                doc.pop(legacy_field, None)
-            doc.update(
-                {
-                    f"{prefix}_vector": normalized,
-                    f"{prefix}_model": str(model or ""),
-                    f"{prefix}_source_hash": str(source_hash or ""),
-                    f"{prefix}_instruction": str(instruction or "").strip(),
-                    f"{prefix}_updated_at": updated_at,
-                }
-            )
-            con.execute(
-                f"""
-                UPDATE articles SET
-                    {prefix}_vector = ?, {prefix}_model = ?,
-                    {prefix}_source_hash = ?, {prefix}_instruction = ?,
-                    {prefix}_updated_at = ?, doc_json = ?
-                WHERE id = ?
-                """,
-                (
-                    _json_dumps(normalized),
-                    str(model or ""),
-                    str(source_hash or ""),
-                    str(instruction or "").strip(),
-                    updated_at,
-                    _json_dumps(doc),
-                    str(article_id),
-                ),
-            )
-            existing_columns = {
-                str(column["name"])
-                for column in con.execute("PRAGMA table_info(articles)").fetchall()
-            }
-            if "embedding_vector" in existing_columns:
+                if purpose is not None:
+                    doc.pop(legacy_field, None)
+            if purpose is None:
+                doc.update(
+                    {
+                        "embedding_vector": normalized,
+                        "embedding_model": str(model or ""),
+                        "embedding_source_hash": str(source_hash or ""),
+                        "embedding_updated_at": updated_at,
+                    }
+                )
+                if "embedding_vector" in existing_columns:
+                    con.execute(
+                        """
+                        UPDATE articles SET
+                            embedding_vector = ?, embedding_model = ?,
+                            embedding_source_hash = ?, embedding_updated_at = ?,
+                            doc_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            _json_dumps(normalized),
+                            str(model or ""),
+                            str(source_hash or ""),
+                            updated_at,
+                            _json_dumps(doc),
+                            str(article_id),
+                        ),
+                    )
+                else:
+                    con.execute(
+                        "UPDATE articles SET doc_json = ? WHERE id = ?",
+                        (_json_dumps(doc), str(article_id)),
+                    )
+            else:
+                purpose_name = str(purpose).strip().lower()
+                if purpose_name not in {"similarity", "tagging"}:
+                    raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+                prefix = f"{purpose_name}_embedding"
+                doc.update(
+                    {
+                        f"{prefix}_vector": normalized,
+                        f"{prefix}_model": str(model or ""),
+                        f"{prefix}_source_hash": str(source_hash or ""),
+                        f"{prefix}_instruction": str(instruction or "").strip(),
+                        f"{prefix}_updated_at": updated_at,
+                    }
+                )
+                con.execute(
+                    f"""
+                    UPDATE articles SET
+                        {prefix}_vector = ?, {prefix}_model = ?,
+                        {prefix}_source_hash = ?, {prefix}_instruction = ?,
+                        {prefix}_updated_at = ?, doc_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        _json_dumps(normalized),
+                        str(model or ""),
+                        str(source_hash or ""),
+                        str(instruction or "").strip(),
+                        updated_at,
+                        _json_dumps(doc),
+                        str(article_id),
+                    ),
+                )
+            if purpose is not None and "embedding_vector" in existing_columns:
                 con.execute(
                     """
                     UPDATE articles SET embedding_vector = NULL, embedding_model = NULL,

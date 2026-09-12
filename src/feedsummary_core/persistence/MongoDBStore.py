@@ -106,6 +106,11 @@ def _public_doc(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return result
 
 
+_ASSIGNMENT_OPERATION_FIELD = "last_assignment_operation_id"
+_SNAPSHOT_OPERATION_FIELD = "last_snapshot_operation_id"
+_SNAPSHOT_PENDING_FIELD = "pending_operation_id"
+
+
 class MongoDBStore:
     """MongoDB-backed persistence store with TinyDB/SQLite feature parity."""
 
@@ -332,7 +337,7 @@ class MongoDBStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
-        purpose: str = "similarity",
+        purpose: Optional[str] = None,
         instruction: Optional[str] = None,
     ) -> bool:
         """Persist a purpose-specific embedding for an existing article."""
@@ -342,26 +347,37 @@ class MongoDBStore:
             or not all(isinstance(value, (int, float)) for value in embedding_vector)
         ):
             return False
-        purpose = str(purpose).strip().lower()
-        if purpose not in {"similarity", "tagging"}:
-            raise ValueError(f"Unsupported article embedding purpose: {purpose}")
-        prefix = f"{purpose}_embedding"
+        purpose_name = None if purpose is None else str(purpose).strip().lower()
+        if purpose_name is None:
+            set_fields = {
+                "embedding_vector": [float(value) for value in embedding_vector],
+                "embedding_model": str(model or ""),
+                "embedding_source_hash": str(source_hash or ""),
+                "embedding_updated_at": _now_ts(),
+            }
+            unset_fields: Dict[str, str] = {}
+        else:
+            if purpose_name not in {"similarity", "tagging"}:
+                raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+            prefix = f"{purpose_name}_embedding"
+            set_fields = {
+                f"{prefix}_vector": [float(value) for value in embedding_vector],
+                f"{prefix}_model": str(model or ""),
+                f"{prefix}_source_hash": str(source_hash or ""),
+                f"{prefix}_instruction": str(instruction or "").strip(),
+                f"{prefix}_updated_at": _now_ts(),
+            }
+            unset_fields = {
+                "embedding_vector": "",
+                "embedding_model": "",
+                "embedding_source_hash": "",
+                "embedding_updated_at": "",
+            }
         result = self.db.articles.update_one(
             {"_id": str(article_id)},
             {
-                "$set": {
-                    f"{prefix}_vector": [float(value) for value in embedding_vector],
-                    f"{prefix}_model": str(model or ""),
-                    f"{prefix}_source_hash": str(source_hash or ""),
-                    f"{prefix}_instruction": str(instruction or "").strip(),
-                    f"{prefix}_updated_at": _now_ts(),
-                },
-                "$unset": {
-                    "embedding_vector": "",
-                    "embedding_model": "",
-                    "embedding_source_hash": "",
-                    "embedding_updated_at": "",
-                },
+                "$set": set_fields,
+                "$unset": unset_fields,
             },
         )
         return result.matched_count > 0
@@ -723,6 +739,7 @@ class MongoDBStore:
     def _apply_cluster_assignment(self, operation: Dict[str, Any]) -> bool:
         cluster = dict(operation["cluster"])
         membership = dict(operation["membership"])
+        operation_id = str(operation["id"])
         expected = operation.get("expected_membership_revision")
         cluster["id"] = str(cluster["id"])
         cluster["_id"] = cluster["id"]
@@ -737,21 +754,29 @@ class MongoDBStore:
             return False
 
         existing_cluster = self.db.threat_clusters.find_one(
-            {"_id": cluster["_id"]}, {"membership_revision": 1}
+            {"_id": cluster["_id"]},
+            {"membership_revision": 1, _ASSIGNMENT_OPERATION_FIELD: 1},
         )
         target_revision = int(cluster["membership_revision"])
         if existing_cluster is None:
             if expected is not None:
                 return False
             try:
+                cluster[_ASSIGNMENT_OPERATION_FIELD] = operation_id
                 self.db.threat_clusters.insert_one(cluster)
             except DuplicateKeyError:
                 return False
         else:
             current_revision = int(existing_cluster.get("membership_revision") or 0)
-            if current_revision != target_revision:
+            if current_revision == target_revision:
+                if existing_membership is None and str(
+                    existing_cluster.get(_ASSIGNMENT_OPERATION_FIELD) or ""
+                ) != operation_id:
+                    return False
+            else:
                 if expected is None or current_revision != int(expected):
                     return False
+                cluster[_ASSIGNMENT_OPERATION_FIELD] = operation_id
                 result = self.db.threat_clusters.replace_one(
                     {"_id": cluster["_id"], "membership_revision": int(expected)},
                     cluster,
@@ -1211,13 +1236,19 @@ class MongoDBStore:
     def _apply_snapshot_revision(self, operation: Dict[str, Any]) -> bool:
         cluster = dict(operation["cluster"])
         snapshot = dict(operation["snapshot"])
+        operation_id = str(operation["id"])
         expected_membership = int(operation["expected_membership_revision"])
         expected_summarized = int(operation["expected_summarized_revision"])
         cluster["_id"] = str(cluster["id"])
         snapshot["_id"] = str(snapshot["id"])
         current = self.db.threat_clusters.find_one(
             {"_id": cluster["_id"]},
-            {"membership_revision": 1, "summarized_revision": 1},
+            {
+                "membership_revision": 1,
+                "summarized_revision": 1,
+                "latest_snapshot_id": 1,
+                _SNAPSHOT_OPERATION_FIELD: 1,
+            },
         )
         if current is None or int(current.get("membership_revision") or 0) != expected_membership:
             return False
@@ -1239,12 +1270,16 @@ class MongoDBStore:
         )
         if existing_snapshot is None:
             try:
+                snapshot[_SNAPSHOT_PENDING_FIELD] = operation_id
                 self.db.threat_cluster_snapshots.insert_one(snapshot)
+                existing_snapshot = snapshot
             except DuplicateKeyError:
                 return False
         elif str(existing_snapshot.get("_id")) != snapshot["_id"]:
             return False
+        snapshot_pending = str(existing_snapshot.get(_SNAPSHOT_PENDING_FIELD) or "")
         if current_summarized != target_summarized:
+            cluster[_SNAPSHOT_OPERATION_FIELD] = operation_id
             cluster_filter: Dict[str, Any] = {
                 "_id": cluster["_id"],
                 "membership_revision": expected_membership,
@@ -1259,6 +1294,20 @@ class MongoDBStore:
             result = self.db.threat_clusters.replace_one(
                 cluster_filter,
                 cluster,
+            )
+            if result.matched_count < 1:
+                return False
+        else:
+            if str(current.get("latest_snapshot_id") or "") != snapshot["_id"]:
+                return False
+            if snapshot_pending and snapshot_pending != operation_id:
+                return False
+            if snapshot_pending and str(current.get(_SNAPSHOT_OPERATION_FIELD) or "") != operation_id:
+                return False
+        if snapshot_pending:
+            result = self.db.threat_cluster_snapshots.update_one(
+                {"_id": snapshot["_id"], _SNAPSHOT_PENDING_FIELD: snapshot_pending},
+                {"$unset": {_SNAPSHOT_PENDING_FIELD: ""}},
             )
             if result.matched_count < 1:
                 return False
@@ -1332,7 +1381,10 @@ class MongoDBStore:
         cluster_id: Optional[str] = None,
         limit: int = 1000,
     ) -> List[Dict[str, Any]]:
-        query: Dict[str, Any] = {"profile_id": str(profile_id)}
+        query: Dict[str, Any] = {
+            "profile_id": str(profile_id),
+            _SNAPSHOT_PENDING_FIELD: {"$exists": False},
+        }
         if cluster_id is not None:
             query["cluster_id"] = str(cluster_id)
         cursor = (
@@ -1344,7 +1396,9 @@ class MongoDBStore:
 
     def get_cluster_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
         return _public_doc(
-            self.db.threat_cluster_snapshots.find_one({"_id": str(snapshot_id)})
+            self.db.threat_cluster_snapshots.find_one(
+                {"_id": str(snapshot_id), _SNAPSHOT_PENDING_FIELD: {"$exists": False}}
+            )
         )
 
     def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool:

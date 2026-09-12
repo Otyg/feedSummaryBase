@@ -58,6 +58,9 @@ from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_ta
 logger = logging.getLogger(__name__)
 _LONG_TERM_LOCKS: Dict[str, threading.Lock] = {}
 _LONG_TERM_LOCKS_GUARD = threading.Lock()
+_ASSIGNMENT_OPERATION_FIELD = "last_assignment_operation_id"
+_SNAPSHOT_OPERATION_FIELD = "last_snapshot_operation_id"
+_SNAPSHOT_PENDING_FIELD = "pending_operation_id"
 
 try:
     import fcntl
@@ -123,7 +126,7 @@ class TinyDBStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
-        purpose: str = "similarity",
+        purpose: Optional[str] = None,
         instruction: Optional[str] = None,
     ) -> bool:
         """Persist a purpose-specific embedding for an existing article."""
@@ -131,36 +134,45 @@ class TinyDBStore:
             isinstance(value, (int, float)) for value in embedding_vector
         ):
             return False
-        purpose = str(purpose).strip().lower()
-        if purpose not in {"similarity", "tagging"}:
-            raise ValueError(f"Unsupported article embedding purpose: {purpose}")
-        prefix = f"{purpose}_embedding"
-        db = self._db()
-        try:
-            A = Query()
-            updated = db.table("articles").update(
-                {
-                    f"{prefix}_vector": [float(value) for value in embedding_vector],
-                    f"{prefix}_model": str(model or ""),
-                    f"{prefix}_source_hash": str(source_hash or ""),
-                    f"{prefix}_instruction": str(instruction or "").strip(),
-                    f"{prefix}_updated_at": int(time.time()),
-                },
-                A.id == str(article_id),
-            )
-            for legacy_field in (
-                "embedding_vector",
-                "embedding_model",
-                "embedding_source_hash",
-                "embedding_updated_at",
-            ):
-                db.table("articles").update(
-                    delete_field(legacy_field),
-                    (A.id == str(article_id)) & A[legacy_field].exists(),
-                )
-            return bool(updated)
-        finally:
-            db.close()
+        normalized = [float(value) for value in embedding_vector]
+        purpose_name = None if purpose is None else str(purpose).strip().lower()
+        if purpose_name is None:
+            fields = {
+                "embedding_vector": normalized,
+                "embedding_model": str(model or ""),
+                "embedding_source_hash": str(source_hash or ""),
+                "embedding_updated_at": int(time.time()),
+            }
+        else:
+            if purpose_name not in {"similarity", "tagging"}:
+                raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+            prefix = f"{purpose_name}_embedding"
+            fields = {
+                f"{prefix}_vector": normalized,
+                f"{prefix}_model": str(model or ""),
+                f"{prefix}_source_hash": str(source_hash or ""),
+                f"{prefix}_instruction": str(instruction or "").strip(),
+                f"{prefix}_updated_at": int(time.time()),
+            }
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                A = Query()
+                updated = db.table("articles").update(fields, A.id == str(article_id))
+                if purpose_name is not None:
+                    for legacy_field in (
+                        "embedding_vector",
+                        "embedding_model",
+                        "embedding_source_hash",
+                        "embedding_updated_at",
+                    ):
+                        db.table("articles").update(
+                            delete_field(legacy_field),
+                            (A.id == str(article_id)) & A[legacy_field].exists(),
+                        )
+                return bool(updated)
+            finally:
+                db.close()
 
     def list_articles(self, limit: int = 2000) -> List[Dict[str, Any]]:
         """
@@ -745,6 +757,7 @@ class TinyDBStore:
     def _apply_cluster_assignment(db: TinyDB, operation: Dict[str, Any]) -> bool:
         cluster = dict(operation["cluster"])
         membership = dict(operation["membership"])
+        operation_id = str(operation["id"])
         expected = operation.get("expected_membership_revision")
         cluster_table = db.table("threat_clusters")
         membership_table = db.table("threat_cluster_memberships")
@@ -764,14 +777,19 @@ class TinyDBStore:
         if existing_cluster is None:
             if expected is not None:
                 return False
+            cluster[_ASSIGNMENT_OPERATION_FIELD] = operation_id
             cluster_table.insert(cluster)
         else:
             current_revision = int(existing_cluster.get("membership_revision") or 0)
             if current_revision == target_revision:
-                pass
+                if existing_membership is None and str(
+                    existing_cluster.get(_ASSIGNMENT_OPERATION_FIELD) or ""
+                ) != operation_id:
+                    return False
             elif expected is None or current_revision != int(expected):
                 return False
             else:
+                cluster[_ASSIGNMENT_OPERATION_FIELD] = operation_id
 
                 def replace_document(row):
                     row.clear()
@@ -1230,6 +1248,7 @@ class TinyDBStore:
     def _apply_snapshot_revision(db: TinyDB, operation: Dict[str, Any]) -> bool:
         cluster = dict(operation["cluster"])
         snapshot = dict(operation["snapshot"])
+        operation_id = str(operation["id"])
         expected_membership = int(operation["expected_membership_revision"])
         expected_summarized = int(operation["expected_summarized_revision"])
         query = Query()
@@ -1250,16 +1269,34 @@ class TinyDBStore:
         )
         existing_snapshot = snapshot_table.get(snapshot_match)
         if existing_snapshot is None:
-            snapshot_table.insert(snapshot)
+            pending_snapshot = dict(snapshot)
+            pending_snapshot[_SNAPSHOT_PENDING_FIELD] = operation_id
+            snapshot_table.insert(pending_snapshot)
+            existing_snapshot = pending_snapshot
         elif str(existing_snapshot.get("id")) != str(snapshot["id"]):
             return False
+        snapshot_pending = str(existing_snapshot.get(_SNAPSHOT_PENDING_FIELD) or "")
         if current_summarized != target_summarized:
+            cluster[_SNAPSHOT_OPERATION_FIELD] = operation_id
 
             def replace_document(row):
                 row.clear()
                 row.update(cluster)
 
             cluster_table.update(replace_document, cluster_match)
+        else:
+            if str(current.get("latest_snapshot_id") or "") != str(snapshot["id"]):
+                return False
+            if snapshot_pending and snapshot_pending != operation_id:
+                return False
+            if snapshot_pending and str(current.get(_SNAPSHOT_OPERATION_FIELD) or "") != operation_id:
+                return False
+        if snapshot_pending:
+            snapshot_table.update(
+                delete_field(_SNAPSHOT_PENDING_FIELD),
+                (query.id == str(snapshot["id"]))
+                & (query[_SNAPSHOT_PENDING_FIELD] == snapshot_pending),
+            )
         return True
 
     def save_cluster_snapshot_revision(
@@ -1335,15 +1372,17 @@ class TinyDBStore:
         return self._list_long_term_docs(
             "threat_cluster_snapshots",
             lambda row: row.get("profile_id") == str(profile_id)
+            and not str(row.get(_SNAPSHOT_PENDING_FIELD) or "").strip()
             and (cluster_id is None or row.get("cluster_id") == str(cluster_id)),
             lambda row: (-int(row.get("created_at") or 0), str(row.get("id") or "")),
             limit,
         )
 
     def get_cluster_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
-        return self._get_long_term_doc(
-            "threat_cluster_snapshots", str(snapshot_id)
-        )
+        row = self._get_long_term_doc("threat_cluster_snapshots", str(snapshot_id))
+        if row and str(row.get(_SNAPSHOT_PENDING_FIELD) or "").strip():
+            return None
+        return row
 
     def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool:
         doc = dict(report_doc or {})
@@ -1467,7 +1506,9 @@ class TinyDBStore:
         db.close()
         return rows[0] if rows else None
 
-    def _run_long_term_cleanup(self, *, cutoff: int) -> Dict[str, int]:
+    def _run_long_term_cleanup(
+        self, *, cutoff: int, db: Optional[TinyDB] = None
+    ) -> Dict[str, int]:
         """Remove expired long-term history while preserving live provenance."""
 
         removed = {
@@ -1478,107 +1519,98 @@ class TinyDBStore:
             "long_term_runs": 0,
             "long_term_quarantine": 0,
         }
-        with _long_term_file_lock(self.path):
+        managed_db = db is None
+        if db is None:
             db = self._db()
-            try:
-                reports = db.table("threat_landscape_reports")
-                retained_snapshot_ids = {
-                    str(snapshot_id)
-                    for report in reports
-                    if int(report.get("period_end_ts") or 0) >= cutoff
-                    for snapshot_id in report.get("input_snapshot_ids") or []
-                }
-                before = len(reports)
-                reports.remove(
-                    lambda row: int(row.get("period_end_ts") or 0) < cutoff
-                )
-                removed["long_term_reports"] = max(0, before - len(reports))
+        try:
+            reports = db.table("threat_landscape_reports")
+            retained_snapshot_ids = {
+                str(snapshot_id)
+                for report in reports
+                if int(report.get("period_end_ts") or 0) >= cutoff
+                for snapshot_id in report.get("input_snapshot_ids") or []
+            }
+            before = len(reports)
+            reports.remove(lambda row: int(row.get("period_end_ts") or 0) < cutoff)
+            removed["long_term_reports"] = max(0, before - len(reports))
 
-                snapshots = db.table("threat_cluster_snapshots")
-                before = len(snapshots)
-                snapshots.remove(
-                    lambda row: int(row.get("created_at") or 0) < cutoff
-                    and str(row.get("id") or "") not in retained_snapshot_ids
-                )
-                removed["long_term_snapshots"] = max(0, before - len(snapshots))
-                protected_cluster_ids = {
-                    str(row.get("cluster_id") or "") for row in snapshots
-                }
+            snapshots = db.table("threat_cluster_snapshots")
+            before = len(snapshots)
+            snapshots.remove(
+                lambda row: int(row.get("created_at") or 0) < cutoff
+                and str(row.get("id") or "") not in retained_snapshot_ids
+            )
+            removed["long_term_snapshots"] = max(0, before - len(snapshots))
+            protected_cluster_ids = {
+                str(row.get("cluster_id") or "") for row in snapshots
+            }
+            protected_cluster_ids.update(
+                str(row.get("cluster", {}).get("id") or "")
+                for row in db.table("long_term_snapshot_journal")
+                if isinstance(row.get("cluster"), dict)
+            )
+            protected_cluster_ids.update(
+                str(row.get("cluster", {}).get("id") or "")
+                for row in db.table("long_term_assignment_journal")
+                if isinstance(row.get("cluster"), dict)
+            )
+            for row in db.table("long_term_cluster_reconciliations"):
                 protected_cluster_ids.update(
-                    str(row.get("cluster", {}).get("id") or "")
-                    for row in db.table("long_term_snapshot_journal")
-                    if isinstance(row.get("cluster"), dict)
+                    str(value) for value in row.get("source_cluster_ids") or []
                 )
+            for row in db.table("long_term_reconciliation_journal"):
                 protected_cluster_ids.update(
-                    str(row.get("cluster", {}).get("id") or "")
-                    for row in db.table("long_term_assignment_journal")
-                    if isinstance(row.get("cluster"), dict)
+                    str(value) for value in row.get("source_cluster_ids") or []
                 )
-                for row in db.table("long_term_cluster_reconciliations"):
+            for table_name in (
+                "long_term_cluster_membership_edits",
+                "long_term_membership_edit_journal",
+            ):
+                for row in db.table(table_name):
                     protected_cluster_ids.update(
-                        str(value) for value in row.get("source_cluster_ids") or []
+                        str(row.get(field) or "")
+                        for field in ("source_cluster_id", "target_cluster_id")
                     )
-                for row in db.table("long_term_reconciliation_journal"):
-                    protected_cluster_ids.update(
-                        str(value) for value in row.get("source_cluster_ids") or []
-                    )
-                for table_name in (
-                    "long_term_cluster_membership_edits",
-                    "long_term_membership_edit_journal",
-                ):
-                    for row in db.table(table_name):
-                        protected_cluster_ids.update(
-                            str(row.get(field) or "")
-                            for field in ("source_cluster_id", "target_cluster_id")
-                        )
-                protected_cluster_ids.discard("")
+            protected_cluster_ids.discard("")
 
-                clusters = db.table("threat_clusters")
-                expired_cluster_ids = {
-                    str(row.get("id") or "")
-                    for row in clusters
-                    if str(row.get("status") or "") == "closed"
-                    and int(row.get("last_seen_ts") or 0) < cutoff
-                    and str(row.get("id") or "") not in protected_cluster_ids
-                }
-                expired_cluster_ids.discard("")
-                before = len(clusters)
-                clusters.remove(
-                    lambda row: str(row.get("id") or "") in expired_cluster_ids
-                )
-                removed["long_term_clusters"] = max(0, before - len(clusters))
+            clusters = db.table("threat_clusters")
+            expired_cluster_ids = {
+                str(row.get("id") or "")
+                for row in clusters
+                if str(row.get("status") or "") == "closed"
+                and int(row.get("last_seen_ts") or 0) < cutoff
+                and str(row.get("id") or "") not in protected_cluster_ids
+            }
+            expired_cluster_ids.discard("")
+            before = len(clusters)
+            clusters.remove(lambda row: str(row.get("id") or "") in expired_cluster_ids)
+            removed["long_term_clusters"] = max(0, before - len(clusters))
 
-                memberships = db.table("threat_cluster_memberships")
-                before = len(memberships)
-                memberships.remove(
-                    lambda row: str(row.get("cluster_id") or "")
-                    in expired_cluster_ids
-                )
-                removed["long_term_memberships"] = max(
-                    0, before - len(memberships)
-                )
+            memberships = db.table("threat_cluster_memberships")
+            before = len(memberships)
+            memberships.remove(
+                lambda row: str(row.get("cluster_id") or "") in expired_cluster_ids
+            )
+            removed["long_term_memberships"] = max(0, before - len(memberships))
 
-                runs = db.table("long_term_runs")
-                before = len(runs)
-                runs.remove(
-                    lambda row: str(row.get("status") or "")
-                    in {"done", "failed", "blocked"}
-                    and int(row.get("finished_at") or row.get("started_at") or 0)
-                    < cutoff
-                )
-                removed["long_term_runs"] = max(0, before - len(runs))
+            runs = db.table("long_term_runs")
+            before = len(runs)
+            runs.remove(
+                lambda row: str(row.get("status") or "") in {"done", "failed", "blocked"}
+                and int(row.get("finished_at") or row.get("started_at") or 0) < cutoff
+            )
+            removed["long_term_runs"] = max(0, before - len(runs))
 
-                quarantine = db.table("long_term_article_quarantine")
-                before = len(quarantine)
-                quarantine.remove(
-                    lambda row: str(row.get("status") or "") == "resolved"
-                    and int(row.get("resolved_at") or 0) < cutoff
-                )
-                removed["long_term_quarantine"] = max(
-                    0, before - len(quarantine)
-                )
-                return removed
-            finally:
+            quarantine = db.table("long_term_article_quarantine")
+            before = len(quarantine)
+            quarantine.remove(
+                lambda row: str(row.get("status") or "") == "resolved"
+                and int(row.get("resolved_at") or 0) < cutoff
+            )
+            removed["long_term_quarantine"] = max(0, before - len(quarantine))
+            return removed
+        finally:
+            if managed_db:
                 db.close()
 
     def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]:
@@ -1601,64 +1633,65 @@ class TinyDBStore:
         # TinyDB import here to avoid dependency if user doesn't use it
         from tinydb import TinyDB
 
-        db = TinyDB(self.path)
-        try:
-            # Articles
-            at = db.table("articles")
-            # remove uses a predicate for each row
-            before = len(at)
-            at.remove(
-                lambda r: int(r.get("published_ts") or r.get("fetched_at") or 0) < cut_articles
-            )
-            removed["articles"] = max(0, before - len(at))
+        with _long_term_file_lock(self.path):
+            db = TinyDB(self.path)
+            try:
+                # Articles
+                at = db.table("articles")
+                # remove uses a predicate for each row
+                before = len(at)
+                at.remove(
+                    lambda r: int(r.get("published_ts") or r.get("fetched_at") or 0)
+                    < cut_articles
+                )
+                removed["articles"] = max(0, before - len(at))
 
-            # Temp summaries
-            tt = db.table("temp_summaries")
-            before = len(tt)
-            tt.remove(lambda r: int(r.get("created_at") or 0) < cut_temp)
-            removed["temp_summaries"] = max(0, before - len(tt))
+                # Temp summaries
+                tt = db.table("temp_summaries")
+                before = len(tt)
+                tt.remove(lambda r: int(r.get("created_at") or 0) < cut_temp)
+                removed["temp_summaries"] = max(0, before - len(tt))
 
-            # Jobs (only done/failed)
-            jt = db.table("jobs")
-            before = len(jt)
+                # Jobs (only done/failed)
+                jt = db.table("jobs")
+                before = len(jt)
 
-            def job_old_finished(r: Dict[str, Any]) -> bool:
-                ts = int(r.get("finished_at") or r.get("created_at") or 0)
-                st = str(r.get("status") or "")
-                return ts < cut_jobs and st in ("done", "failed")
+                def job_old_finished(r: Dict[str, Any]) -> bool:
+                    ts = int(r.get("finished_at") or r.get("created_at") or 0)
+                    st = str(r.get("status") or "")
+                    return ts < cut_jobs and st in ("done", "failed")
 
-            jt.remove(job_old_finished)
-            removed["jobs"] = max(0, before - len(jt))
+                jt.remove(job_old_finished)
+                removed["jobs"] = max(0, before - len(jt))
 
-            # Summary docs
-            sd = db.table("summary_docs")
-            before = len(sd)
+                # Summary docs
+                sd = db.table("summary_docs")
+                before = len(sd)
 
-            def sum_should_remove(r: Dict[str, Any]) -> bool:
-                created = int(r.get("created") or 0)
-                # we need prompt_package; in tinydb it is stored inside the doc itself
-                pkg = ""
-                sel = r.get("selection")
-                if isinstance(sel, dict):
-                    pkg = str(sel.get("prompt_package") or "").lower().strip()
-                kind = "other"
-                if "weekly" in pkg:
-                    kind = "weekly"
-                elif "daily" in pkg:
-                    kind = "daily"
+                def sum_should_remove(r: Dict[str, Any]) -> bool:
+                    created = int(r.get("created") or 0)
+                    # we need prompt_package; in tinydb it is stored inside the doc itself
+                    pkg = ""
+                    sel = r.get("selection")
+                    if isinstance(sel, dict):
+                        pkg = str(sel.get("prompt_package") or "").lower().strip()
+                    kind = "other"
+                    if "weekly" in pkg:
+                        kind = "weekly"
+                    elif "daily" in pkg:
+                        kind = "daily"
 
-                if kind == "daily":
-                    return created < cut_daily
-                if kind == "weekly":
+                    if kind == "daily":
+                        return created < cut_daily
+                    if kind == "weekly":
+                        return created < cut_weekly
                     return created < cut_weekly
-                return created < cut_weekly
 
-            sd.remove(sum_should_remove)
-            removed["summary_docs"] = max(0, before - len(sd))
-
-        finally:
-            db.close()
-        removed.update(self._run_long_term_cleanup(cutoff=cut_long_term))
+                sd.remove(sum_should_remove)
+                removed["summary_docs"] = max(0, before - len(sd))
+                removed.update(self._run_long_term_cleanup(cutoff=cut_long_term, db=db))
+            finally:
+                db.close()
         return removed
 
     # ============================================================================
