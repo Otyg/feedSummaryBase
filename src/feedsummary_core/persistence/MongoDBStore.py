@@ -1307,6 +1307,11 @@ class MongoDBStore:
                 return False
             if snapshot_pending and str(current.get(_SNAPSHOT_OPERATION_FIELD) or "") != operation_id:
                 return False
+            if str(current.get(_SNAPSHOT_OPERATION_FIELD) or "") != operation_id:
+                self.db.threat_clusters.update_one(
+                    {"_id": cluster["_id"]},
+                    {"$set": {_SNAPSHOT_OPERATION_FIELD: operation_id}},
+                )
         if snapshot_pending:
             result = self.db.threat_cluster_snapshots.update_one(
                 {"_id": snapshot["_id"], _SNAPSHOT_PENDING_FIELD: snapshot_pending},

@@ -1305,6 +1305,11 @@ class TinyDBStore:
                 return False
             if snapshot_pending and str(current.get(_SNAPSHOT_OPERATION_FIELD) or "") != operation_id:
                 return False
+            if str(current.get(_SNAPSHOT_OPERATION_FIELD) or "") != operation_id:
+                cluster_table.update(
+                    {_SNAPSHOT_OPERATION_FIELD: operation_id},
+                    cluster_match,
+                )
         if snapshot_pending:
             snapshot_table.update(
                 delete_field(_SNAPSHOT_PENDING_FIELD),
