@@ -114,10 +114,13 @@ class TinyDBStore:
         return res[0] if res else None
 
     def upsert_article(self, article_doc: Dict[str, Any]) -> None:
-        db = self._db()
-        A = Query()
-        db.table("articles").upsert(article_doc, A.id == article_doc["id"])
-        db.close()
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                A = Query()
+                db.table("articles").upsert(article_doc, A.id == article_doc["id"])
+            finally:
+                db.close()
 
     def update_article_embedding(
         self,
@@ -252,12 +255,18 @@ class TinyDBStore:
         """
         Legacy: Behålls för bakåtkomp, men pipeline använder den inte längre.
         """
-        db = self._db()
-        A = Query()
-        ts = int(time.time())
-        for aid in article_ids:
-            db.table("articles").update({"summarized": True, "summarized_at": ts}, A.id == aid)
-        db.close()
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                A = Query()
+                ts = int(time.time())
+                for aid in article_ids:
+                    db.table("articles").update(
+                        {"summarized": True, "summarized_at": ts},
+                        A.id == aid,
+                    )
+            finally:
+                db.close()
 
     def save_summary_doc(self, summary_doc: Dict[str, Any]) -> Any:
         db = self._db()
