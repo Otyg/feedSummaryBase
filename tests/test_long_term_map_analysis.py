@@ -27,8 +27,15 @@ class FakeLLM:
         self.responses = list(responses)
         self.calls = []
 
-    async def chat(self, messages, *, temperature=0.0, max_output_tokens=None):
-        self.calls.append((messages, temperature, max_output_tokens))
+    async def chat(
+        self,
+        messages,
+        *,
+        temperature=0.0,
+        max_output_tokens=None,
+        response_format=None,
+    ):
+        self.calls.append((messages, temperature, max_output_tokens, response_format))
         return self.responses.pop(0)
 
 
@@ -158,6 +165,48 @@ class LongTermMapAnalysisTests(unittest.TestCase):
             ),
         )
 
+    def test_duplicate_legacy_reconciliation_revisions_are_chunked(self):
+        original_list_memberships = self.store.list_cluster_memberships
+
+        def duplicate_revisions(cluster_id, *, limit=10000):
+            return [
+                {**row, "cluster_membership_revision": 3}
+                for row in original_list_memberships(cluster_id, limit=limit)
+            ]
+
+        llm = FakeLLM([self.valid_response(2), self.valid_response(3)])
+        settings = MapSettings(min_pending_articles=1, max_articles_per_call=2)
+        with patch.object(
+            self.store,
+            "list_cluster_memberships",
+            side_effect=duplicate_revisions,
+        ):
+            first = asyncio.run(
+                update_cluster_map_snapshot(
+                    self.store,
+                    llm,
+                    cluster_id=self.cluster["id"],
+                    prompt_package=self.prompt,
+                    now_ts=600,
+                    settings=settings,
+                )
+            )
+            second = asyncio.run(
+                update_cluster_map_snapshot(
+                    self.store,
+                    llm,
+                    cluster_id=self.cluster["id"],
+                    prompt_package=self.prompt,
+                    now_ts=700,
+                    settings=settings,
+                )
+            )
+
+        self.assertEqual(("article-1", "article-2"), first.input_article_ids)
+        self.assertEqual(2, first.summarized_revision)
+        self.assertEqual(("article-3",), second.input_article_ids)
+        self.assertEqual(3, second.summarized_revision)
+
     def test_chunk_cannot_cite_an_article_from_a_later_revision(self):
         payload = json.loads(self.valid_response(2))
         payload["facts"][0]["evidence_article_ids"] = ["article-3"]
@@ -221,6 +270,62 @@ class LongTermMapAnalysisTests(unittest.TestCase):
         self.assertTrue(result.repair_attempted)
         self.assertEqual(2, len(llm.calls))
         self.assertEqual([1200, 1200], [call[2] for call in llm.calls])
+        self.assertEqual(
+            [self.prompt["output_schema"], self.prompt["output_schema"]],
+            [call[3] for call in llm.calls],
+        )
+
+    def test_blank_uncertainties_are_removed_without_format_repair(self):
+        payload = json.loads(self.valid_response(3))
+        payload["uncertainties"] = [
+            None,
+            "",
+            "   ",
+            {},
+            [],
+            {"detail": "Attribution is not confirmed."},
+        ]
+        llm = FakeLLM([json.dumps(payload)])
+
+        result = asyncio.run(
+            update_cluster_map_snapshot(
+                self.store,
+                llm,
+                cluster_id=self.cluster["id"],
+                prompt_package=self.prompt,
+                now_ts=600,
+                settings=MapSettings(min_pending_articles=1),
+            )
+        )
+
+        self.assertFalse(result.repair_attempted)
+        self.assertEqual(1, len(llm.calls))
+        snapshots = self.store.list_cluster_snapshots(
+            "profile", cluster_id=self.cluster["id"]
+        )
+        self.assertEqual(
+            ['{"detail": "Attribution is not confirmed."}'],
+            snapshots[0]["payload"]["uncertainties"],
+        )
+
+    def test_failed_repair_preserves_both_validation_errors(self):
+        llm = FakeLLM(["bad", "still bad"])
+
+        with self.assertRaisesRegex(
+            SnapshotValidationError,
+            r"initial response failed validation \(3 chars\).*"
+            r"format repair failed \(9 chars\)",
+        ):
+            asyncio.run(
+                update_cluster_map_snapshot(
+                    self.store,
+                    llm,
+                    cluster_id=self.cluster["id"],
+                    prompt_package=self.prompt,
+                    now_ts=600,
+                    settings=MapSettings(min_pending_articles=1),
+                )
+            )
 
     def test_configured_output_limit_matches_reserved_budget(self):
         llm = FakeLLM([self.valid_response(3)])
@@ -369,6 +474,38 @@ class LongTermMapAnalysisTests(unittest.TestCase):
         self.assertEqual(1200, primary.calls[0][1]["max_output_tokens"])
         self.assertEqual(1200, fallback.calls[0][1]["max_output_tokens"])
         self.assertEqual([], self.store.list_cluster_snapshots("profile"))
+
+    def test_failed_map_response_can_restart_from_same_revision(self):
+        with self.assertRaises(SnapshotValidationError):
+            asyncio.run(
+                update_cluster_map_snapshot(
+                    self.store,
+                    FakeLLM(["not-json"]),
+                    cluster_id=self.cluster["id"],
+                    prompt_package=self.prompt,
+                    now_ts=600,
+                    settings=MapSettings(
+                        min_pending_articles=1,
+                        format_repair_attempts=0,
+                    ),
+                )
+            )
+
+        self.assertEqual(0, self.store.get_threat_cluster(self.cluster["id"])["summarized_revision"])
+        resumed = asyncio.run(
+            update_cluster_map_snapshot(
+                self.store,
+                FakeLLM([self.valid_response(3)]),
+                cluster_id=self.cluster["id"],
+                prompt_package=self.prompt,
+                now_ts=601,
+                settings=MapSettings(min_pending_articles=1),
+            )
+        )
+
+        self.assertEqual("saved", resumed.action)
+        self.assertEqual(3, resumed.summarized_revision)
+        self.assertEqual(1, len(self.store.list_cluster_snapshots("profile")))
 
 
 if __name__ == "__main__":

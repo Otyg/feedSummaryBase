@@ -224,6 +224,7 @@ class OllamaCloudClient:
         *,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
     ) -> str:
         """
         Returnerar en enda textsträng.
@@ -247,12 +248,15 @@ class OllamaCloudClient:
                 payload_options["num_predict"] = int(max_output_tokens)
 
             try:
-                resp = await self._client.chat(
-                    model=self.cfg.model,
-                    messages=messages,
-                    stream=False,
-                    options=payload_options,
-                )
+                request_options: Dict[str, Any] = {
+                    "model": self.cfg.model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": payload_options,
+                }
+                if response_format is not None:
+                    request_options["format"] = response_format
+                resp = await self._client.chat(**request_options)
                 if isinstance(resp, dict):
                     return (resp.get("message") or {}).get("content", "") or ""
                 return getattr(resp.message, "content", "") or ""

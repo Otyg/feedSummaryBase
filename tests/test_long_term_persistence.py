@@ -1,14 +1,21 @@
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from tinydb import TinyDB
+from tinydb import Query, TinyDB
 
 try:
     import mongomock
 except ImportError:  # pragma: no cover - optional test dependency
     mongomock = None
 
+from feedsummary_core.long_term import (
+    build_cluster_membership_edit,
+    build_cluster_merge_operation,
+    build_cluster_review_merge_operation,
+    build_cluster_review_resolution,
+)
 from feedsummary_core.persistence import (
     CleanupPolicy,
     MongoDBStore,
@@ -189,6 +196,159 @@ class LongTermStoreContract:
             ],
         )
 
+    def test_cluster_listing_supports_pagination_without_vectors(self):
+        older = {**self.cluster_doc(), "id": "cluster-older"}
+        newer = {
+            **self.cluster_doc(),
+            "id": "cluster-newer",
+            "last_seen_ts": 1100,
+        }
+        self.assertTrue(self.store.save_threat_cluster(older))
+        self.assertTrue(self.store.save_threat_cluster(newer))
+
+        rows = self.store.list_threat_clusters(
+            "profile",
+            limit=1,
+            offset=1,
+            include_vectors=False,
+        )
+
+        self.assertEqual(["cluster-older"], [row["id"] for row in rows])
+        self.assertNotIn("centroid", rows[0])
+        self.assertNotIn("vector_sum", rows[0])
+
+    def test_cluster_listing_filters_on_minimum_member_count(self):
+        single = {**self.cluster_doc(), "id": "cluster-single", "last_seen_ts": 1200}
+        multiple = {
+            **self.cluster_doc(),
+            "id": "cluster-multiple",
+            "member_count": 2,
+            "membership_revision": 2,
+        }
+        self.assertTrue(self.store.save_threat_cluster(single))
+        self.assertTrue(self.store.save_threat_cluster(multiple))
+        rows = self.store.list_threat_clusters(
+            "profile", min_member_count=2, limit=1, include_vectors=False
+        )
+        self.assertEqual(["cluster-multiple"], [row["id"] for row in rows])
+
+    def test_membership_edit_moves_article_atomically_and_is_audited(self):
+        source = {
+            **self.cluster_doc(), "id": "cluster-source-edit",
+            "member_count": 2, "membership_revision": 2,
+            "vector_sum": [1.0, 1.0], "centroid": [0.5, 0.5],
+            "summarized_revision": 2, "latest_snapshot_id": "old-snapshot",
+        }
+        target = {**self.cluster_doc(), "id": "cluster-target-edit"}
+        source_rows = [
+            {"profile_id": "profile", "article_id": "article-stay",
+             "cluster_id": source["id"], "assigned_at": 900, "article_ts": 900,
+             "cluster_membership_revision": 1, "strict_cve_identity": False},
+            {"profile_id": "profile", "article_id": "article-move",
+             "cluster_id": source["id"], "assigned_at": 1000, "article_ts": 1000,
+             "cluster_membership_revision": 2, "strict_cve_identity": False},
+        ]
+        target_rows = [
+            {"profile_id": "profile", "article_id": "article-target",
+             "cluster_id": target["id"], "assigned_at": 950, "article_ts": 950,
+             "cluster_membership_revision": 1, "strict_cve_identity": False}
+        ]
+        self.assertTrue(self.store.save_threat_cluster(source))
+        self.assertTrue(self.store.save_threat_cluster(target))
+        for row in source_rows + target_rows:
+            self.assertTrue(self.store.save_cluster_membership(row))
+        operation = build_cluster_membership_edit(
+            source, source_rows, target_cluster=target,
+            target_memberships=target_rows, article_id="article-move",
+            article={
+                "id": "article-move", "similarity_embedding_vector": [0.0, 1.0],
+                "similarity_embedding_model": "model",
+                "similarity_embedding_instruction": "instruction",
+            },
+            edited_at=1300, edited_by="analyst@example", comment="Same incident.",
+        )
+        self.assertTrue(self.store.apply_cluster_membership_edit(operation))
+        self.assertTrue(self.store.apply_cluster_membership_edit(operation))
+        self.assertEqual(
+            target["id"],
+            self.store.get_cluster_membership("profile", "article-move")["cluster_id"],
+        )
+        self.assertEqual(1, self.store.get_threat_cluster(source["id"])["member_count"])
+        self.assertEqual(2, self.store.get_threat_cluster(target["id"])["member_count"])
+        self.assertIsNone(self.store.get_threat_cluster(source["id"])["latest_snapshot_id"])
+        self.assertEqual(
+            "applied", self.store.get_cluster_membership_edit(operation["id"])["status"]
+        )
+
+    def test_cluster_review_resolution_is_optimistic_and_audited(self):
+        review = {**self.cluster_doc(), "id": "cluster-review", "status": "needs_review"}
+        self.assertTrue(self.store.save_threat_cluster(review))
+        resolution = build_cluster_review_resolution(
+            review,
+            decision="keep_separate",
+            reviewed_at=1200,
+            reviewed_by="analyst@example",
+            comment="Distinct victim and incident window.",
+        )
+
+        self.assertTrue(
+            self.store.resolve_threat_cluster_review(
+                resolution,
+                expected_membership_revision=1,
+            )
+        )
+        self.assertFalse(
+            self.store.resolve_threat_cluster_review(
+                resolution,
+                expected_membership_revision=1,
+            )
+        )
+        stored = self.store.get_threat_cluster("cluster-review")
+        self.assertEqual("active", stored["status"])
+        self.assertEqual("keep_separate", stored["review_decision"])
+        self.assertEqual("analyst@example", stored["reviewed_by"])
+
+    def test_review_merge_preserves_decision_on_tombstone_and_operation(self):
+        target = {**self.cluster_doc(), "id": "cluster-review-target"}
+        review = {
+            **self.cluster_doc(),
+            "id": "cluster-review-source",
+            "status": "needs_review",
+        }
+        memberships = {
+            target["id"]: {
+                "profile_id": "profile",
+                "article_id": "article-review-target",
+                "cluster_id": target["id"],
+                "assigned_at": 1000,
+                "evidence": {"title": "Target event"},
+            },
+            review["id"]: {
+                "profile_id": "profile",
+                "article_id": "article-review-source",
+                "cluster_id": review["id"],
+                "assigned_at": 1001,
+                "evidence": {"title": "Ambiguous event"},
+            },
+        }
+        self.assertTrue(self.store.save_cluster_assignment(target, memberships[target["id"]]))
+        self.assertTrue(self.store.save_cluster_assignment(review, memberships[review["id"]]))
+        operation = build_cluster_review_merge_operation(
+            review,
+            target,
+            {cluster_id: [row] for cluster_id, row in memberships.items()},
+            allowed_candidate_cluster_ids=[target["id"]],
+            reviewed_at=1200,
+            reviewed_by="analyst@example",
+        )
+
+        self.assertTrue(self.store.apply_cluster_reconciliation(operation))
+        tombstone = self.store.get_threat_cluster(review["id"])
+        self.assertEqual("merge", tombstone["review_decision"])
+        self.assertEqual(target["id"], tombstone["reviewed_target_cluster_id"])
+        stored = self.store.get_cluster_reconciliation(operation["id"])
+        self.assertEqual("analyst@example", stored["review_resolution"]["reviewed_by"])
+
     def test_cluster_assignment_updates_cluster_and_membership_together(self):
         initial = self.cluster_doc()
         initial["id"] = "cluster-atomic"
@@ -257,6 +417,117 @@ class LongTermStoreContract:
             self.store.get_cluster_membership("profile", "article-stale")
         )
 
+    def test_cluster_reconciliation_is_atomic_idempotent_and_preserves_snapshots(self):
+        first = {**self.cluster_doc(), "id": "cluster-primary"}
+        second = {
+            **self.cluster_doc(),
+            "id": "cluster-secondary",
+            "first_seen_ts": 950,
+            "last_seen_ts": 1050,
+            "centroid": [0.0, 1.0],
+            "vector_sum": [0.0, 1.0],
+        }
+        first_membership = {
+            "profile_id": "profile",
+            "article_id": "article-primary",
+            "cluster_id": first["id"],
+            "assigned_at": 1000,
+            "strict_cve_identity": False,
+            "strong_indicators": ["organization:papercut"],
+            "evidence": {"title": "PaperCut incident"},
+        }
+        second_membership = {
+            "profile_id": "profile",
+            "article_id": "article-secondary",
+            "cluster_id": second["id"],
+            "assigned_at": 1050,
+            "strict_cve_identity": False,
+            "strong_indicators": ["product:papercut mf/ng"],
+            "evidence": {"title": "PaperCut exploit"},
+        }
+        self.assertTrue(self.store.save_cluster_assignment(first, first_membership))
+        self.assertTrue(self.store.save_cluster_assignment(second, second_membership))
+        self.assertTrue(
+            self.store.save_cluster_snapshot(
+                {
+                    "id": "snapshot-secondary",
+                    "profile_id": "profile",
+                    "cluster_id": second["id"],
+                    "membership_revision": 1,
+                    "prompt_version": "cluster-update-v1",
+                    "created_at": 1100,
+                }
+            )
+        )
+        operation = build_cluster_merge_operation(
+            [first, second],
+            {
+                first["id"]: [first_membership],
+                second["id"]: [second_membership],
+            },
+            primary_cluster_id=first["id"],
+            reconciliation_id="reconciliation-1",
+            reconciled_at=1200,
+        )
+
+        self.assertTrue(self.store.apply_cluster_reconciliation(operation))
+        self.assertTrue(self.store.apply_cluster_reconciliation(operation))
+        primary = self.store.get_threat_cluster(first["id"])
+        secondary = self.store.get_threat_cluster(second["id"])
+        self.assertEqual(2, primary["member_count"])
+        self.assertEqual(3, primary["membership_revision"])
+        self.assertIsNone(primary["latest_snapshot_id"])
+        self.assertEqual(0, secondary["member_count"])
+        self.assertEqual(first["id"], secondary["superseded_by_cluster_id"])
+        self.assertEqual(
+            ["article-primary", "article-secondary"],
+            [
+                row["article_id"]
+                for row in self.store.list_cluster_memberships(first["id"])
+            ],
+        )
+        moved = self.store.get_cluster_membership("profile", "article-secondary")
+        self.assertEqual(second["id"], moved["previous_cluster_id"])
+        self.assertEqual("reconciliation-1", moved["reconciliation_id"])
+        revisions = sorted(
+            row["cluster_membership_revision"]
+            for row in self.store.list_cluster_memberships(first["id"])
+        )
+        self.assertEqual([2, 3], revisions)
+        self.assertIsNotNone(self.store.get_cluster_snapshot("snapshot-secondary"))
+        stored_operation = self.store.get_cluster_reconciliation("reconciliation-1")
+        self.assertEqual("applied", stored_operation["status"])
+        self.assertEqual(2, stored_operation["membership_count"])
+
+    def test_cluster_reconciliation_rejects_a_stale_source_revision(self):
+        operation = self.reconciliation_fixture("stale")
+        secondary_id = next(
+            value
+            for value in operation["source_cluster_ids"]
+            if value != operation["primary_cluster_id"]
+        )
+        secondary = self.store.get_threat_cluster(secondary_id)
+        secondary["membership_revision"] = 2
+        self.assertTrue(
+            self.store.save_threat_cluster(
+                secondary, expected_membership_revision=1
+            )
+        )
+
+        self.assertFalse(self.store.apply_cluster_reconciliation(operation))
+        self.assertEqual(
+            secondary_id,
+            self.store.get_cluster_membership(
+                "profile", "article-secondary-stale"
+            )["cluster_id"],
+        )
+        self.assertEqual(
+            1,
+            self.store.get_threat_cluster(operation["primary_cluster_id"])[
+                "member_count"
+            ],
+        )
+
     def test_snapshots_reports_and_runs_are_insert_only(self):
         snapshot = {
             "id": "snapshot-1",
@@ -272,6 +543,11 @@ class LongTermStoreContract:
             ["snapshot-1"],
             [row["id"] for row in self.store.list_cluster_snapshots("profile")],
         )
+        self.assertEqual(
+            "snapshot-1",
+            self.store.get_cluster_snapshot("snapshot-1")["id"],
+        )
+        self.assertIsNone(self.store.get_cluster_snapshot("missing-snapshot"))
 
         report = {
             "id": "report-1",
@@ -309,6 +585,10 @@ class LongTermStoreContract:
             )
         )
         self.assertEqual("done", self.store.get_long_term_run("run-1")["status"])
+        self.assertEqual(
+            ["run-1"],
+            [row["id"] for row in self.store.list_long_term_runs("profile")],
+        )
 
     def test_summary_cleanup_never_deletes_authoritative_landscape_report(self):
         report = {
@@ -336,6 +616,131 @@ class LongTermStoreContract:
         self.assertEqual(
             report["id"],
             self.store.get_threat_landscape_report(report["id"])["id"],
+        )
+
+    def test_long_term_cleanup_preserves_live_and_referenced_provenance(self):
+        now = int(time.time())
+        old = now - 800 * 86400
+
+        def save_cluster(cluster_id, *, status="closed"):
+            cluster = {
+                **self.cluster_doc(),
+                "id": cluster_id,
+                "status": status,
+                "first_seen_ts": old,
+                "last_seen_ts": old,
+                "created_at": old,
+                "updated_at": old,
+            }
+            membership = {
+                "profile_id": "profile",
+                "article_id": f"article-{cluster_id}",
+                "cluster_id": cluster_id,
+                "assigned_at": old,
+            }
+            self.assertTrue(self.store.save_cluster_assignment(cluster, membership))
+
+        save_cluster("cluster-expired")
+        save_cluster("cluster-referenced")
+        save_cluster("cluster-active", status="active")
+        for cluster_id in ("cluster-expired", "cluster-referenced"):
+            self.assertTrue(
+                self.store.save_cluster_snapshot(
+                    {
+                        "id": f"snapshot-{cluster_id}",
+                        "profile_id": "profile",
+                        "cluster_id": cluster_id,
+                        "membership_revision": 1,
+                        "prompt_version": "cluster-v1",
+                        "created_at": old,
+                    }
+                )
+            )
+        self.assertTrue(
+            self.store.save_threat_landscape_report(
+                {
+                    "id": "report-expired",
+                    "profile_id": "profile",
+                    "period_end_ts": old,
+                    "created_at": old,
+                    "input_snapshot_ids": ["snapshot-cluster-expired"],
+                }
+            )
+        )
+        self.assertTrue(
+            self.store.save_threat_landscape_report(
+                {
+                    "id": "report-current",
+                    "profile_id": "profile",
+                    "period_end_ts": now,
+                    "created_at": now,
+                    "input_snapshot_ids": ["snapshot-cluster-referenced"],
+                }
+            )
+        )
+
+        for run_id, status in (("run-expired", "done"), ("run-running", "running")):
+            self.assertTrue(
+                self.store.create_long_term_run(
+                    {
+                        "id": run_id,
+                        "profile_id": "profile",
+                        "run_type": "incremental",
+                        "started_at": old,
+                        "status": "running",
+                    }
+                )
+            )
+            if status == "done":
+                self.assertTrue(
+                    self.store.update_long_term_run(
+                        run_id,
+                        expected_status="running",
+                        fields={"status": status, "finished_at": old},
+                    )
+                )
+
+        for article_id in ("quarantine-expired", "quarantine-open"):
+            self.assertTrue(
+                self.store.save_long_term_quarantine(
+                    {
+                        "profile_id": "profile",
+                        "article_id": article_id,
+                        "reason": "missing_embedding",
+                        "observed_at": old,
+                    }
+                )
+            )
+        self.assertTrue(
+            self.store.resolve_long_term_quarantine(
+                "profile", "quarantine-expired", resolved_at=old
+            )
+        )
+
+        removed = self.store.run_cleanup(CleanupPolicy(long_term_days=730))
+
+        self.assertEqual(1, removed["long_term_reports"])
+        self.assertEqual(1, removed["long_term_snapshots"])
+        self.assertEqual(1, removed["long_term_clusters"])
+        self.assertEqual(1, removed["long_term_memberships"])
+        self.assertEqual(1, removed["long_term_runs"])
+        self.assertEqual(1, removed["long_term_quarantine"])
+        self.assertIsNone(self.store.get_threat_cluster("cluster-expired"))
+        self.assertIsNotNone(self.store.get_threat_cluster("cluster-referenced"))
+        self.assertIsNotNone(self.store.get_threat_cluster("cluster-active"))
+        self.assertIsNotNone(
+            self.store.get_threat_landscape_report("report-current")
+        )
+        self.assertEqual(
+            ["snapshot-cluster-referenced"],
+            [
+                row["id"]
+                for row in self.store.list_cluster_snapshots("profile", limit=10)
+            ],
+        )
+        self.assertIsNotNone(self.store.get_long_term_run("run-running"))
+        self.assertIsNotNone(
+            self.store.get_long_term_quarantine("profile", "quarantine-open")
         )
 
     def test_article_quarantine_tracks_retries_and_resolution(self):
@@ -455,6 +860,47 @@ class LongTermStoreContract:
             "updated_at": 1000,
         }
 
+    def reconciliation_fixture(self, suffix):
+        first = {**self.cluster_doc(), "id": f"cluster-primary-{suffix}"}
+        second = {
+            **self.cluster_doc(),
+            "id": f"cluster-secondary-{suffix}",
+            "centroid": [0.0, 1.0],
+            "vector_sum": [0.0, 1.0],
+        }
+        first_membership = {
+            "profile_id": "profile",
+            "article_id": f"article-primary-{suffix}",
+            "cluster_id": first["id"],
+            "assigned_at": 1000,
+            "strict_cve_identity": False,
+            "evidence": {"title": "PaperCut incident"},
+        }
+        second_membership = {
+            "profile_id": "profile",
+            "article_id": f"article-secondary-{suffix}",
+            "cluster_id": second["id"],
+            "assigned_at": 1001,
+            "strict_cve_identity": False,
+            "evidence": {"title": "PaperCut exploit"},
+        }
+        self.assertTrue(
+            self.store.save_cluster_assignment(first, first_membership)
+        )
+        self.assertTrue(
+            self.store.save_cluster_assignment(second, second_membership)
+        )
+        return build_cluster_merge_operation(
+            [first, second],
+            {
+                first["id"]: [first_membership],
+                second["id"]: [second_membership],
+            },
+            primary_cluster_id=first["id"],
+            reconciliation_id=f"reconciliation-{suffix}",
+            reconciled_at=1200,
+        )
+
 
 class SqliteLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
     def make_store(self, directory):
@@ -516,6 +962,34 @@ class TinyDBLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
         self.assertEqual([], database.table("long_term_assignment_journal").all())
         database.close()
 
+    def test_partial_reconciliation_journal_is_replayed(self):
+        operation = self.reconciliation_fixture("tiny-recovery")
+        database = TinyDB(self.store.path)
+        query = Query()
+        database.table("long_term_reconciliation_journal").insert(operation)
+        targets = [
+            operation["merged_cluster"],
+            *operation["superseded_clusters"],
+        ]
+        for target in targets:
+            def replace_document(row, replacement=target):
+                row.clear()
+                row.update(replacement)
+
+            database.table("threat_clusters").update(
+                replace_document, query.id == target["id"]
+            )
+        database.close()
+
+        self.assertTrue(self.store.apply_cluster_reconciliation(operation))
+        database = TinyDB(self.store.path)
+        self.assertEqual([], database.table("long_term_reconciliation_journal").all())
+        database.close()
+        moved = self.store.get_cluster_membership(
+            "profile", "article-secondary-tiny-recovery"
+        )
+        self.assertEqual(operation["primary_cluster_id"], moved["cluster_id"])
+
 
 @unittest.skipIf(mongomock is None, "mongomock is not installed")
 class MongoDBLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
@@ -525,6 +999,33 @@ class MongoDBLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
             database="long_term_contract",
             client=mongomock.MongoClient(),
         )
+
+    def test_partial_reconciliation_journal_is_replayed(self):
+        operation = self.reconciliation_fixture("mongo-recovery")
+        journal = {
+            **operation,
+            "_id": operation["id"],
+            "created_at": operation["reconciled_at"],
+        }
+        self.store.db.long_term_reconciliation_journal.insert_one(journal)
+        for target in [
+            operation["merged_cluster"],
+            *operation["superseded_clusters"],
+        ]:
+            self.store.db.threat_clusters.replace_one(
+                {"_id": target["id"]}, {**target, "_id": target["id"]}
+            )
+
+        self.assertTrue(self.store.apply_cluster_reconciliation(operation))
+        self.assertIsNone(
+            self.store.db.long_term_reconciliation_journal.find_one(
+                {"_id": operation["id"]}
+            )
+        )
+        moved = self.store.get_cluster_membership(
+            "profile", "article-secondary-mongo-recovery"
+        )
+        self.assertEqual(operation["primary_cluster_id"], moved["cluster_id"])
 
 
 if __name__ == "__main__":

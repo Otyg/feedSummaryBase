@@ -87,6 +87,50 @@ class LongTermProcessorTests(unittest.TestCase):
         self.assertEqual(0, replay.assigned)
         self.assertEqual(2, len(self.store.list_threat_clusters("profile")))
 
+    def test_ambiguous_membership_retains_both_review_candidate_ids(self):
+        signature = EmbeddingSignature(
+            "embedding-model", 2, "cluster incidents"
+        )
+        first = create_cluster(
+            profile_id="profile",
+            article_id="seed-a",
+            article_ts=100,
+            embedding=[1.0, 0.0],
+            signature=signature,
+        )
+        second = create_cluster(
+            profile_id="profile",
+            article_id="seed-b",
+            article_ts=100,
+            embedding=[0.999, 0.045],
+            signature=signature,
+        )
+        self.assertTrue(self.store.save_threat_cluster(first.to_document()))
+        self.assertTrue(self.store.save_threat_cluster(second.to_document()))
+        self.store.upsert_article(self.article("ambiguous", 200, [1.0, 0.0]))
+
+        result = run_incremental_clustering(
+            self.store,
+            profile_id="profile",
+            owner_id="worker",
+            until_fetched_at=500,
+            now_ts=500,
+            settings=IncrementalSettings(
+                batch_size=20,
+                lease_seconds=60,
+                clustering=ClusteringSettings(
+                    similarity_threshold=0.8,
+                    ambiguity_margin=0.01,
+                    candidate_window_days=60,
+                ),
+            ),
+        )
+
+        self.assertEqual(1, result.needs_review)
+        membership = self.store.get_cluster_membership("profile", "ambiguous")
+        self.assertEqual(first.id, membership["best_candidate_cluster_id"])
+        self.assertEqual(second.id, membership["second_candidate_cluster_id"])
+
     def test_clustering_renews_lease_before_cursor_commit(self):
         self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))
 
@@ -255,6 +299,87 @@ class LongTermProcessorTests(unittest.TestCase):
         clusters = self.store.list_threat_clusters("profile")
         self.assertEqual(1, len(clusters))
         self.assertEqual(1, clusters[0]["member_count"])
+
+    def test_blocked_identity_can_be_corrected_and_resumed_without_cursor_gap(self):
+        identityless = self.article("", 100, [1.0, 0.0])
+
+        with patch.object(
+            self.store,
+            "list_articles_for_long_term",
+            return_value=[identityless],
+        ):
+            blocked = run_incremental_clustering(
+                self.store,
+                profile_id="profile",
+                owner_id="worker-a",
+                until_fetched_at=500,
+                now_ts=500,
+                settings=self.settings(),
+            )
+
+        self.assertEqual("article_id_missing", blocked.blocked_reason)
+        self.assertEqual((0, ""), (blocked.cursor_fetched_at, blocked.cursor_article_id))
+        self.assertEqual("blocked", self.store.get_long_term_run(blocked.run_id)["status"])
+
+        self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))
+        resumed = run_incremental_clustering(
+            self.store,
+            profile_id="profile",
+            owner_id="worker-b",
+            until_fetched_at=500,
+            now_ts=501,
+            settings=self.settings(),
+        )
+
+        self.assertIsNone(resumed.blocked_reason)
+        self.assertEqual(1, resumed.assigned)
+        self.assertEqual((100, "article-a"), (resumed.cursor_fetched_at, resumed.cursor_article_id))
+        self.assertEqual("done", self.store.get_long_term_run(resumed.run_id)["status"])
+
+    def test_embedding_signature_changes_never_mix_cluster_memberships(self):
+        original = self.article("article-a", 100, [1.0, 0.0])
+        changed_model = self.article("article-b", 200, [1.0, 0.0])
+        changed_model["similarity_embedding_model"] = "embedding-model-v2"
+        changed_dimension = self.article("article-c", 300, [1.0, 0.0, 0.0])
+        changed_instruction = self.article("article-d", 400, [1.0, 0.0])
+        changed_instruction["similarity_embedding_instruction"] = "new incident instruction"
+        for article in (
+            original,
+            changed_model,
+            changed_dimension,
+            changed_instruction,
+        ):
+            self.store.upsert_article(article)
+
+        result = run_incremental_clustering(
+            self.store,
+            profile_id="profile",
+            owner_id="worker",
+            until_fetched_at=500,
+            now_ts=500,
+            settings=self.settings(),
+        )
+
+        self.assertEqual(4, result.created)
+        clusters = self.store.list_threat_clusters("profile")
+        signatures = {
+            (
+                cluster["embedding_model"],
+                cluster["embedding_dimension"],
+                cluster["embedding_instruction"],
+            )
+            for cluster in clusters
+        }
+        self.assertEqual(
+            {
+                ("embedding-model", 2, "cluster incidents"),
+                ("embedding-model-v2", 2, "cluster incidents"),
+                ("embedding-model", 3, "cluster incidents"),
+                ("embedding-model", 2, "new incident instruction"),
+            },
+            signatures,
+        )
+        self.assertEqual([1, 1, 1, 1], sorted(row["member_count"] for row in clusters))
 
     def test_dry_run_predicts_without_writes_or_cursor_movement(self):
         self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))
@@ -429,9 +554,9 @@ class LongTermProcessorTests(unittest.TestCase):
 
     def test_conflicting_cves_create_separate_clusters(self):
         first = self.article("article-a", 100, [1.0, 0.0])
-        first["title"] = "CVE-2026-1000 exploited"
+        first["title"] = "CVE-2026-1000 - Product vulnerability"
         second = self.article("article-b", 200, [1.0, 0.0])
-        second["title"] = "CVE-2026-2000 exploited"
+        second["title"] = "CVE-2026-2000 - Product vulnerability"
         self.store.upsert_article(first)
         self.store.upsert_article(second)
 
@@ -452,6 +577,31 @@ class LongTermProcessorTests(unittest.TestCase):
             [["cve:cve-2026-1000"], ["cve:cve-2026-2000"]],
             sorted(cluster["strong_indicators"] for cluster in clusters),
         )
+
+    def test_narrative_event_articles_with_different_cves_can_merge(self):
+        first = self.article("article-a", 100, [1.0, 0.0])
+        first["title"] = "PaperCut vulnerability actively exploited"
+        first["text"] = "PaperCut incident involving CVE-2023-27350"
+        second = self.article("article-b", 200, [1.0, 0.0])
+        second["title"] = "PaperCut warns of zero-day attacks"
+        second["text"] = "The same PaperCut campaign mentions CVE-2023-27351"
+        self.store.upsert_article(first)
+        self.store.upsert_article(second)
+
+        result = run_incremental_clustering(
+            self.store,
+            profile_id="profile",
+            owner_id="worker",
+            until_fetched_at=500,
+            now_ts=500,
+            settings=self.settings(),
+        )
+
+        self.assertEqual(1, result.created)
+        self.assertEqual(1, result.matched)
+        cluster = self.store.list_threat_clusters("profile")[0]
+        self.assertFalse(cluster["strict_cve_identity"])
+        self.assertEqual(2, cluster["member_count"])
 
 
 if __name__ == "__main__":

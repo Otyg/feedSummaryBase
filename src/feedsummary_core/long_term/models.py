@@ -83,16 +83,31 @@ class ThreatCluster:
     status: ClusterStatus = ClusterStatus.ACTIVE
     algorithm_version: str = "online-centroid-v1"
     strong_indicators: tuple[str, ...] = ()
+    strict_cve_identity: bool = True
     summarized_revision: int = 0
     latest_snapshot_id: str | None = None
     last_summarized_at: int | None = None
     reopened_count: int = 0
     last_reopened_at: int | None = None
+    superseded_by_cluster_id: str | None = None
+    reconciliation_id: str | None = None
+    reconciled_at: int | None = None
+    review_decision: str | None = None
+    reviewed_at: int | None = None
+    reviewed_by: str | None = None
+    review_comment: str | None = None
+    reviewed_target_cluster_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.id or not self.profile_id:
             raise ValueError("cluster id and profile id must not be empty")
-        if self.member_count < 1:
+        superseded = self.superseded_by_cluster_id is not None
+        if superseded:
+            if self.member_count != 0 or self.status is not ClusterStatus.CLOSED:
+                raise ValueError("a superseded cluster must be closed and empty")
+            if not self.reconciliation_id or self.reconciled_at is None:
+                raise ValueError("a superseded cluster requires reconciliation lineage")
+        elif self.member_count < 1:
             raise ValueError("cluster member_count must be positive")
         if self.membership_revision < self.member_count:
             raise ValueError("membership_revision cannot be lower than member_count")
@@ -106,6 +121,19 @@ class ThreatCluster:
             self.first_seen_ts <= self.last_reopened_at <= self.last_seen_ts
         ):
             raise ValueError("last_reopened_at must be within the cluster interval")
+        if self.review_decision not in {None, "keep_separate", "exclude", "merge"}:
+            raise ValueError("unsupported cluster review decision")
+        if self.review_decision is None:
+            if self.reviewed_at is not None or self.reviewed_by is not None:
+                raise ValueError("unresolved cluster cannot have review audit metadata")
+        elif self.reviewed_at is None or not str(self.reviewed_by or "").strip():
+            raise ValueError("resolved cluster review requires timestamp and reviewer")
+        if self.review_decision == "keep_separate" and self.status is ClusterStatus.NEEDS_REVIEW:
+            raise ValueError("a separate reviewed cluster must leave needs_review")
+        if self.review_decision == "exclude" and self.status is not ClusterStatus.CLOSED:
+            raise ValueError("an excluded reviewed cluster must be closed")
+        if self.review_decision == "merge" and not self.reviewed_target_cluster_id:
+            raise ValueError("a merged reviewed cluster requires its target cluster")
         if len(self.centroid) != self.embedding_signature.dimensions:
             raise ValueError("centroid does not match the embedding signature")
         if len(self.vector_sum) != self.embedding_signature.dimensions:
@@ -131,11 +159,20 @@ class ThreatCluster:
             "membership_revision": self.membership_revision,
             "algorithm_version": self.algorithm_version,
             "strong_indicators": list(self.strong_indicators),
+            "strict_cve_identity": self.strict_cve_identity,
             "summarized_revision": self.summarized_revision,
             "latest_snapshot_id": self.latest_snapshot_id,
             "last_summarized_at": self.last_summarized_at,
             "reopened_count": self.reopened_count,
             "last_reopened_at": self.last_reopened_at,
+            "superseded_by_cluster_id": self.superseded_by_cluster_id,
+            "reconciliation_id": self.reconciliation_id,
+            "reconciled_at": self.reconciled_at,
+            "review_decision": self.review_decision,
+            "reviewed_at": self.reviewed_at,
+            "reviewed_by": self.reviewed_by,
+            "review_comment": self.review_comment,
+            "reviewed_target_cluster_id": self.reviewed_target_cluster_id,
         }
 
     @classmethod
@@ -167,6 +204,9 @@ class ThreatCluster:
                     }
                 )
             ),
+            # Missing means conservative legacy behaviour. Reconciliation can
+            # derive a more precise value from persisted membership evidence.
+            strict_cve_identity=bool(document.get("strict_cve_identity", True)),
             summarized_revision=int(document.get("summarized_revision") or 0),
             latest_snapshot_id=(
                 str(document["latest_snapshot_id"])
@@ -182,6 +222,46 @@ class ThreatCluster:
             last_reopened_at=(
                 int(document["last_reopened_at"])
                 if document.get("last_reopened_at") is not None
+                else None
+            ),
+            superseded_by_cluster_id=(
+                str(document["superseded_by_cluster_id"])
+                if document.get("superseded_by_cluster_id")
+                else None
+            ),
+            reconciliation_id=(
+                str(document["reconciliation_id"])
+                if document.get("reconciliation_id")
+                else None
+            ),
+            reconciled_at=(
+                int(document["reconciled_at"])
+                if document.get("reconciled_at") is not None
+                else None
+            ),
+            review_decision=(
+                str(document["review_decision"])
+                if document.get("review_decision")
+                else None
+            ),
+            reviewed_at=(
+                int(document["reviewed_at"])
+                if document.get("reviewed_at") is not None
+                else None
+            ),
+            reviewed_by=(
+                str(document["reviewed_by"])
+                if document.get("reviewed_by")
+                else None
+            ),
+            review_comment=(
+                str(document["review_comment"])
+                if document.get("review_comment") is not None
+                else None
+            ),
+            reviewed_target_cluster_id=(
+                str(document["reviewed_target_cluster_id"])
+                if document.get("reviewed_target_cluster_id")
                 else None
             ),
         )

@@ -79,6 +79,8 @@ class AssignmentDecision:
     similarity: float | None
     second_similarity: float | None
     reason: str
+    best_candidate_cluster_id: str | None = None
+    second_candidate_cluster_id: str | None = None
 
 
 def _validated_vector(
@@ -142,6 +144,7 @@ def create_cluster(
     embedding: Sequence[float],
     signature: EmbeddingSignature,
     strong_indicators: Iterable[str] = (),
+    strict_cve_identity: bool = True,
     algorithm_version: str = "online-centroid-v1",
 ) -> ThreatCluster:
     """Create a one-member cluster from a validated, normalized article vector."""
@@ -164,6 +167,7 @@ def create_cluster(
         strong_indicators=tuple(
             sorted({str(value).strip().casefold() for value in strong_indicators if str(value).strip()})
         ),
+        strict_cve_identity=bool(strict_cve_identity),
     )
 
 
@@ -173,6 +177,7 @@ def add_cluster_member(
     article_ts: int,
     embedding: Sequence[float],
     strong_indicators: Iterable[str] = (),
+    strict_cve_identity: bool = True,
 ) -> ThreatCluster:
     """Return an updated cluster using an exact incremental arithmetic centroid."""
 
@@ -201,6 +206,9 @@ def add_cluster_member(
                     if str(value).strip()
                 }
             )
+        ),
+        strict_cve_identity=(
+            cluster.strict_cve_identity and bool(strict_cve_identity)
         ),
     )
 
@@ -238,6 +246,7 @@ def assign_article(
     signature: EmbeddingSignature,
     candidates: Iterable[ThreatCluster],
     strong_indicators: Iterable[str] = (),
+    strict_cve_identity: bool = True,
     settings: ClusteringSettings | None = None,
 ) -> AssignmentDecision:
     """Choose a compatible recent cluster or return a deterministic non-match decision."""
@@ -266,7 +275,13 @@ def assign_article(
         cluster_cves = {
             value for value in cluster_indicator_set if value.startswith("cve:")
         }
-        if article_cves and cluster_cves and article_cves.isdisjoint(cluster_cves):
+        if (
+            strict_cve_identity
+            and cluster.strict_cve_identity
+            and article_cves
+            and cluster_cves
+            and article_cves.isdisjoint(cluster_cves)
+        ):
             conflicting_cves = True
             continue
         score = cosine_similarity(vector, cluster.centroid)
@@ -288,6 +303,7 @@ def assign_article(
     scored.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
     best_similarity, best_overlap, _, best_id = scored[0]
     second_similarity = scored[1][0] if len(scored) > 1 else None
+    second_id = scored[1][3] if len(scored) > 1 else None
     if best_similarity < settings.similarity_threshold:
         return AssignmentDecision(
             AssignmentAction.NEW_CLUSTER,
@@ -295,6 +311,8 @@ def assign_article(
             best_similarity,
             second_similarity,
             "below_similarity_threshold",
+            best_candidate_cluster_id=best_id,
+            second_candidate_cluster_id=second_id,
         )
     if (
         second_similarity is not None
@@ -307,6 +325,8 @@ def assign_article(
             best_similarity,
             second_similarity,
             "ambiguous_candidates",
+            best_candidate_cluster_id=best_id,
+            second_candidate_cluster_id=second_id,
         )
     return AssignmentDecision(
         AssignmentAction.MATCH,
@@ -316,4 +336,6 @@ def assign_article(
         "similarity_match_with_indicator_support"
         if best_overlap
         else "similarity_match",
+        best_candidate_cluster_id=best_id,
+        second_candidate_cluster_id=second_id,
     )

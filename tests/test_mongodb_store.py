@@ -236,7 +236,18 @@ class MongoDBStoreTests(unittest.TestCase):
         removed = self.store.run_cleanup(CleanupPolicy(articles_days=30))
 
         self.assertEqual(
-            {"articles": 1, "summary_docs": 1, "temp_summaries": 1, "jobs": 1},
+            {
+                "articles": 1,
+                "summary_docs": 1,
+                "temp_summaries": 1,
+                "jobs": 1,
+                "long_term_reports": 0,
+                "long_term_snapshots": 0,
+                "long_term_clusters": 0,
+                "long_term_memberships": 0,
+                "long_term_runs": 0,
+                "long_term_quarantine": 0,
+            },
             removed,
         )
         self.assertIsNotNone(self.store.get_summary_doc("weekly-current"))

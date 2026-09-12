@@ -18,12 +18,20 @@ class RecordingClient:
         self.error = error
         self.calls = []
 
-    async def chat(self, messages, *, temperature=0.2, max_output_tokens=None):
+    async def chat(
+        self,
+        messages,
+        *,
+        temperature=0.2,
+        max_output_tokens=None,
+        response_format=None,
+    ):
         self.calls.append(
             {
                 "messages": messages,
                 "temperature": temperature,
                 "max_output_tokens": max_output_tokens,
+                "response_format": response_format,
             }
         )
         if self.error is not None:
@@ -54,12 +62,15 @@ class LLMOutputLimitTests(unittest.TestCase):
                 [{"role": "user", "content": "test"}],
                 temperature=0.1,
                 max_output_tokens=777,
+                response_format={"type": "object"},
             )
         )
 
         self.assertEqual("fallback", result)
         self.assertEqual(777, primary.calls[0]["max_output_tokens"])
         self.assertEqual(777, fallback.calls[0]["max_output_tokens"])
+        self.assertEqual({"type": "object"}, primary.calls[0]["response_format"])
+        self.assertEqual({"type": "object"}, fallback.calls[0]["response_format"])
 
     def test_call_without_limit_remains_compatible_with_legacy_client(self):
         legacy = LegacyClient()
@@ -107,12 +118,14 @@ class LLMOutputLimitTests(unittest.TestCase):
             await client.chat(
                 [{"role": "user", "content": "bounded"}],
                 max_output_tokens=456,
+                response_format={"type": "object"},
             )
             await client.chat([{"role": "user", "content": "default"}])
 
         asyncio.run(run_calls())
 
         self.assertEqual(456, session.requests[0][1]["options"]["num_predict"])
+        self.assertEqual({"type": "object"}, session.requests[0][1]["format"])
         self.assertNotIn("num_predict", session.requests[1][1]["options"])
 
     def test_cloud_ollama_maps_limit_to_num_predict(self):
@@ -132,6 +145,7 @@ class LLMOutputLimitTests(unittest.TestCase):
             client.chat(
                 [{"role": "user", "content": "bounded"}],
                 max_output_tokens=654,
+                response_format={"type": "object"},
             )
         )
 
@@ -139,6 +153,9 @@ class LLMOutputLimitTests(unittest.TestCase):
         self.assertEqual(
             654,
             client._client.chat.await_args.kwargs["options"]["num_predict"],
+        )
+        self.assertEqual(
+            {"type": "object"}, client._client.chat.await_args.kwargs["format"]
         )
 
 

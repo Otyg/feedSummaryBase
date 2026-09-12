@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 from feedsummary_core.llm_client.ollama_cloud import LLMRateLimitError, LLMUnavailableError
 
@@ -51,6 +51,7 @@ class LLMClient(Protocol):
         *,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
     ) -> str: ...
 
 
@@ -135,6 +136,7 @@ class FallbackLLMClient:
         *,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
     ) -> str:
         provider_idx = self._next_provider_idx(self._active_idx)
         if provider_idx is None:
@@ -148,12 +150,13 @@ class FallbackLLMClient:
             attempt = 0
             while True:
                 try:
-                    if max_output_tokens is None:
+                    if max_output_tokens is None and response_format is None:
                         return await active.chat(messages, temperature=temperature)
                     return await active.chat(
                         messages,
                         temperature=temperature,
                         max_output_tokens=max_output_tokens,
+                        response_format=response_format,
                     )
                 except LLMUnavailableError as e:
                     attempt += 1

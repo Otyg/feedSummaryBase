@@ -78,6 +78,7 @@ class MapLLM(Protocol):
         *,
         temperature: float = 0.0,
         max_output_tokens: int | None = None,
+        response_format: str | dict[str, Any] | None = None,
     ) -> str: ...
 
 
@@ -145,6 +146,45 @@ def _membership_revision(membership: dict[str, Any], fallback: int) -> int:
     return int(membership.get("cluster_membership_revision") or fallback)
 
 
+def _ordered_memberships_with_effective_revisions(
+    memberships: list[dict[str, Any]], *, cluster_revision: int
+) -> list[tuple[int, dict[str, Any]]]:
+    """Return a deterministic, strictly increasing revision for every member.
+
+    Reconciliation operations created before membership revisions were allocated
+    per article assigned the merged cluster's final revision to every member. A
+    Map batch must not interpret those duplicate values as one indivisible
+    revision and consequently skip the articles beyond its size limit.
+    """
+
+    indexed = list(enumerate(memberships, start=1))
+    ordered = [
+        item
+        for fallback_revision, item in sorted(
+            indexed,
+            key=lambda pair: (
+                _membership_revision(pair[1], pair[0]),
+                str(pair[1].get("article_id") or ""),
+            ),
+        )
+    ]
+    revisions = [
+        _membership_revision(item, index)
+        for index, item in enumerate(ordered, start=1)
+    ]
+    if len(set(revisions)) == len(revisions) and (
+        not revisions or revisions[-1] == cluster_revision
+    ):
+        return list(zip(revisions, ordered))
+
+    first_revision = cluster_revision - len(ordered) + 1
+    if first_revision < 1:
+        raise ValueError(
+            "cluster has more memberships than its membership revision permits"
+        )
+    return list(zip(range(first_revision, cluster_revision + 1), ordered))
+
+
 def _article_material(article: dict[str, Any], clip_chars: int) -> dict[str, Any]:
     body = str(
         article.get("text") or article.get("content") or article.get("summary") or ""
@@ -189,6 +229,25 @@ def _snapshot_id(cluster_id: str, revision: int, prompt_version: str) -> str:
     return f"threat_snapshot_{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
 
 
+def _normalize_snapshot_candidate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize uncertainty markers without manufacturing or losing evidence."""
+
+    normalized = dict(payload)
+    uncertainties = normalized.get("uncertainties")
+    if isinstance(uncertainties, list):
+        normalized_uncertainties: list[Any] = []
+        for value in uncertainties:
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            if isinstance(value, (dict, list)):
+                if not value:
+                    continue
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            normalized_uncertainties.append(value)
+        normalized["uncertainties"] = normalized_uncertainties
+    return normalized
+
+
 async def update_cluster_map_snapshot(
     store: MapStore,
     llm: MapLLM,
@@ -219,24 +278,16 @@ async def update_cluster_map_snapshot(
             0,
         )
 
-    memberships = store.list_cluster_memberships(cluster.id)
-    indexed_memberships = list(enumerate(memberships, start=1))
-    ordered_memberships = [
-        item
-        for fallback_revision, item in sorted(
-            indexed_memberships,
-            key=lambda pair: (
-                _membership_revision(pair[1], pair[0]),
-                str(pair[1].get("article_id") or ""),
-            ),
-        )
-    ]
-    pending = [
-        membership
-        for index, membership in enumerate(ordered_memberships, start=1)
-        if _membership_revision(membership, index) > cluster.summarized_revision
+    memberships_with_revisions = _ordered_memberships_with_effective_revisions(
+        store.list_cluster_memberships(cluster.id),
+        cluster_revision=cluster.membership_revision,
+    )
+    pending_with_revisions = [
+        pair
+        for pair in memberships_with_revisions
+        if pair[0] > cluster.summarized_revision
     ][: settings.max_articles_per_call]
-    if not pending:
+    if not pending_with_revisions:
         return MapUpdateResult(
             cluster.id,
             "skipped",
@@ -247,11 +298,9 @@ async def update_cluster_map_snapshot(
             False,
             0,
         )
+    pending = [membership for _, membership in pending_with_revisions]
     selected_ids = [str(item["article_id"]) for item in pending]
-    target_revision = max(
-        _membership_revision(item, index)
-        for index, item in enumerate(pending, start=cluster.summarized_revision + 1)
-    )
+    target_revision = pending_with_revisions[-1][0]
     articles_by_id = {
         str(article.get("id") or ""): article
         for article in store.get_articles_by_ids(selected_ids)
@@ -262,14 +311,18 @@ async def update_cluster_map_snapshot(
         _article_material(articles_by_id[article_id], settings.article_clip_chars)
         for article_id in selected_ids
     ]
-    snapshots = store.list_cluster_snapshots(
-        cluster.profile_id, cluster_id=cluster.id, limit=1
+    snapshots = (
+        store.list_cluster_snapshots(
+            cluster.profile_id, cluster_id=cluster.id, limit=1
+        )
+        if cluster.latest_snapshot_id
+        else []
     )
     previous_snapshot = snapshots[0].get("payload") if snapshots else None
     allowed_ids = [
         str(item["article_id"])
-        for index, item in enumerate(ordered_memberships, start=1)
-        if _membership_revision(item, index) <= target_revision
+        for revision, item in memberships_with_revisions
+        if revision <= target_revision
     ]
     messages = _render_messages(
         prompt_package,
@@ -285,11 +338,12 @@ async def update_cluster_map_snapshot(
         article_material.pop()
         selected_ids.pop()
         pending.pop()
-        target_revision = _membership_revision(pending[-1], cluster.summarized_revision + len(pending))
+        pending_with_revisions.pop()
+        target_revision = pending_with_revisions[-1][0]
         allowed_ids = [
             str(item["article_id"])
-            for index, item in enumerate(ordered_memberships, start=1)
-            if _membership_revision(item, index) <= target_revision
+            for revision, item in memberships_with_revisions
+            if revision <= target_revision
         ]
         messages = _render_messages(
             prompt_package,
@@ -309,11 +363,12 @@ async def update_cluster_map_snapshot(
         messages,
         temperature=float(prompt_package.get("temperature", 0.0)),
         max_output_tokens=settings.max_output_tokens,
+        response_format=prompt_package["output_schema"],
     )
     repair_attempted = False
     try:
         payload = validate_cluster_snapshot(
-            parse_snapshot_json(raw),
+            _normalize_snapshot_candidate(parse_snapshot_json(raw)),
             profile_id=cluster.profile_id,
             cluster_id=cluster.id,
             membership_revision=target_revision,
@@ -348,14 +403,22 @@ async def update_cluster_map_snapshot(
             repair_messages,
             temperature=0.0,
             max_output_tokens=settings.max_output_tokens,
+            response_format=prompt_package["output_schema"],
         )
-        payload = validate_cluster_snapshot(
-            parse_snapshot_json(repaired),
-            profile_id=cluster.profile_id,
-            cluster_id=cluster.id,
-            membership_revision=target_revision,
-            allowed_article_ids=set(allowed_ids),
-        )
+        try:
+            payload = validate_cluster_snapshot(
+                _normalize_snapshot_candidate(parse_snapshot_json(repaired)),
+                profile_id=cluster.profile_id,
+                cluster_id=cluster.id,
+                membership_revision=target_revision,
+                allowed_article_ids=set(allowed_ids),
+            )
+        except SnapshotValidationError as repair_error:
+            raise SnapshotValidationError(
+                "initial response failed validation "
+                f"({len(raw)} chars): {error}; format repair failed "
+                f"({len(repaired)} chars): {repair_error}"
+            ) from repair_error
 
     prompt_version = str(prompt_package.get("prompt_version") or "").strip()
     if not prompt_version:

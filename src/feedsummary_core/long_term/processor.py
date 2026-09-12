@@ -33,7 +33,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 import uuid
 from math import ceil
@@ -58,8 +57,8 @@ from feedsummary_core.long_term.models import (
     ThreatCluster,
 )
 from feedsummary_core.long_term.lease import LeaseLostError
+from feedsummary_core.long_term.identity import CVE_PATTERN, is_strict_cve_record
 
-_CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 _STRONG_TAG_CATEGORIES = frozenset(
     {"THREAT", "VULNERABILITY", "ORGANIZATION", "PRODUCT"}
 )
@@ -247,8 +246,11 @@ def _membership_document(
     reason: str,
     similarity: float | None,
     second_similarity: float | None,
+    best_candidate_cluster_id: str | None,
+    second_candidate_cluster_id: str | None,
     assigned_at: int,
     strong_indicators: Sequence[str],
+    strict_cve_identity: bool,
     article: dict[str, Any],
 ) -> dict[str, Any]:
     return {
@@ -261,12 +263,15 @@ def _membership_document(
         "assignment_reason": reason,
         "similarity": similarity,
         "second_similarity": second_similarity,
+        "best_candidate_cluster_id": best_candidate_cluster_id,
+        "second_candidate_cluster_id": second_candidate_cluster_id,
         "cluster_membership_revision": cluster.membership_revision,
         "algorithm_version": cluster.algorithm_version,
         "embedding_model": cluster.embedding_signature.model,
         "embedding_dimension": cluster.embedding_signature.dimensions,
         "embedding_instruction": cluster.embedding_signature.instruction,
         "strong_indicators": list(strong_indicators),
+        "strict_cve_identity": strict_cve_identity,
         "evidence": {
             "title": str(article.get("title") or "").strip(),
             "url": str(article.get("url") or "").strip(),
@@ -300,13 +305,13 @@ def _strong_indicators(
         str(article.get(field) or "")
         for field in ("title", "text", "content", "summary")
     )
-    indicators = {f"cve:{match.group(0).casefold()}" for match in _CVE_PATTERN.finditer(text)}
+    indicators = {f"cve:{match.group(0).casefold()}" for match in CVE_PATTERN.finditer(text)}
     for tag in article_tags:
         category = str(tag.get("category") or "").strip().upper()
         name = str(tag.get("name") or "").strip().casefold()
         if not name or category not in _STRONG_TAG_CATEGORIES:
             continue
-        cves = _CVE_PATTERN.findall(name)
+        cves = CVE_PATTERN.findall(name)
         if cves:
             indicators.update(f"cve:{value.casefold()}" for value in cves)
         else:
@@ -439,12 +444,14 @@ def run_incremental_clustering(
             ]
             quarantine_rows = store.get_articles_by_ids(retry_ids) if retry_ids else []
             counts["quarantine_retried"] = len(quarantine_rows)
+        candidate_rows = (*quarantine_rows, *new_rows)
         rows_by_id = {
             str(row.get("id") or ""): row
-            for row in (*quarantine_rows, *new_rows)
+            for row in candidate_rows
             if str(row.get("id") or "")
         }
-        rows = list(rows_by_id.values())
+        identityless_rows = [row for row in candidate_rows if not str(row.get("id") or "")]
+        rows = [*identityless_rows, *rows_by_id.values()]
         fetched_cursor = max(
             (
                 (int(row.get("fetched_at") or 0), str(row.get("id") or ""))
@@ -477,6 +484,7 @@ def run_incremental_clustering(
                 )
                 continue
             indicators = _strong_indicators(article, article_tags)
+            strict_cve_identity = is_strict_cve_record(article)
             try:
                 article_id, article_ts, vector, signature = _article_embedding(
                     article, now_ts, settings.max_future_skew_seconds
@@ -484,6 +492,7 @@ def run_incremental_clustering(
             except (ArticleQualityError, VectorValidationError, ValueError) as exc:
                 reason = str(exc)
                 if not article_id:
+                    blocked_article_id = None
                     blocked_reason = reason
                     break
                 if not dry_run:
@@ -545,6 +554,7 @@ def run_incremental_clustering(
                 signature=signature,
                 candidates=candidates,
                 strong_indicators=indicators,
+                strict_cve_identity=strict_cve_identity,
                 settings=settings.clustering,
             )
             previous_revision: int | None = None
@@ -559,6 +569,7 @@ def run_incremental_clustering(
                     article_ts=article_ts,
                     embedding=vector,
                     strong_indicators=indicators,
+                    strict_cve_identity=strict_cve_identity,
                 )
                 candidates[index] = cluster
                 counts["matched"] += 1
@@ -570,6 +581,7 @@ def run_incremental_clustering(
                     embedding=vector,
                     signature=signature,
                     strong_indicators=indicators,
+                    strict_cve_identity=strict_cve_identity,
                 )
                 if decision.action is AssignmentAction.NEEDS_REVIEW:
                     cluster = replace(cluster, status=ClusterStatus.NEEDS_REVIEW)
@@ -587,8 +599,11 @@ def run_incremental_clustering(
                 reason=decision.reason,
                 similarity=decision.similarity,
                 second_similarity=decision.second_similarity,
+                best_candidate_cluster_id=decision.best_candidate_cluster_id,
+                second_candidate_cluster_id=decision.second_candidate_cluster_id,
                 assigned_at=now_ts,
                 strong_indicators=indicators,
+                strict_cve_identity=strict_cve_identity,
                 article=article,
             )
             if not dry_run and not store.save_cluster_assignment(

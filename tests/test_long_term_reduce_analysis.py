@@ -13,7 +13,11 @@ from feedsummary_core.long_term import (
     run_landscape_reduce,
     select_report_snapshots,
 )
-from feedsummary_core.long_term.reduce_analysis import _segment_id
+from feedsummary_core.long_term.reduce_analysis import (
+    _compact_snapshots_for_final,
+    _metrics_for_prompt,
+    _segment_id,
+)
 
 
 class FakeStore:
@@ -60,8 +64,15 @@ class FakeLLM:
         self.responses = list(responses)
         self.calls = []
 
-    async def chat(self, messages, *, temperature=0.0, max_output_tokens=None):
-        self.calls.append((messages, temperature, max_output_tokens))
+    async def chat(
+        self,
+        messages,
+        *,
+        temperature=0.0,
+        max_output_tokens=None,
+        response_format=None,
+    ):
+        self.calls.append((messages, temperature, max_output_tokens, response_format))
         return self.responses.pop(0)
 
 
@@ -130,6 +141,71 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
             ),
             "output_schema": {"type": "object"},
         }
+
+    def test_prompt_metrics_omit_non_citable_identifier_bulk(self):
+        metrics = copy.deepcopy(self.metrics)
+        window = metrics["windows"][0]
+        window["event_cluster_ids"].append("atomic-1")
+        window["snapshot_eligible_cluster_ids"] = [
+            "cluster-1",
+            "cluster-2",
+            "cluster-3",
+        ]
+        window["source_coverage"] = {
+            "unique_source_count": 2,
+            "unique_sources_per_event": {"cluster-1": 1, "atomic-1": 1},
+        }
+        window["comparison"] = {
+            "event_cluster_ids": ["atomic-old"],
+            "source_coverage": {"unique_sources_per_event": {"atomic-old": 1}},
+        }
+        window["weekly_buckets"][0]["event_cluster_ids"].append("atomic-1")
+
+        compact = _metrics_for_prompt(metrics)
+        compact_window = compact["windows"][0]
+
+        self.assertNotIn("event_cluster_ids", compact_window)
+        self.assertNotIn("event_cluster_ids", compact_window["comparison"])
+        self.assertNotIn(
+            "unique_sources_per_event", compact_window["source_coverage"]
+        )
+        self.assertNotIn("event_cluster_ids", compact_window["weekly_buckets"][0])
+        self.assertEqual(
+            {"window_1": [1]},
+            compact["citable_cluster_bucket_presence"]["cluster-1"],
+        )
+        self.assertNotIn(
+            "atomic-1", compact["citable_cluster_bucket_presence"]
+        )
+        self.assertIn("atomic-1", metrics["windows"][0]["event_cluster_ids"])
+        self.assertEqual(
+            5,
+            compact["prompt_compaction"][
+                "non_citable_event_id_occurrences_omitted"
+            ],
+        )
+
+    def test_final_compaction_retains_identity_and_bounds_detail(self):
+        compact = _compact_snapshots_for_final(
+            [
+                {
+                    "id": "snapshot-1",
+                    "profile_id": "profile",
+                    "cluster_id": "cluster-1",
+                    "summary": "s" * 500,
+                    "key_facts": ["f" * 200, "second"],
+                    "uncertainties": ["u" * 200],
+                }
+            ],
+            level=4,
+        )
+
+        self.assertEqual("cluster-1", compact[0]["cluster_id"])
+        self.assertNotIn("id", compact[0])
+        self.assertNotIn("profile_id", compact[0])
+        self.assertEqual(180, len(compact[0]["summary"]))
+        self.assertEqual(["f" * 120], compact[0]["key_facts"])
+        self.assertEqual(["u" * 100], compact[0]["uncertainties"])
 
     @staticmethod
     def report(*, sparse=False):
@@ -267,6 +343,10 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
         self.assertEqual(2, result.llm_call_count)
         self.assertEqual(1, len(store.reports))
         self.assertEqual([2500, 2500], [call[2] for call in llm.calls])
+        self.assertEqual(
+            [self.final_prompt["output_schema"]] * 2,
+            [call[3] for call in llm.calls],
+        )
 
     def test_invalid_final_response_never_creates_report(self):
         store = FakeStore(self.snapshots)
@@ -279,6 +359,31 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
                 settings=ReduceSettings(format_repair_attempts=0),
             )
         self.assertEqual([], store.reports)
+
+    def test_failed_final_repair_preserves_both_validation_errors(self):
+        store = FakeStore(self.snapshots)
+
+        with self.assertRaisesRegex(
+            ReportValidationError,
+            r"initial report response failed validation \(3 chars\).*"
+            r"format repair failed \(9 chars\)",
+        ):
+            self.run_reduce(store, FakeLLM(["bad", "still bad"]))
+
+        self.assertEqual([], store.reports)
+
+    def test_deterministic_gate_removes_changes_and_forecast_without_trend_coverage(self):
+        self.metrics["windows"][0]["coverage"]["trend_eligible"] = False
+        store = FakeStore(self.snapshots)
+        llm = FakeLLM([json.dumps(self.report())])
+
+        result = self.run_reduce(store, llm)
+
+        self.assertEqual("saved", result.action)
+        self.assertFalse(result.repair_attempted)
+        self.assertEqual([], store.reports[0]["analysis"]["changes"])
+        self.assertEqual([], store.reports[0]["forecast"])
+        self.assertEqual(1, len(llm.calls))
 
     def test_lost_lease_blocks_report_and_mirror_persistence(self):
         store = FakeStore(self.snapshots)
@@ -312,6 +417,24 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
         self.assertEqual([], store.reports)
         self.assertEqual({}, store.summaries)
 
+    def test_failed_reduce_response_can_restart_without_duplicate_report(self):
+        store = FakeStore(self.snapshots)
+        with self.assertRaises(ReportValidationError):
+            self.run_reduce(
+                store,
+                FakeLLM(["not-json"]),
+                settings=ReduceSettings(format_repair_attempts=0),
+            )
+
+        self.assertEqual([], store.reports)
+        resumed = self.run_reduce(store, FakeLLM([json.dumps(self.report())]))
+        replay = self.run_reduce(store, FakeLLM([json.dumps(self.report())]))
+
+        self.assertEqual("saved", resumed.action)
+        self.assertEqual("existing", replay.action)
+        self.assertEqual(resumed.report_id, replay.report_id)
+        self.assertEqual(1, len(store.reports))
+
     def test_large_input_is_segmented_before_final_reduce(self):
         snapshots = copy.deepcopy(self.snapshots)
         for snapshot in snapshots:
@@ -337,6 +460,43 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
         self.assertEqual(4, result.llm_call_count)
         self.assertEqual("landscape-segment-v1", store.reports[0]["segment_prompt_version"])
         self.assertEqual([200, 200, 200, 200], [call[2] for call in llm.calls])
+        self.assertEqual(
+            [self.segment_prompt["output_schema"]] * 3
+            + [self.final_prompt["output_schema"]],
+            [call[3] for call in llm.calls],
+        )
+
+    def test_invalid_segment_and_repair_are_regenerated_in_place(self):
+        snapshots = copy.deepcopy(self.snapshots)
+        for snapshot in snapshots:
+            snapshot["payload"]["summary"] = "x" * 3000
+        groups = [[snapshot] for snapshot in snapshots]
+        responses = [
+            "bad",
+            "still bad",
+            json.dumps(self.segment_payload(groups[0])),
+            json.dumps(self.segment_payload(groups[1])),
+            json.dumps(self.segment_payload(groups[2])),
+            json.dumps(self.report()),
+        ]
+        llm = FakeLLM(responses)
+        store = FakeStore(snapshots)
+
+        result = self.run_reduce(
+            store,
+            llm,
+            settings=ReduceSettings(
+                max_context_tokens=2000,
+                max_output_tokens=200,
+                safety_margin_tokens=100,
+                max_snapshots_per_segment=1,
+                generation_attempts=2,
+            ),
+        )
+
+        self.assertEqual("saved", result.action)
+        self.assertTrue(result.repair_attempted)
+        self.assertEqual(6, result.llm_call_count)
 
     def test_missing_snapshot_disables_trend_claims_and_is_recorded(self):
         store = FakeStore(self.snapshots[:2])
@@ -368,6 +528,24 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
 
         self.assertEqual(
             ["latest", "snapshot-2", "snapshot-3"],
+            [snapshot["id"] for snapshot in selected],
+        )
+
+    def test_snapshot_selection_excludes_atomic_observation_clusters(self):
+        self.metrics["windows"][0]["snapshot_eligible_cluster_ids"] = [
+            "cluster-1",
+            "cluster-2",
+        ]
+
+        selected = select_report_snapshots(
+            FakeStore(self.snapshots),
+            profile_id="profile",
+            metrics=self.metrics,
+            settings=ReduceSettings(),
+        )
+
+        self.assertEqual(
+            ["snapshot-1", "snapshot-2"],
             [snapshot["id"] for snapshot in selected],
         )
 

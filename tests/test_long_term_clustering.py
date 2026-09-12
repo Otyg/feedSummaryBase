@@ -170,6 +170,8 @@ class LongTermClusteringTests(unittest.TestCase):
         )
         self.assertEqual(AssignmentAction.NEEDS_REVIEW, decision.action)
         self.assertEqual("ambiguous_candidates", decision.reason)
+        self.assertEqual(first.id, decision.best_candidate_cluster_id)
+        self.assertEqual(second.id, decision.second_candidate_cluster_id)
 
     def test_conflicting_cves_prevent_high_similarity_merge(self):
         candidate = create_cluster(
@@ -202,6 +204,30 @@ class LongTermClusteringTests(unittest.TestCase):
         self.assertEqual(AssignmentAction.MATCH, supported.action)
         self.assertEqual(
             "similarity_match_with_indicator_support", supported.reason
+        )
+
+    def test_narrative_articles_can_match_despite_disjoint_cves(self):
+        candidate = create_cluster(
+            profile_id="healthcare_europe",
+            article_id="papercut-seed",
+            article_ts=1_000_000,
+            embedding=[1.0, 0.0],
+            signature=self.signature,
+            strong_indicators=["cve:cve-2023-27350", "organization:papercut"],
+            strict_cve_identity=False,
+        )
+        decision = assign_article(
+            profile_id="healthcare_europe",
+            article_ts=1_000_100,
+            embedding=[1.0, 0.0],
+            signature=self.signature,
+            candidates=[candidate],
+            strong_indicators=["cve:cve-2023-27351", "organization:papercut"],
+            strict_cve_identity=False,
+        )
+        self.assertEqual(AssignmentAction.MATCH, decision.action)
+        self.assertEqual(
+            "similarity_match_with_indicator_support", decision.reason
         )
 
 

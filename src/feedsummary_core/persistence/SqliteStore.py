@@ -41,6 +41,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from feedsummary_core.persistence import CleanupPolicy
+from feedsummary_core.long_term.reconciliation import (
+    validate_cluster_merge_operation,
+)
+from feedsummary_core.long_term.membership_edit import validate_cluster_membership_edit
+from feedsummary_core.long_term.review import validate_cluster_review_resolution
 from feedsummary_core.persistence.helpers import classify_summary_doc
 from feedsummary_core.persistence.tag_relations import (
     PARENT_CHILD_RELATION,
@@ -297,6 +302,29 @@ class SqliteStore:
 
                 CREATE INDEX IF NOT EXISTS idx_threat_memberships_cluster
                     ON threat_cluster_memberships(cluster_id, assigned_at);
+
+                CREATE TABLE IF NOT EXISTS long_term_cluster_reconciliations (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    primary_cluster_id TEXT NOT NULL,
+                    reconciled_at INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    doc_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_long_term_reconciliations_profile
+                    ON long_term_cluster_reconciliations(
+                        profile_id, reconciled_at DESC
+                    );
+
+                CREATE TABLE IF NOT EXISTS long_term_cluster_membership_edits (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    article_id TEXT NOT NULL,
+                    edited_at INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    doc_json TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS long_term_article_quarantine (
                     profile_id TEXT NOT NULL,
@@ -1329,7 +1357,10 @@ class SqliteStore:
         embedding_model: Optional[str] = None,
         embedding_dimension: Optional[int] = None,
         embedding_instruction: Optional[str] = None,
+        min_member_count: Optional[int] = None,
         limit: int = 10000,
+        offset: int = 0,
+        include_vectors: bool = True,
     ) -> List[Dict[str, Any]]:
         where = ["profile_id = ?"]
         params: List[Any] = [str(profile_id)]
@@ -1349,21 +1380,35 @@ class SqliteStore:
         if embedding_instruction is not None:
             where.append("embedding_instruction = ?")
             params.append(str(embedding_instruction))
+        if min_member_count is not None:
+            where.append("CAST(json_extract(doc_json, '$.member_count') AS INTEGER) >= ?")
+            params.append(max(0, _safe_int(min_member_count)))
         params.append(max(1, _safe_int(limit, 10000)))
+        params.append(max(0, _safe_int(offset)))
         con = self._connect()
         try:
             rows = con.execute(
                 f"""
                 SELECT doc_json FROM threat_clusters WHERE {' AND '.join(where)}
-                ORDER BY last_seen_ts DESC, id ASC LIMIT ?
+                ORDER BY last_seen_ts DESC, id ASC LIMIT ? OFFSET ?
                 """,
                 tuple(params),
             ).fetchall()
-            return [
+            documents = [
                 doc
                 for row in rows
                 if isinstance((doc := _json_loads(row["doc_json"])), dict)
             ]
+            if not include_vectors:
+                return [
+                    {
+                        key: value
+                        for key, value in document.items()
+                        if key not in {"centroid", "vector_sum"}
+                    }
+                    for document in documents
+                ]
+            return documents
         finally:
             con.close()
 
@@ -1441,6 +1486,48 @@ class SqliteStore:
         except Exception:
             con.rollback()
             raise
+        finally:
+            con.close()
+
+    def resolve_threat_cluster_review(
+        self,
+        cluster_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: int,
+    ) -> bool:
+        doc = validate_cluster_review_resolution(cluster_doc)
+        doc.setdefault("updated_at", _now_ts())
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            existing = con.execute(
+                "SELECT membership_revision, doc_json FROM threat_clusters WHERE id = ?",
+                (str(doc["id"]),),
+            ).fetchone()
+            current = _json_loads(existing["doc_json"]) if existing is not None else None
+            if (
+                existing is None
+                or int(existing["membership_revision"])
+                != int(expected_membership_revision)
+                or not isinstance(current, dict)
+                or str(current.get("status") or "") != "needs_review"
+                or current.get("review_decision")
+            ):
+                con.rollback()
+                return False
+            con.execute(
+                """
+                UPDATE threat_clusters SET status=?, updated_at=?, doc_json=? WHERE id=?
+                """,
+                (
+                    str(doc["status"]),
+                    _safe_int(doc["updated_at"]),
+                    _json_dumps(doc),
+                    str(doc["id"]),
+                ),
+            )
+            con.commit()
+            return True
         finally:
             con.close()
 
@@ -1619,6 +1706,280 @@ class SqliteStore:
             "assigned_at ASC, article_id ASC",
             limit,
         )
+
+    def apply_cluster_reconciliation(
+        self, reconciliation_doc: Dict[str, Any]
+    ) -> bool:
+        """Atomically move memberships and retain secondary cluster tombstones."""
+
+        operation = validate_cluster_merge_operation(reconciliation_doc)
+        operation_id = operation["id"]
+        profile_id = operation["profile_id"]
+        primary_id = operation["primary_cluster_id"]
+        source_ids = operation["source_cluster_ids"]
+        expected = operation["expected_membership_revisions"]
+        targets = {
+            operation["merged_cluster"]["id"]: operation["merged_cluster"],
+            **{
+                row["id"]: row for row in operation["superseded_clusters"]
+            },
+        }
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            existing_operation = con.execute(
+                "SELECT doc_json FROM long_term_cluster_reconciliations WHERE id=?",
+                (operation_id,),
+            ).fetchone()
+            if existing_operation is not None:
+                stored = _json_loads(existing_operation["doc_json"]) or {}
+                con.rollback()
+                if (
+                    stored.get("primary_cluster_id") != primary_id
+                    or stored.get("source_cluster_ids") != source_ids
+                ):
+                    raise ValueError("reconciliation id already has different content")
+                return True
+
+            placeholders = ",".join("?" for _ in source_ids)
+            rows = con.execute(
+                f"SELECT id, membership_revision, doc_json FROM threat_clusters "
+                f"WHERE id IN ({placeholders})",
+                tuple(source_ids),
+            ).fetchall()
+            current = {str(row["id"]): row for row in rows}
+            if set(current) != set(source_ids) or any(
+                int(current[cluster_id]["membership_revision"])
+                != int(expected[cluster_id])
+                for cluster_id in source_ids
+            ):
+                con.rollback()
+                return False
+
+            membership_rows = con.execute(
+                f"SELECT profile_id, article_id, cluster_id, assigned_at, doc_json "
+                f"FROM threat_cluster_memberships "
+                f"WHERE cluster_id IN ({placeholders}) "
+                f"ORDER BY assigned_at ASC, article_id ASC",
+                tuple(source_ids),
+            ).fetchall()
+            if (
+                len(membership_rows)
+                != int(operation["merged_cluster"]["member_count"])
+                or any(str(row["profile_id"]) != profile_id for row in membership_rows)
+            ):
+                con.rollback()
+                return False
+
+            for cluster_id, target in targets.items():
+                target = dict(target)
+                target.setdefault("updated_at", operation["reconciled_at"])
+                con.execute(
+                    """
+                    UPDATE threat_clusters SET profile_id=?, status=?, last_seen_ts=?,
+                        embedding_model=?, embedding_dimension=?, embedding_instruction=?,
+                        membership_revision=?, updated_at=?, doc_json=? WHERE id=?
+                    """,
+                    (
+                        str(target["profile_id"]),
+                        str(target["status"]),
+                        _safe_int(target["last_seen_ts"]),
+                        str(target["embedding_model"]),
+                        _safe_int(target["embedding_dimension"]),
+                        str(target["embedding_instruction"]),
+                        _safe_int(target["membership_revision"]),
+                        _safe_int(target["updated_at"]),
+                        _json_dumps(target),
+                        str(cluster_id),
+                    ),
+                )
+
+            for row in membership_rows:
+                membership = _json_loads(row["doc_json"]) or {}
+                previous_id = str(row["cluster_id"])
+                lineage = [
+                    str(value)
+                    for value in membership.get("cluster_lineage") or []
+                ]
+                if previous_id != primary_id and previous_id not in lineage:
+                    lineage.append(previous_id)
+                    membership["previous_cluster_id"] = previous_id
+                membership.update(
+                    {
+                        "cluster_id": primary_id,
+                        "cluster_lineage": lineage,
+                        "cluster_membership_revision": int(
+                            operation["membership_revision_by_article_id"][
+                                str(row["article_id"])
+                            ]
+                        ),
+                        "reconciliation_id": operation_id,
+                        "reconciled_at": operation["reconciled_at"],
+                    }
+                )
+                con.execute(
+                    """
+                    UPDATE threat_cluster_memberships
+                    SET cluster_id=?, doc_json=?
+                    WHERE profile_id=? AND article_id=?
+                    """,
+                    (
+                        primary_id,
+                        _json_dumps(membership),
+                        str(row["profile_id"]),
+                        str(row["article_id"]),
+                    ),
+                )
+
+            stored_operation = {
+                **operation,
+                "status": "applied",
+                "membership_count": len(membership_rows),
+                "applied_at": operation["reconciled_at"],
+            }
+            con.execute(
+                """
+                INSERT INTO long_term_cluster_reconciliations (
+                    id, profile_id, primary_cluster_id, reconciled_at, status, doc_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    profile_id,
+                    primary_id,
+                    operation["reconciled_at"],
+                    "applied",
+                    _json_dumps(stored_operation),
+                ),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def get_cluster_reconciliation(
+        self, reconciliation_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc(
+            "long_term_cluster_reconciliations", str(reconciliation_id)
+        )
+
+    def apply_cluster_membership_edit(self, edit_doc: Dict[str, Any]) -> bool:
+        """Atomically move one membership and invalidate changed snapshots."""
+        operation = validate_cluster_membership_edit(edit_doc)
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            existing = con.execute(
+                "SELECT doc_json FROM long_term_cluster_membership_edits WHERE id=?",
+                (operation["id"],),
+            ).fetchone()
+            if existing is not None:
+                stored = _json_loads(existing["doc_json"]) or {}
+                con.rollback()
+                if (
+                    stored.get("article_id") != operation["article_id"]
+                    or stored.get("target_cluster_id") != operation["target_cluster_id"]
+                ):
+                    raise ValueError("membership edit id already has different content")
+                return True
+
+            source = con.execute(
+                "SELECT membership_revision FROM threat_clusters WHERE id=?",
+                (operation["source_cluster_id"],),
+            ).fetchone()
+            target = con.execute(
+                "SELECT membership_revision FROM threat_clusters WHERE id=?",
+                (operation["target_cluster_id"],),
+            ).fetchone()
+            target_expected = operation.get("expected_target_membership_revision")
+            if source is None or int(source["membership_revision"]) != int(
+                operation["expected_source_membership_revision"]
+            ):
+                con.rollback()
+                return False
+            if (
+                target_expected is None
+                and target is not None
+                or target_expected is not None
+                and (
+                    target is None
+                    or int(target["membership_revision"]) != int(target_expected)
+                )
+            ):
+                con.rollback()
+                return False
+
+            expected = operation["expected_memberships"]
+            placeholders = ",".join("?" for _ in expected)
+            rows = con.execute(
+                f"SELECT article_id, cluster_id FROM threat_cluster_memberships "
+                f"WHERE profile_id=? AND article_id IN ({placeholders})",
+                (operation["profile_id"], *expected),
+            ).fetchall()
+            if {str(row["article_id"]): str(row["cluster_id"]) for row in rows} != expected:
+                con.rollback()
+                return False
+
+            for cluster in (operation["source_cluster"], operation["target_cluster"]):
+                con.execute(
+                    """
+                    INSERT INTO threat_clusters (
+                        id, profile_id, status, last_seen_ts, embedding_model,
+                        embedding_dimension, embedding_instruction,
+                        membership_revision, updated_at, doc_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        profile_id=excluded.profile_id, status=excluded.status,
+                        last_seen_ts=excluded.last_seen_ts,
+                        embedding_model=excluded.embedding_model,
+                        embedding_dimension=excluded.embedding_dimension,
+                        embedding_instruction=excluded.embedding_instruction,
+                        membership_revision=excluded.membership_revision,
+                        updated_at=excluded.updated_at, doc_json=excluded.doc_json
+                    """,
+                    (
+                        cluster["id"], cluster["profile_id"], cluster["status"],
+                        _safe_int(cluster["last_seen_ts"]), cluster["embedding_model"],
+                        _safe_int(cluster["embedding_dimension"]),
+                        cluster["embedding_instruction"],
+                        _safe_int(cluster["membership_revision"]),
+                        _safe_int(cluster.get("updated_at"), operation["edited_at"]),
+                        _json_dumps(cluster),
+                    ),
+                )
+            for membership in operation["memberships"]:
+                con.execute(
+                    """UPDATE threat_cluster_memberships SET cluster_id=?, doc_json=?
+                    WHERE profile_id=? AND article_id=?""",
+                    (
+                        membership["cluster_id"], _json_dumps(membership),
+                        operation["profile_id"], membership["article_id"],
+                    ),
+                )
+            stored = {**operation, "status": "applied", "applied_at": operation["edited_at"]}
+            con.execute(
+                """INSERT INTO long_term_cluster_membership_edits
+                (id, profile_id, article_id, edited_at, status, doc_json)
+                VALUES (?, ?, ?, ?, 'applied', ?)""",
+                (
+                    operation["id"], operation["profile_id"], operation["article_id"],
+                    operation["edited_at"], _json_dumps(stored),
+                ),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def get_cluster_membership_edit(self, edit_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("long_term_cluster_membership_edits", str(edit_id))
 
     def get_long_term_quarantine(
         self, profile_id: str, article_id: str
@@ -1915,6 +2276,11 @@ class SqliteStore:
         finally:
             con.close()
 
+    def get_cluster_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc(
+            "threat_cluster_snapshots", str(snapshot_id)
+        )
+
     def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool:
         doc = dict(report_doc or {})
         required = ("id", "profile_id", "period_end_ts", "created_at")
@@ -1951,6 +2317,17 @@ class SqliteStore:
 
     def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         return self._get_long_term_doc("long_term_runs", str(run_id))
+
+    def list_long_term_runs(
+        self, profile_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "long_term_runs",
+            "profile_id",
+            str(profile_id),
+            "started_at DESC, id ASC",
+            limit,
+        )
 
     def update_long_term_run(
         self,
@@ -2095,8 +2472,22 @@ class SqliteStore:
         cut_weekly = now - pol.weekly_summaries_days * 86400
         cut_temp = now - pol.temp_summaries_days * 86400
         cut_jobs = now - pol.jobs_days * 86400
+        cut_long_term = (
+            now - pol.long_term_days * 86400 if pol.long_term_days > 0 else -1
+        )
 
-        removed = {"articles": 0, "summary_docs": 0, "temp_summaries": 0, "jobs": 0}
+        removed = {
+            "articles": 0,
+            "summary_docs": 0,
+            "temp_summaries": 0,
+            "jobs": 0,
+            "long_term_reports": 0,
+            "long_term_snapshots": 0,
+            "long_term_clusters": 0,
+            "long_term_memberships": 0,
+            "long_term_runs": 0,
+            "long_term_quarantine": 0,
+        }
 
         con = self._connect()
         try:
@@ -2159,6 +2550,129 @@ class SqliteStore:
                         tuple(part),
                     )
                     removed["summary_docs"] += cur.rowcount if cur.rowcount is not None else 0
+
+            # Long-term reports own their snapshot provenance. An expired snapshot
+            # therefore remains while any retained report still references it.
+            retained_snapshot_ids: set[str] = set()
+            rows = con.execute(
+                """
+                SELECT doc_json FROM threat_landscape_reports
+                WHERE period_end_ts >= ?
+                """,
+                (cut_long_term,),
+            ).fetchall()
+            for row in rows:
+                report = _json_loads(row["doc_json"]) or {}
+                if isinstance(report, dict):
+                    retained_snapshot_ids.update(
+                        str(snapshot_id)
+                        for snapshot_id in report.get("input_snapshot_ids") or []
+                    )
+            cur = con.execute(
+                "DELETE FROM threat_landscape_reports WHERE period_end_ts < ?",
+                (cut_long_term,),
+            )
+            removed["long_term_reports"] = cur.rowcount or 0
+
+            rows = con.execute(
+                "SELECT id FROM threat_cluster_snapshots WHERE created_at < ?",
+                (cut_long_term,),
+            ).fetchall()
+            expired_snapshot_ids = [
+                str(row["id"])
+                for row in rows
+                if str(row["id"]) not in retained_snapshot_ids
+            ]
+            for i in range(0, len(expired_snapshot_ids), 200):
+                part = expired_snapshot_ids[i : i + 200]
+                placeholders = ",".join(["?"] * len(part))
+                cur = con.execute(
+                    f"DELETE FROM threat_cluster_snapshots WHERE id IN ({placeholders})",
+                    tuple(part),
+                )
+                removed["long_term_snapshots"] += cur.rowcount or 0
+
+            protected_cluster_ids = {
+                str(row["cluster_id"])
+                for row in con.execute(
+                    "SELECT DISTINCT cluster_id FROM threat_cluster_snapshots"
+                ).fetchall()
+            }
+            for row in con.execute(
+                "SELECT doc_json FROM long_term_cluster_reconciliations"
+            ).fetchall():
+                reconciliation = _json_loads(row["doc_json"]) or {}
+                protected_cluster_ids.update(
+                    str(value)
+                    for value in reconciliation.get("source_cluster_ids") or []
+                )
+            for row in con.execute(
+                "SELECT doc_json FROM long_term_cluster_membership_edits"
+            ).fetchall():
+                edit = _json_loads(row["doc_json"]) or {}
+                protected_cluster_ids.update(
+                    str(edit.get(field) or "")
+                    for field in ("source_cluster_id", "target_cluster_id")
+                )
+            protected_cluster_ids.discard("")
+            rows = con.execute(
+                """
+                SELECT id FROM threat_clusters
+                WHERE status='closed' AND last_seen_ts < ?
+                """,
+                (cut_long_term,),
+            ).fetchall()
+            expired_cluster_ids = [
+                str(row["id"])
+                for row in rows
+                if str(row["id"]) not in protected_cluster_ids
+            ]
+            for i in range(0, len(expired_cluster_ids), 200):
+                part = expired_cluster_ids[i : i + 200]
+                placeholders = ",".join(["?"] * len(part))
+                cur = con.execute(
+                    f"DELETE FROM threat_cluster_memberships WHERE cluster_id IN ({placeholders})",
+                    tuple(part),
+                )
+                removed["long_term_memberships"] += cur.rowcount or 0
+                cur = con.execute(
+                    f"DELETE FROM threat_clusters WHERE id IN ({placeholders})",
+                    tuple(part),
+                )
+                removed["long_term_clusters"] += cur.rowcount or 0
+
+            rows = con.execute(
+                """
+                SELECT id, started_at, doc_json FROM long_term_runs
+                WHERE started_at < ? AND status IN ('done', 'failed', 'blocked')
+                """,
+                (cut_long_term,),
+            ).fetchall()
+            expired_run_ids = []
+            for row in rows:
+                run = _json_loads(row["doc_json"]) or {}
+                finished_at = int(
+                    run.get("finished_at") or row["started_at"] or 0
+                )
+                if finished_at < cut_long_term:
+                    expired_run_ids.append(str(row["id"]))
+            for i in range(0, len(expired_run_ids), 200):
+                part = expired_run_ids[i : i + 200]
+                placeholders = ",".join(["?"] * len(part))
+                cur = con.execute(
+                    f"DELETE FROM long_term_runs WHERE id IN ({placeholders})",
+                    tuple(part),
+                )
+                removed["long_term_runs"] += cur.rowcount or 0
+
+            cur = con.execute(
+                """
+                DELETE FROM long_term_article_quarantine
+                WHERE status='resolved' AND COALESCE(resolved_at, 0) < ?
+                """,
+                (cut_long_term,),
+            )
+            removed["long_term_quarantine"] = cur.rowcount or 0
 
             con.commit()
             return removed

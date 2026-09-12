@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -81,6 +82,7 @@ class ReduceLLM(Protocol):
         *,
         temperature: float = 0.0,
         max_output_tokens: int | None = None,
+        response_format: str | dict[str, Any] | None = None,
     ) -> str: ...
 
 
@@ -100,6 +102,7 @@ class ReduceSettings:
     max_snapshots_per_segment: int = 12
     max_snapshot_records: int = 10000
     format_repair_attempts: int = 1
+    generation_attempts: int = 3
 
     def __post_init__(self) -> None:
         positive = (
@@ -107,6 +110,7 @@ class ReduceSettings:
             self.max_output_tokens,
             self.max_snapshots_per_segment,
             self.max_snapshot_records,
+            self.generation_attempts,
         )
         if any(value < 1 for value in positive):
             raise ValueError("Reduce limits must be positive")
@@ -168,9 +172,67 @@ def _event_cluster_ids(metrics: dict[str, Any]) -> set[str]:
         str(cluster_id)
         for window in metrics.get("windows") or []
         if isinstance(window, dict)
-        for cluster_id in window.get("event_cluster_ids") or []
+        for cluster_id in (
+            window.get("snapshot_eligible_cluster_ids")
+            if "snapshot_eligible_cluster_ids" in window
+            else window.get("event_cluster_ids")
+        )
+        or []
         if str(cluster_id)
     }
+
+
+def _metrics_for_prompt(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Remove non-citable identifier bulk while retaining counts and time evidence."""
+
+    result = copy.deepcopy(metrics)
+    citable_ids = _event_cluster_ids(result)
+    omitted_event_ids = 0
+    omitted_source_rows = 0
+    bucket_presence: dict[str, dict[str, list[int]]] = {}
+
+    def compact_period(period: dict[str, Any]) -> None:
+        nonlocal omitted_event_ids, omitted_source_rows
+        event_ids = period.pop("event_cluster_ids", [])
+        if isinstance(event_ids, list):
+            omitted_event_ids += len(event_ids)
+        period.pop("snapshot_eligible_cluster_ids", None)
+        source_coverage = period.get("source_coverage")
+        if isinstance(source_coverage, dict):
+            per_event = source_coverage.pop("unique_sources_per_event", {})
+            if isinstance(per_event, dict):
+                omitted_source_rows += len(per_event)
+
+    for window_number, window in enumerate(result.get("windows") or [], start=1):
+        if not isinstance(window, dict):
+            continue
+        window_key = str(window.get("days") or f"window_{window_number}")
+        compact_period(window)
+        comparison = window.get("comparison")
+        if isinstance(comparison, dict):
+            compact_period(comparison)
+        for bucket_number, bucket in enumerate(
+            window.get("weekly_buckets") or [], start=1
+        ):
+            if not isinstance(bucket, dict):
+                continue
+            event_ids = bucket.pop("event_cluster_ids", None)
+            if isinstance(event_ids, list):
+                for value in event_ids:
+                    cluster_id = str(value)
+                    if cluster_id in citable_ids:
+                        bucket_presence.setdefault(cluster_id, {}).setdefault(
+                            window_key, []
+                        ).append(bucket_number)
+
+    result["citable_cluster_bucket_presence"] = bucket_presence
+    result["prompt_compaction"] = {
+        "non_citable_event_id_occurrences_omitted": omitted_event_ids,
+        "per_event_source_rows_omitted": omitted_source_rows,
+        "counts_and_source_aggregates_preserved": True,
+        "bucket_membership_inverted_by_citable_cluster": True,
+    }
+    return result
 
 
 def select_report_snapshots(
@@ -226,7 +288,12 @@ def _apply_snapshot_coverage(
         missing = sorted(
             {
                 str(value)
-                for value in window.get("event_cluster_ids") or []
+                for value in (
+                    window.get("snapshot_eligible_cluster_ids")
+                    if "snapshot_eligible_cluster_ids" in window
+                    else window.get("event_cluster_ids")
+                )
+                or []
                 if str(value) and str(value) not in available
             }
         )
@@ -241,6 +308,25 @@ def _apply_snapshot_coverage(
         coverage["warnings"] = warnings
     quality["warning_codes"] = sorted(warning_codes)
     return result
+
+
+def _apply_deterministic_report_gates(
+    report: dict[str, Any], metrics: dict[str, Any]
+) -> dict[str, Any]:
+    """Remove model claims that deterministic coverage rules cannot permit."""
+
+    trend_eligible = any(
+        isinstance(window, dict)
+        and isinstance(window.get("coverage"), dict)
+        and window["coverage"].get("trend_eligible") is True
+        for window in metrics.get("windows") or []
+    )
+    if trend_eligible:
+        return report
+    gated = copy.deepcopy(report)
+    gated["changes"] = []
+    gated["forecast"] = []
+    return gated
 
 
 def _previous_report(
@@ -419,6 +505,72 @@ def _segment_groups(
     return groups
 
 
+_FINAL_COMPACTION_LEVELS = (
+    (600, 3, 240, 2, 200),
+    (400, 2, 200, 1, 180),
+    (260, 2, 140, 1, 120),
+    (180, 1, 120, 1, 100),
+    (140, 1, 90, 0, 0),
+    (120, 0, 0, 0, 0),
+    (80, 0, 0, 0, 0),
+    (60, 0, 0, 0, 0),
+    (40, 0, 0, 0, 0),
+)
+
+
+def _compact_snapshots_for_final(
+    snapshots: list[dict[str, Any]], *, level: int
+) -> list[dict[str, Any]]:
+    """Create an evenly bounded final view while retaining every cluster identity."""
+
+    try:
+        summary_chars, fact_count, fact_chars, uncertainty_count, uncertainty_chars = (
+            _FINAL_COMPACTION_LEVELS[level - 1]
+        )
+    except IndexError as error:
+        raise ValueError("final compaction level is out of range") from error
+
+    def clipped_strings(value: Any, count: int, chars: int) -> list[str]:
+        if not isinstance(value, list) or count < 1 or chars < 1:
+            return []
+        return [
+            text[:chars]
+            for item in value[:count]
+            if (text := str(item or "").strip())
+        ]
+
+    result = []
+    for snapshot in snapshots:
+        result.append(
+            {
+                "cluster_id": str(snapshot.get("cluster_id") or ""),
+                "summary": str(snapshot.get("summary") or "").strip()[:summary_chars],
+                "key_facts": clipped_strings(
+                    snapshot.get("key_facts"), fact_count, fact_chars
+                ),
+                "uncertainties": clipped_strings(
+                    snapshot.get("uncertainties"),
+                    uncertainty_count,
+                    uncertainty_chars,
+                ),
+            }
+        )
+    return result
+
+
+def _previous_report_identity(
+    previous_report: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if previous_report is None:
+        return None
+    return {
+        "id": previous_report.get("id"),
+        "period_start_ts": previous_report.get("period_start_ts"),
+        "period_end_ts": previous_report.get("period_end_ts"),
+        "detail_omitted_for_prompt_budget": True,
+    }
+
+
 async def _repair_json(
     llm: ReduceLLM,
     *,
@@ -454,6 +606,7 @@ async def _repair_json(
         messages,
         temperature=0.0,
         max_output_tokens=max_output_tokens,
+        response_format=output_schema,
     )
 
 
@@ -472,6 +625,7 @@ async def run_landscape_reduce(
     settings: ReduceSettings | None = None,
     mirror_to_summary_docs: bool = False,
     lease_guard: LeaseGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> ReduceResult:
     """Generate, validate and idempotently save one frozen landscape report."""
 
@@ -486,13 +640,14 @@ async def run_landscape_reduce(
         settings=settings,
     )
     frozen_metrics = _apply_snapshot_coverage(metrics, snapshots)
+    prompt_metrics = _metrics_for_prompt(frozen_metrics)
     period_end_ts = int(frozen_metrics.get("period_end_ts") or 0)
     previous_report_id, previous = _previous_report(store, profile_id, period_end_ts)
     final_snapshots = snapshots
     messages = render_landscape_report_messages(
         final_prompt_package,
         profile_context=profile_context,
-        metrics=frozen_metrics,
+        metrics=prompt_metrics,
         snapshots=final_snapshots,
         previous_report=previous,
     )
@@ -508,77 +663,191 @@ async def run_landscape_reduce(
             snapshots=snapshots,
             settings=settings,
         )
-        for group in groups:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "segment_plan",
+                    "segment_total": len(groups),
+                    "snapshot_total": len(snapshots),
+                }
+            )
+        for segment_number, group in enumerate(groups, start=1):
             segment_count += 1
+            segment_repair_attempted = False
             segment_id = _segment_id(profile_id, group)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "segment_started",
+                        "segment_number": segment_number,
+                        "segment_total": len(groups),
+                        "snapshot_count": len(group),
+                    }
+                )
             segment_messages = _segment_messages(
                 segment_prompt_package,
                 profile_id=profile_id,
                 segment_id=segment_id,
                 snapshots=group,
             )
-            raw_segment = await llm.chat(
-                segment_messages,
-                temperature=float(segment_prompt_package.get("temperature", 0.0)),
-                max_output_tokens=settings.max_output_tokens,
-            )
-            llm_call_count += 1
-            try:
-                segment_payload = parse_landscape_report_json(raw_segment)
-                compact.extend(
-                    validate_landscape_segment(
-                        segment_payload,
-                        profile_id=profile_id,
-                        segment_id=segment_id,
-                        snapshots=group,
-                    )
-                )
-            except ReportValidationError as error:
-                if settings.format_repair_attempts < 1:
-                    raise
-                repair_attempted = True
-                repaired = await _repair_json(
-                    llm,
-                    raw=raw_segment,
-                    error=error,
-                    output_schema=segment_prompt_package["output_schema"],
-                    identity={
-                        "profile_id": profile_id,
-                        "segment_id": segment_id,
-                        "snapshot_ids": sorted(str(row["id"]) for row in group),
-                    },
+            segment_rows: list[dict[str, Any]] | None = None
+            last_segment_error: ReportValidationError | None = None
+            for generation_attempt in range(1, settings.generation_attempts + 1):
+                raw_segment = await llm.chat(
+                    segment_messages,
+                    temperature=float(segment_prompt_package.get("temperature", 0.0)),
                     max_output_tokens=settings.max_output_tokens,
+                    response_format=segment_prompt_package["output_schema"],
                 )
                 llm_call_count += 1
-                compact.extend(
-                    validate_landscape_segment(
-                        parse_landscape_report_json(repaired),
+                try:
+                    segment_rows = validate_landscape_segment(
+                        parse_landscape_report_json(raw_segment),
                         profile_id=profile_id,
                         segment_id=segment_id,
                         snapshots=group,
                     )
+                except ReportValidationError as error:
+                    last_segment_error = error
+                    if settings.format_repair_attempts:
+                        repair_attempted = True
+                        segment_repair_attempted = True
+                        repaired = await _repair_json(
+                            llm,
+                            raw=raw_segment,
+                            error=error,
+                            output_schema=segment_prompt_package["output_schema"],
+                            identity={
+                                "profile_id": profile_id,
+                                "segment_id": segment_id,
+                                "snapshot_ids": sorted(
+                                    str(row["id"]) for row in group
+                                ),
+                            },
+                            max_output_tokens=settings.max_output_tokens,
+                        )
+                        llm_call_count += 1
+                        try:
+                            segment_rows = validate_landscape_segment(
+                                parse_landscape_report_json(repaired),
+                                profile_id=profile_id,
+                                segment_id=segment_id,
+                                snapshots=group,
+                            )
+                        except ReportValidationError as repair_error:
+                            last_segment_error = ReportValidationError(
+                                "initial segment response failed validation "
+                                f"({len(raw_segment)} chars): {error}; "
+                                "format repair failed "
+                                f"({len(repaired)} chars): {repair_error}"
+                            )
+                    if (
+                        segment_rows is None
+                        and generation_attempt < settings.generation_attempts
+                        and progress_callback is not None
+                    ):
+                        progress_callback(
+                            {
+                                "status": "segment_retry",
+                                "segment_number": segment_number,
+                                "segment_total": len(groups),
+                                "next_generation_attempt": generation_attempt + 1,
+                                "error": str(last_segment_error)[:1000],
+                            }
+                        )
+                if segment_rows is not None:
+                    break
+            if segment_rows is None:
+                if last_segment_error is None:
+                    raise RuntimeError("segment generation ended without a result")
+                raise last_segment_error
+            compact.extend(segment_rows)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "segment_completed",
+                        "segment_number": segment_number,
+                        "segment_total": len(groups),
+                        "repair_attempted": segment_repair_attempted,
+                    }
                 )
         final_snapshots = sorted(compact, key=lambda row: str(row["cluster_id"]))
         messages = render_landscape_report_messages(
             final_prompt_package,
             profile_context=profile_context,
-            metrics=frozen_metrics,
+            metrics=prompt_metrics,
             snapshots=final_snapshots,
             previous_report=previous,
         )
         final_estimate = estimate_tokens(messages_to_text(messages))
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "final_candidate",
+                    "estimated_prompt_tokens": final_estimate,
+                    "input_budget_tokens": settings.input_budget,
+                }
+            )
         if final_estimate > settings.input_budget:
-            raise ReduceBudgetError("segmented Reduce input still exceeds final prompt budget")
+            minimum_estimate = final_estimate
+            for compaction_level in range(1, len(_FINAL_COMPACTION_LEVELS) + 1):
+                candidate_snapshots = _compact_snapshots_for_final(
+                    final_snapshots, level=compaction_level
+                )
+                candidate_messages = render_landscape_report_messages(
+                    final_prompt_package,
+                    profile_context=profile_context,
+                    metrics=prompt_metrics,
+                    snapshots=candidate_snapshots,
+                    previous_report=_previous_report_identity(previous),
+                )
+                candidate_estimate = estimate_tokens(
+                    messages_to_text(candidate_messages)
+                )
+                minimum_estimate = candidate_estimate
+                if candidate_estimate <= settings.input_budget:
+                    final_snapshots = candidate_snapshots
+                    messages = candidate_messages
+                    final_estimate = candidate_estimate
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "status": "final_compacted",
+                                "compaction_level": compaction_level,
+                                "estimated_prompt_tokens": final_estimate,
+                                "input_budget_tokens": settings.input_budget,
+                            }
+                        )
+                    break
+            else:
+                raise ReduceBudgetError(
+                    "segmented Reduce input still exceeds final prompt budget after "
+                    "deterministic compaction: "
+                    f"estimated {minimum_estimate}, budget {settings.input_budget}"
+                )
 
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "status": "final_started",
+                "segment_count": segment_count,
+                "estimated_prompt_tokens": final_estimate,
+                "input_budget_tokens": settings.input_budget,
+            }
+        )
     raw_report = await llm.chat(
         messages,
         temperature=float(final_prompt_package.get("temperature", 0.0)),
         max_output_tokens=settings.max_output_tokens,
+        response_format=final_prompt_package["output_schema"],
     )
     llm_call_count += 1
     try:
+        parsed_report = _apply_deterministic_report_gates(
+            parse_landscape_report_json(raw_report), frozen_metrics
+        )
         report = validate_landscape_report(
-            parse_landscape_report_json(raw_report),
+            parsed_report,
             profile_id=profile_id,
             metrics=frozen_metrics,
             snapshots=snapshots,
@@ -601,13 +870,23 @@ async def run_landscape_reduce(
             max_output_tokens=settings.max_output_tokens,
         )
         llm_call_count += 1
-        report = validate_landscape_report(
-            parse_landscape_report_json(repaired),
-            profile_id=profile_id,
-            metrics=frozen_metrics,
-            snapshots=snapshots,
-            forecast_horizon_days=forecast_horizon_days,
-        )
+        try:
+            parsed_repair = _apply_deterministic_report_gates(
+                parse_landscape_report_json(repaired), frozen_metrics
+            )
+            report = validate_landscape_report(
+                parsed_repair,
+                profile_id=profile_id,
+                metrics=frozen_metrics,
+                snapshots=snapshots,
+                forecast_horizon_days=forecast_horizon_days,
+            )
+        except ReportValidationError as repair_error:
+            raise ReportValidationError(
+                "initial report response failed validation "
+                f"({len(raw_report)} chars): {error}; format repair failed "
+                f"({len(repaired)} chars): {repair_error}"
+            ) from repair_error
 
     prompt_version = _non_empty(
         final_prompt_package.get("prompt_version"), "final_prompt.prompt_version"
@@ -645,6 +924,14 @@ async def run_landscape_reduce(
         if mirror_to_summary_docs
         else "disabled"
     )
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "status": "final_completed",
+                "report_id": str(document["id"]),
+                "mirror_action": mirror_action,
+            }
+        )
     return ReduceResult(
         action="saved" if saved else "existing",
         report_id=str(document["id"]),

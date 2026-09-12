@@ -18,6 +18,7 @@ def cluster(
     status="active",
     membership_revision=1,
     summarized_revision=1,
+    member_count=None,
     last_reopened_at=None,
 ):
     return {
@@ -28,6 +29,7 @@ def cluster(
         "last_seen_ts": last_seen,
         "membership_revision": membership_revision,
         "summarized_revision": summarized_revision,
+        "member_count": member_count or membership_revision,
         "last_reopened_at": last_reopened_at,
     }
 
@@ -175,6 +177,27 @@ class LongTermMetricsTests(unittest.TestCase):
         self.assertEqual(0, window["coverage"]["missing_time_bucket_count"])
         self.assertTrue(window["coverage"]["trend_eligible"])
 
+    def test_atomic_singletons_do_not_create_snapshot_backlog_when_excluded(self):
+        metrics = compute_landscape_metrics(
+            profile_id="profile",
+            period_end_ts=self.end,
+            clusters=self.clusters,
+            memberships=self.memberships,
+            settings=LandscapeMetricSettings(
+                windows_days=(30,),
+                min_snapshot_member_count=2,
+            ),
+        )
+
+        window = metrics["windows"][0]
+        self.assertEqual(3, window["independent_event_count"])
+        self.assertEqual(["c1"], window["snapshot_eligible_cluster_ids"])
+        self.assertEqual(2, window["atomic_observation_cluster_count"])
+        self.assertEqual(0, window["coverage"]["pending_snapshot_count"])
+        self.assertNotIn(
+            "pending_cluster_snapshots", window["coverage"]["warnings"]
+        )
+
     def test_store_builder_falls_back_to_retained_article_source(self):
         rows = [membership("c1", "a1", self.end - DAY)]
         store = FakeStore(
@@ -192,6 +215,51 @@ class LongTermMetricsTests(unittest.TestCase):
         coverage = metrics["windows"][0]["source_coverage"]
         self.assertEqual({"retained-source": 1}, coverage["source_article_counts"])
         self.assertEqual(0, coverage["unknown_source_article_count"])
+
+    def test_unresolved_and_excluded_reviews_do_not_affect_event_metrics(self):
+        clusters = [
+            cluster(
+                "included",
+                first_seen=self.end - DAY,
+                last_seen=self.end - DAY,
+            ),
+            cluster(
+                "unresolved",
+                first_seen=self.end - DAY,
+                last_seen=self.end - DAY,
+                status="needs_review",
+            ),
+            {
+                **cluster(
+                    "excluded",
+                    first_seen=self.end - DAY,
+                    last_seen=self.end - DAY,
+                    status="closed",
+                ),
+                "review_decision": "exclude",
+            },
+        ]
+        memberships = [
+            membership(row["id"], f"article-{row['id']}", self.end - DAY, "source")
+            for row in clusters
+        ]
+
+        metrics = compute_landscape_metrics(
+            profile_id="profile",
+            period_end_ts=self.end,
+            clusters=clusters,
+            memberships=memberships,
+            settings=LandscapeMetricSettings(windows_days=(7,)),
+        )
+
+        self.assertEqual(1, metrics["windows"][0]["independent_event_count"])
+        self.assertEqual(1, metrics["quality"]["unresolved_review_cluster_count"])
+        self.assertEqual(1, metrics["quality"]["excluded_review_cluster_count"])
+        self.assertEqual(2, metrics["quality"]["ignored_review_membership_count"])
+        self.assertIn(
+            "unresolved_cluster_reviews_ignored",
+            metrics["quality"]["warning_codes"],
+        )
 
 
 if __name__ == "__main__":

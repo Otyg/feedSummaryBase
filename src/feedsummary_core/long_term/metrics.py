@@ -63,6 +63,7 @@ class LandscapeMetricSettings:
     source_mix_change_threshold: float = 0.35
     max_clusters: int = 10000
     max_memberships_per_cluster: int = 10000
+    min_snapshot_member_count: int = 1
 
     def __post_init__(self) -> None:
         if not self.windows_days or any(days < 1 for days in self.windows_days):
@@ -81,6 +82,8 @@ class LandscapeMetricSettings:
                 raise ValueError(f"{name} must be between zero and one")
         if self.max_clusters < 1 or self.max_memberships_per_cluster < 1:
             raise ValueError("input limits must be positive")
+        if self.min_snapshot_member_count < 1:
+            raise ValueError("min_snapshot_member_count must be positive")
 
 
 def _safe_int(value: Any) -> int:
@@ -88,6 +91,14 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _cluster_member_count(cluster: dict[str, Any]) -> int:
+    """Read member count while retaining compatibility with older documents."""
+
+    return _safe_int(cluster.get("member_count")) or _safe_int(
+        cluster.get("membership_revision")
+    )
 
 
 def _in_period(value: Any, start_ts: int, end_ts: int) -> bool:
@@ -260,10 +271,30 @@ def compute_landscape_metrics(
     profile_id = str(profile_id or "").strip()
     if not profile_id or period_end_ts < 1:
         raise ValueError("profile_id and a positive period_end_ts are required")
-    clusters_by_id = {
-        str(row.get("id")): dict(row)
+    profile_clusters = [
+        dict(row)
         for row in clusters
-        if str(row.get("profile_id") or "") == profile_id and str(row.get("id") or "")
+        if str(row.get("profile_id") or "") == profile_id
+        and str(row.get("id") or "")
+    ]
+    unresolved_review_cluster_ids = {
+        str(row["id"])
+        for row in profile_clusters
+        if str(row.get("status") or "") == "needs_review"
+        and not row.get("review_decision")
+    }
+    excluded_review_cluster_ids = {
+        str(row["id"])
+        for row in profile_clusters
+        if str(row.get("review_decision") or "") == "exclude"
+    }
+    ignored_review_cluster_ids = (
+        unresolved_review_cluster_ids | excluded_review_cluster_ids
+    )
+    clusters_by_id = {
+        str(row["id"]): row
+        for row in profile_clusters
+        if str(row["id"]) not in ignored_review_cluster_ids
     }
     article_sources = {
         str(row.get("id")): str(row.get("source") or "").strip()
@@ -274,6 +305,7 @@ def compute_landscape_metrics(
     invalid_membership_count = 0
     seen_memberships: set[tuple[str, str]] = set()
     duplicate_membership_count = 0
+    ignored_review_membership_count = 0
     for row in sorted(
         memberships,
         key=lambda item: (
@@ -284,6 +316,9 @@ def compute_landscape_metrics(
     ):
         cluster_id = str(row.get("cluster_id") or "")
         article_id = str(row.get("article_id") or "")
+        if cluster_id in ignored_review_cluster_ids:
+            ignored_review_membership_count += 1
+            continue
         if cluster_id not in clusters_by_id or not article_id or _membership_time(row) < 1:
             invalid_membership_count += 1
             continue
@@ -313,6 +348,17 @@ def compute_landscape_metrics(
             start_ts=start_ts - seconds,
             end_ts=start_ts,
         )
+        for values in (current, previous):
+            snapshot_eligible = [
+                cluster_id
+                for cluster_id in values["event_cluster_ids"]
+                if _cluster_member_count(clusters_by_id[cluster_id])
+                >= settings.min_snapshot_member_count
+            ]
+            values["snapshot_eligible_cluster_ids"] = snapshot_eligible
+            values["atomic_observation_cluster_count"] = (
+                len(values["event_cluster_ids"]) - len(snapshot_eligible)
+            )
         buckets = _weekly_buckets(
             valid_memberships,
             clusters_by_id,
@@ -360,7 +406,7 @@ def compute_landscape_metrics(
         pending_snapshot_count = sum(
             _safe_int(clusters_by_id[cluster_id].get("summarized_revision"))
             < _safe_int(clusters_by_id[cluster_id].get("membership_revision"))
-            for cluster_id in current["event_cluster_ids"]
+            for cluster_id in current["snapshot_eligible_cluster_ids"]
         )
         if pending_snapshot_count:
             warnings.append("pending_cluster_snapshots")
@@ -407,6 +453,10 @@ def compute_landscape_metrics(
         global_warnings.add("duplicate_memberships_ignored")
     if input_truncated:
         global_warnings.add("input_truncated")
+    if unresolved_review_cluster_ids:
+        global_warnings.add("unresolved_cluster_reviews_ignored")
+    if excluded_review_cluster_ids:
+        global_warnings.add("excluded_review_clusters_ignored")
     return {
         "schema_version": 1,
         "profile_id": profile_id,
@@ -419,6 +469,7 @@ def compute_landscape_metrics(
             ),
             "source_concentration_threshold": settings.source_concentration_threshold,
             "source_mix_change_threshold": settings.source_mix_change_threshold,
+            "min_snapshot_member_count": settings.min_snapshot_member_count,
         },
         "windows": windows,
         "quality": {
@@ -426,6 +477,9 @@ def compute_landscape_metrics(
             "input_membership_count": len(valid_memberships),
             "invalid_membership_count": invalid_membership_count,
             "duplicate_membership_count": duplicate_membership_count,
+            "unresolved_review_cluster_count": len(unresolved_review_cluster_ids),
+            "excluded_review_cluster_count": len(excluded_review_cluster_ids),
+            "ignored_review_membership_count": ignored_review_membership_count,
             "input_truncated": bool(input_truncated),
             "warning_codes": sorted(global_warnings),
         },

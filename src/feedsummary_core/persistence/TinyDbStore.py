@@ -44,6 +44,11 @@ from tinydb import Query, TinyDB
 from tinydb.operations import delete as delete_field
 
 from feedsummary_core.persistence import CleanupPolicy
+from feedsummary_core.long_term.reconciliation import (
+    validate_cluster_merge_operation,
+)
+from feedsummary_core.long_term.membership_edit import validate_cluster_membership_edit
+from feedsummary_core.long_term.review import validate_cluster_review_resolution
 from feedsummary_core.persistence.tag_relations import (
     PARENT_CHILD_RELATION,
     proposed_parent_child_edges,
@@ -575,7 +580,10 @@ class TinyDBStore:
         embedding_model: Optional[str] = None,
         embedding_dimension: Optional[int] = None,
         embedding_instruction: Optional[str] = None,
+        min_member_count: Optional[int] = None,
         limit: int = 10000,
+        offset: int = 0,
+        include_vectors: bool = True,
     ) -> List[Dict[str, Any]]:
         status_set = {str(status) for status in statuses or [] if str(status)}
         db = self._db()
@@ -602,9 +610,24 @@ class TinyDBStore:
                     and row.get("embedding_instruction") != embedding_instruction
                 ):
                     continue
+                if min_member_count is not None and int(row.get("member_count") or 0) < int(
+                    min_member_count
+                ):
+                    continue
                 rows.append(row)
             rows.sort(key=lambda row: (-int(row.get("last_seen_ts") or 0), str(row.get("id"))))
-            return rows[: max(1, int(limit))]
+            start = max(0, int(offset))
+            selected = rows[start : start + max(1, int(limit))]
+            if not include_vectors:
+                return [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"centroid", "vector_sum"}
+                    }
+                    for row in selected
+                ]
+            return selected
         finally:
             db.close()
 
@@ -650,6 +673,38 @@ class TinyDBStore:
                         row.update(doc)
 
                     table.update(replace_document, query.id == str(doc["id"]))
+                return True
+            finally:
+                db.close()
+
+    def resolve_threat_cluster_review(
+        self,
+        cluster_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: int,
+    ) -> bool:
+        doc = validate_cluster_review_resolution(cluster_doc)
+        doc.setdefault("updated_at", int(time.time()))
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                table = db.table("threat_clusters")
+                query = Query()
+                existing = table.get(query.id == str(doc["id"]))
+                if (
+                    existing is None
+                    or int(existing.get("membership_revision") or 0)
+                    != int(expected_membership_revision)
+                    or str(existing.get("status") or "") != "needs_review"
+                    or existing.get("review_decision")
+                ):
+                    return False
+
+                def replace_document(row):
+                    row.clear()
+                    row.update(doc)
+
+                table.update(replace_document, query.id == str(doc["id"]))
                 return True
             finally:
                 db.close()
@@ -802,6 +857,264 @@ class TinyDBStore:
             lambda row: (int(row.get("assigned_at") or 0), str(row.get("article_id") or "")),
             limit,
         )
+
+    @staticmethod
+    def _apply_cluster_reconciliation(
+        db: TinyDB, operation: Dict[str, Any]
+    ) -> bool:
+        reconciliation_table = db.table("long_term_cluster_reconciliations")
+        cluster_table = db.table("threat_clusters")
+        membership_table = db.table("threat_cluster_memberships")
+        query = Query()
+        operation_id = str(operation["id"])
+        primary_id = str(operation["primary_cluster_id"])
+        profile_id = str(operation["profile_id"])
+        source_ids = {str(value) for value in operation["source_cluster_ids"]}
+        expected = operation["expected_membership_revisions"]
+        existing_operation = reconciliation_table.get(query.id == operation_id)
+        if existing_operation is not None:
+            return (
+                str(existing_operation.get("primary_cluster_id")) == primary_id
+                and set(existing_operation.get("source_cluster_ids") or [])
+                == source_ids
+            )
+
+        targets = {
+            str(operation["merged_cluster"]["id"]): dict(
+                operation["merged_cluster"]
+            ),
+            **{
+                str(row["id"]): dict(row)
+                for row in operation["superseded_clusters"]
+            },
+        }
+        for cluster_id in source_ids:
+            current = cluster_table.get(query.id == cluster_id)
+            if current is None:
+                return False
+            current_revision = int(current.get("membership_revision") or 0)
+            target_revision = int(targets[cluster_id]["membership_revision"])
+            already_target = (
+                current_revision == target_revision
+                and str(current.get("reconciliation_id") or "") == operation_id
+            )
+            if not already_target and current_revision != int(expected[cluster_id]):
+                return False
+
+        memberships = [
+            dict(row)
+            for row in membership_table
+            if str(row.get("profile_id") or "") == profile_id
+            and (
+                str(row.get("cluster_id") or "") in source_ids
+                or str(row.get("reconciliation_id") or "") == operation_id
+            )
+        ]
+        if len(memberships) != int(operation["merged_cluster"]["member_count"]):
+            return False
+
+        for cluster_id, target in targets.items():
+            def replace_cluster(row, replacement=target):
+                row.clear()
+                row.update(replacement)
+
+            cluster_table.update(replace_cluster, query.id == cluster_id)
+
+        for membership in memberships:
+            previous_id = str(membership.get("cluster_id") or "")
+            lineage = [
+                str(value) for value in membership.get("cluster_lineage") or []
+            ]
+            if previous_id != primary_id and previous_id not in lineage:
+                lineage.append(previous_id)
+                membership["previous_cluster_id"] = previous_id
+            membership.update(
+                {
+                    "cluster_id": primary_id,
+                    "cluster_lineage": lineage,
+                    "cluster_membership_revision": int(
+                        operation["membership_revision_by_article_id"][
+                            str(membership["article_id"])
+                        ]
+                    ),
+                    "reconciliation_id": operation_id,
+                    "reconciled_at": int(operation["reconciled_at"]),
+                }
+            )
+            match = (query.profile_id == profile_id) & (
+                query.article_id == str(membership["article_id"])
+            )
+
+            def replace_membership(row, replacement=membership):
+                row.clear()
+                row.update(replacement)
+
+            membership_table.update(replace_membership, match)
+
+        stored_operation = {
+            **operation,
+            "status": "applied",
+            "membership_count": len(memberships),
+            "applied_at": int(operation["reconciled_at"]),
+        }
+        reconciliation_table.insert(stored_operation)
+        return True
+
+    def apply_cluster_reconciliation(
+        self, reconciliation_doc: Dict[str, Any]
+    ) -> bool:
+        """Apply or replay a recoverable multi-cluster merge operation."""
+
+        operation = validate_cluster_merge_operation(reconciliation_doc)
+        operation_id = str(operation["id"])
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                journal = db.table("long_term_reconciliation_journal")
+                query = Query()
+                for pending in list(journal):
+                    if self._apply_cluster_reconciliation(db, dict(pending)):
+                        journal.remove(query.id == str(pending.get("id")))
+                existing = db.table("long_term_cluster_reconciliations").get(
+                    query.id == operation_id
+                )
+                if existing is not None:
+                    if (
+                        str(existing.get("primary_cluster_id"))
+                        != operation["primary_cluster_id"]
+                        or list(existing.get("source_cluster_ids") or [])
+                        != operation["source_cluster_ids"]
+                    ):
+                        raise ValueError(
+                            "reconciliation id already has different content"
+                        )
+                    return True
+                if journal.contains(query.id == operation_id):
+                    return False
+                journal.insert(operation)
+                if not self._apply_cluster_reconciliation(db, operation):
+                    return False
+                journal.remove(query.id == operation_id)
+                return True
+            finally:
+                db.close()
+
+    def get_cluster_reconciliation(
+        self, reconciliation_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc(
+            "long_term_cluster_reconciliations", str(reconciliation_id)
+        )
+
+    @staticmethod
+    def _apply_cluster_membership_edit(db: TinyDB, operation: Dict[str, Any]) -> bool:
+        query = Query()
+        edits = db.table("long_term_cluster_membership_edits")
+        existing = edits.get(query.id == operation["id"])
+        if existing is not None:
+            return (
+                existing.get("article_id") == operation["article_id"]
+                and existing.get("target_cluster_id") == operation["target_cluster_id"]
+            )
+        clusters = db.table("threat_clusters")
+        memberships = db.table("threat_cluster_memberships")
+        source_id = operation["source_cluster_id"]
+        target_id = operation["target_cluster_id"]
+        expected_revisions = {
+            source_id: operation["expected_source_membership_revision"],
+            target_id: operation.get("expected_target_membership_revision"),
+        }
+        finals = {
+            source_id: operation["source_cluster"],
+            target_id: operation["target_cluster"],
+        }
+        for cluster_id, expected in expected_revisions.items():
+            current = clusters.get(query.id == cluster_id)
+            already_final = (
+                current is not None
+                and current.get("membership_edit_id") == operation["id"]
+                and int(current.get("membership_revision") or 0)
+                == int(finals[cluster_id]["membership_revision"])
+            )
+            if not already_final and (
+                expected is None and current is not None
+                or expected is not None
+                and (
+                    current is None
+                    or int(current.get("membership_revision") or 0) != int(expected)
+                )
+            ):
+                return False
+        final_memberships = {
+            row["article_id"]: row for row in operation["memberships"]
+        }
+        for article_id, expected_cluster in operation["expected_memberships"].items():
+            match = (query.profile_id == operation["profile_id"]) & (
+                query.article_id == article_id
+            )
+            current = memberships.get(match)
+            already_final = (
+                current is not None
+                and current.get("membership_edit_id") == operation["id"]
+                and current.get("cluster_id") == final_memberships[article_id]["cluster_id"]
+            )
+            if not already_final and (
+                current is None or current.get("cluster_id") != expected_cluster
+            ):
+                return False
+
+        def replace(document):
+            def callback(row):
+                row.clear()
+                row.update(document)
+            return callback
+
+        for cluster_id, document in finals.items():
+            if clusters.contains(query.id == cluster_id):
+                clusters.update(replace(document), query.id == cluster_id)
+            else:
+                clusters.insert(document)
+        for article_id, document in final_memberships.items():
+            memberships.update(
+                replace(document),
+                (query.profile_id == operation["profile_id"])
+                & (query.article_id == article_id),
+            )
+        edits.insert(
+            {**operation, "status": "applied", "applied_at": operation["edited_at"]}
+        )
+        return True
+
+    def apply_cluster_membership_edit(self, edit_doc: Dict[str, Any]) -> bool:
+        operation = validate_cluster_membership_edit(edit_doc)
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                journal = db.table("long_term_membership_edit_journal")
+                query = Query()
+                for pending in list(journal):
+                    if self._apply_cluster_membership_edit(db, dict(pending)):
+                        journal.remove(query.id == pending.get("id"))
+                existing = db.table("long_term_cluster_membership_edits").get(
+                    query.id == operation["id"]
+                )
+                if existing is not None:
+                    if (
+                        existing.get("article_id") != operation["article_id"]
+                        or existing.get("target_cluster_id") != operation["target_cluster_id"]
+                    ):
+                        raise ValueError("membership edit id already has different content")
+                    return True
+                journal.insert(operation)
+                if not self._apply_cluster_membership_edit(db, operation):
+                    return False
+                journal.remove(query.id == operation["id"])
+                return True
+            finally:
+                db.close()
+
+    def get_cluster_membership_edit(self, edit_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc("long_term_cluster_membership_edits", str(edit_id))
 
     def get_long_term_quarantine(
         self, profile_id: str, article_id: str
@@ -1027,6 +1340,11 @@ class TinyDBStore:
             limit,
         )
 
+    def get_cluster_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_long_term_doc(
+            "threat_cluster_snapshots", str(snapshot_id)
+        )
+
     def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool:
         doc = dict(report_doc or {})
         return self._insert_long_term_doc(
@@ -1060,6 +1378,16 @@ class TinyDBStore:
 
     def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         return self._get_long_term_doc("long_term_runs", str(run_id))
+
+    def list_long_term_runs(
+        self, profile_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        return self._list_long_term_docs(
+            "long_term_runs",
+            lambda row: row.get("profile_id") == str(profile_id),
+            lambda row: (-int(row.get("started_at") or 0), str(row.get("id") or "")),
+            limit,
+        )
 
     def update_long_term_run(
         self,
@@ -1139,6 +1467,120 @@ class TinyDBStore:
         db.close()
         return rows[0] if rows else None
 
+    def _run_long_term_cleanup(self, *, cutoff: int) -> Dict[str, int]:
+        """Remove expired long-term history while preserving live provenance."""
+
+        removed = {
+            "long_term_reports": 0,
+            "long_term_snapshots": 0,
+            "long_term_clusters": 0,
+            "long_term_memberships": 0,
+            "long_term_runs": 0,
+            "long_term_quarantine": 0,
+        }
+        with _long_term_file_lock(self.path):
+            db = self._db()
+            try:
+                reports = db.table("threat_landscape_reports")
+                retained_snapshot_ids = {
+                    str(snapshot_id)
+                    for report in reports
+                    if int(report.get("period_end_ts") or 0) >= cutoff
+                    for snapshot_id in report.get("input_snapshot_ids") or []
+                }
+                before = len(reports)
+                reports.remove(
+                    lambda row: int(row.get("period_end_ts") or 0) < cutoff
+                )
+                removed["long_term_reports"] = max(0, before - len(reports))
+
+                snapshots = db.table("threat_cluster_snapshots")
+                before = len(snapshots)
+                snapshots.remove(
+                    lambda row: int(row.get("created_at") or 0) < cutoff
+                    and str(row.get("id") or "") not in retained_snapshot_ids
+                )
+                removed["long_term_snapshots"] = max(0, before - len(snapshots))
+                protected_cluster_ids = {
+                    str(row.get("cluster_id") or "") for row in snapshots
+                }
+                protected_cluster_ids.update(
+                    str(row.get("cluster", {}).get("id") or "")
+                    for row in db.table("long_term_snapshot_journal")
+                    if isinstance(row.get("cluster"), dict)
+                )
+                protected_cluster_ids.update(
+                    str(row.get("cluster", {}).get("id") or "")
+                    for row in db.table("long_term_assignment_journal")
+                    if isinstance(row.get("cluster"), dict)
+                )
+                for row in db.table("long_term_cluster_reconciliations"):
+                    protected_cluster_ids.update(
+                        str(value) for value in row.get("source_cluster_ids") or []
+                    )
+                for row in db.table("long_term_reconciliation_journal"):
+                    protected_cluster_ids.update(
+                        str(value) for value in row.get("source_cluster_ids") or []
+                    )
+                for table_name in (
+                    "long_term_cluster_membership_edits",
+                    "long_term_membership_edit_journal",
+                ):
+                    for row in db.table(table_name):
+                        protected_cluster_ids.update(
+                            str(row.get(field) or "")
+                            for field in ("source_cluster_id", "target_cluster_id")
+                        )
+                protected_cluster_ids.discard("")
+
+                clusters = db.table("threat_clusters")
+                expired_cluster_ids = {
+                    str(row.get("id") or "")
+                    for row in clusters
+                    if str(row.get("status") or "") == "closed"
+                    and int(row.get("last_seen_ts") or 0) < cutoff
+                    and str(row.get("id") or "") not in protected_cluster_ids
+                }
+                expired_cluster_ids.discard("")
+                before = len(clusters)
+                clusters.remove(
+                    lambda row: str(row.get("id") or "") in expired_cluster_ids
+                )
+                removed["long_term_clusters"] = max(0, before - len(clusters))
+
+                memberships = db.table("threat_cluster_memberships")
+                before = len(memberships)
+                memberships.remove(
+                    lambda row: str(row.get("cluster_id") or "")
+                    in expired_cluster_ids
+                )
+                removed["long_term_memberships"] = max(
+                    0, before - len(memberships)
+                )
+
+                runs = db.table("long_term_runs")
+                before = len(runs)
+                runs.remove(
+                    lambda row: str(row.get("status") or "")
+                    in {"done", "failed", "blocked"}
+                    and int(row.get("finished_at") or row.get("started_at") or 0)
+                    < cutoff
+                )
+                removed["long_term_runs"] = max(0, before - len(runs))
+
+                quarantine = db.table("long_term_article_quarantine")
+                before = len(quarantine)
+                quarantine.remove(
+                    lambda row: str(row.get("status") or "") == "resolved"
+                    and int(row.get("resolved_at") or 0) < cutoff
+                )
+                removed["long_term_quarantine"] = max(
+                    0, before - len(quarantine)
+                )
+                return removed
+            finally:
+                db.close()
+
     def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]:
         """
         Cleanup for TinyDB schema:
@@ -1150,6 +1592,9 @@ class TinyDBStore:
         cut_weekly = now - pol.weekly_summaries_days * 86400
         cut_temp = now - pol.temp_summaries_days * 86400
         cut_jobs = now - pol.jobs_days * 86400
+        cut_long_term = (
+            now - pol.long_term_days * 86400 if pol.long_term_days > 0 else -1
+        )
 
         removed = {"articles": 0, "summary_docs": 0, "temp_summaries": 0, "jobs": 0}
 
@@ -1211,9 +1656,10 @@ class TinyDBStore:
             sd.remove(sum_should_remove)
             removed["summary_docs"] = max(0, before - len(sd))
 
-            return removed
         finally:
             db.close()
+        removed.update(self._run_long_term_cleanup(cutoff=cut_long_term))
+        return removed
 
     # ============================================================================
     # Tag management methods

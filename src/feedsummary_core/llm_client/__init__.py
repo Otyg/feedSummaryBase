@@ -62,6 +62,7 @@ class LLMClient(Protocol):
         *,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
     ) -> str: ...
 
 

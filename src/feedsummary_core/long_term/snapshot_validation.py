@@ -75,8 +75,12 @@ def parse_snapshot_json(raw: str) -> dict[str, Any]:
 
 
 def _non_empty_string(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise SnapshotValidationError(f"{field} must be a non-empty string")
+    if not isinstance(value, str):
+        raise SnapshotValidationError(
+            f"{field} must be a non-empty string; got {type(value).__name__}"
+        )
+    if not value.strip():
+        raise SnapshotValidationError(f"{field} must be a non-empty string; got blank")
     return value.strip()
 
 

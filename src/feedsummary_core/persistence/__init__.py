@@ -270,7 +270,10 @@ class NewsStore(Protocol):
         embedding_model: Optional[str] = None,
         embedding_dimension: Optional[int] = None,
         embedding_instruction: Optional[str] = None,
+        min_member_count: Optional[int] = None,
         limit: int = 10000,
+        offset: int = 0,
+        include_vectors: bool = True,
     ) -> List[Dict[str, Any]]: ...
 
     def save_threat_cluster(
@@ -278,6 +281,13 @@ class NewsStore(Protocol):
         cluster_doc: Dict[str, Any],
         *,
         expected_membership_revision: Optional[int] = None,
+    ) -> bool: ...
+
+    def resolve_threat_cluster_review(
+        self,
+        cluster_doc: Dict[str, Any],
+        *,
+        expected_membership_revision: int,
     ) -> bool: ...
 
     def get_cluster_membership(
@@ -316,6 +326,20 @@ class NewsStore(Protocol):
         self, cluster_id: str, *, limit: int = 10000
     ) -> List[Dict[str, Any]]: ...
 
+    def apply_cluster_reconciliation(
+        self, reconciliation_doc: Dict[str, Any]
+    ) -> bool: ...
+
+    def get_cluster_reconciliation(
+        self, reconciliation_id: str
+    ) -> Optional[Dict[str, Any]]: ...
+
+    def apply_cluster_membership_edit(self, edit_doc: Dict[str, Any]) -> bool: ...
+
+    def get_cluster_membership_edit(
+        self, edit_id: str
+    ) -> Optional[Dict[str, Any]]: ...
+
     def save_cluster_snapshot(self, snapshot_doc: Dict[str, Any]) -> bool: ...
 
     def save_cluster_snapshot_revision(
@@ -326,6 +350,10 @@ class NewsStore(Protocol):
         expected_membership_revision: int,
         expected_summarized_revision: int,
     ) -> bool: ...
+
+    def get_cluster_snapshot(
+        self, snapshot_id: str
+    ) -> Optional[Dict[str, Any]]: ...
 
     def list_cluster_snapshots(
         self,
@@ -346,6 +374,10 @@ class NewsStore(Protocol):
     def create_long_term_run(self, run_doc: Dict[str, Any]) -> bool: ...
 
     def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]: ...
+
+    def list_long_term_runs(
+        self, profile_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]: ...
 
     def update_long_term_run(
         self,

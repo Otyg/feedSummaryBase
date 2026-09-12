@@ -158,6 +158,7 @@ class OllamaLocalClient:
         *,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
     ) -> str:
         if max_output_tokens is not None and max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
@@ -175,6 +176,8 @@ class OllamaLocalClient:
             "stream": True,
             "options": options,
         }
+        if response_format is not None:
+            payload["format"] = response_format
 
         url = f"{self.cfg.base_url.rstrip('/')}/api/chat"
         self.log.info("LLM request start (model=%s)", self.cfg.model)

@@ -56,6 +56,10 @@ from feedsummary_core.long_term.map_analysis import (
     cluster_needs_map_update,
     update_cluster_map_snapshot,
 )
+from feedsummary_core.long_term.membership_edit import (
+    build_cluster_membership_edit,
+    validate_cluster_membership_edit,
+)
 from feedsummary_core.long_term.metrics import (
     LandscapeMetricSettings,
     build_landscape_metrics,
@@ -66,6 +70,10 @@ from feedsummary_core.long_term.models import (
     ClusterStatus,
     EmbeddingSignature,
     ThreatCluster,
+)
+from feedsummary_core.long_term.performance import (
+    PerformanceBenchmarkSettings,
+    run_long_term_performance_benchmark,
 )
 from feedsummary_core.long_term.processor import (
     ArticleAssignment,
@@ -86,6 +94,15 @@ from feedsummary_core.long_term.reduce_analysis import (
     select_report_snapshots,
     validate_landscape_segment,
 )
+from feedsummary_core.long_term.reconciliation import (
+    ReconciliationEdge,
+    ReconciliationGroup,
+    ReconciliationResult,
+    ReconciliationSettings,
+    build_cluster_merge_operation,
+    propose_cluster_reconciliation,
+    validate_cluster_merge_operation,
+)
 from feedsummary_core.long_term.reporting import (
     ReportValidationError,
     build_landscape_report_document,
@@ -94,6 +111,12 @@ from feedsummary_core.long_term.reporting import (
     render_landscape_markdown,
     render_landscape_report_messages,
     validate_landscape_report,
+)
+from feedsummary_core.long_term.review import (
+    REVIEW_DECISIONS,
+    build_cluster_review_merge_operation,
+    build_cluster_review_resolution,
+    validate_cluster_review_resolution,
 )
 from feedsummary_core.long_term.snapshot_validation import (
     SnapshotValidationError,
@@ -120,10 +143,16 @@ __all__ = [
     "LongTermLeaseHeartbeat",
     "MapSettings",
     "MapUpdateResult",
+    "PerformanceBenchmarkSettings",
     "PromptBudgetError",
     "ReduceBudgetError",
     "ReduceResult",
     "ReduceSettings",
+    "REVIEW_DECISIONS",
+    "ReconciliationEdge",
+    "ReconciliationGroup",
+    "ReconciliationResult",
+    "ReconciliationSettings",
     "ReportMirrorError",
     "ReportValidationError",
     "SnapshotRevisionConflict",
@@ -135,6 +164,10 @@ __all__ = [
     "build_landscape_metrics",
     "build_landscape_report_document",
     "build_landscape_summary_document",
+    "build_cluster_merge_operation",
+    "build_cluster_membership_edit",
+    "build_cluster_review_merge_operation",
+    "build_cluster_review_resolution",
     "cluster_needs_map_update",
     "cluster_status_at",
     "compute_landscape_metrics",
@@ -143,14 +176,19 @@ __all__ = [
     "mirror_landscape_report",
     "parse_landscape_report_json",
     "parse_snapshot_json",
+    "propose_cluster_reconciliation",
     "render_landscape_markdown",
     "render_landscape_report_messages",
     "run_incremental_clustering",
     "run_landscape_reduce",
+    "run_long_term_performance_benchmark",
     "select_report_snapshots",
     "stable_cluster_id",
     "update_cluster_map_snapshot",
     "validate_cluster_snapshot",
+    "validate_cluster_merge_operation",
+    "validate_cluster_membership_edit",
+    "validate_cluster_review_resolution",
     "validate_landscape_report",
     "validate_landscape_segment",
 ]
