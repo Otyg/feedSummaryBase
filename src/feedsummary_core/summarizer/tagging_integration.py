@@ -126,12 +126,24 @@ async def tag_articles(
         tagging_instruction = str(
             ml_cfg.get("embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION)
         ).strip()
-        for article_id in article_ids:
+        semaphore = asyncio.Semaphore(
+            max(
+                1,
+                int(
+                    ml_cfg.get(
+                        "embedding_max_concurrency",
+                        batching_cfg.get("embedding_max_concurrency", 4),
+                    )
+                ),
+            )
+        )
+
+        async def ensure_embeddings(article_id: str) -> None:
             article = store.get_article(article_id)
             if not article:
-                continue
-            await asyncio.gather(
-                ensure_article_embedding(
+                return
+            async with semaphore:
+                await ensure_article_embedding(
                     article,
                     embed,
                     store=store,
@@ -140,8 +152,8 @@ async def tag_articles(
                     purpose=SIMILARITY_EMBEDDING_PURPOSE,
                     instruction=similarity_instruction,
                     dimensions=dimensions,
-                ),
-                ensure_article_embedding(
+                )
+                await ensure_article_embedding(
                     article,
                     embed,
                     store=store,
@@ -150,8 +162,9 @@ async def tag_articles(
                     purpose=TAGGING_EMBEDDING_PURPOSE,
                     instruction=tagging_instruction,
                     dimensions=dimensions,
-                ),
-            )
+                )
+
+        await asyncio.gather(*(ensure_embeddings(article_id) for article_id in article_ids))
     try:
         ml_settings = EmbeddingClassifierSettings.from_config(
             config,

@@ -127,7 +127,6 @@ class EmbeddingPersistenceTests(unittest.TestCase):
         # A normal ingest upsert must not discard an already persisted cache entry.
         store.upsert_article({"id": "article-1", "title": "Title", "text": "Article body"})
         article = store.get_article("article-1")
-        self.assertNotIn("embedding_vector", article)
         self.assertEqual(
             [1.0, 0.0],
             cached_embedding(
@@ -159,6 +158,7 @@ class EmbeddingPersistenceTests(unittest.TestCase):
                 instruction=TAGGING_EMBEDDING_INSTRUCTION,
             )
         )
+        self.assertEqual([9.0, 9.0], article.get("embedding_vector"))
 
         tag_id = store.add_tag("security")
         self.assertTrue(

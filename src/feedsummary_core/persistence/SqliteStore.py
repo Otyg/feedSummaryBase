@@ -444,6 +444,10 @@ class SqliteStore:
         existing_doc = self.get_article(aid)
         if existing_doc:
             for field in (
+                "embedding_vector",
+                "embedding_model",
+                "embedding_source_hash",
+                "embedding_updated_at",
                 "similarity_embedding_vector",
                 "similarity_embedding_model",
                 "similarity_embedding_source_hash",
@@ -544,11 +548,19 @@ class SqliteStore:
             if "embedding_vector" in existing_columns:
                 con.execute(
                     """
-                    UPDATE articles SET embedding_vector = NULL, embedding_model = NULL,
-                        embedding_source_hash = NULL, embedding_updated_at = NULL
+                    UPDATE articles SET embedding_vector = ?, embedding_model = ?,
+                        embedding_source_hash = ?, embedding_updated_at = ?
                     WHERE id = ?
                     """,
-                    (aid,),
+                    (
+                        _json_dumps(doc.get("embedding_vector"))
+                        if isinstance(doc.get("embedding_vector"), list)
+                        else None,
+                        str(doc.get("embedding_model") or "") or None,
+                        str(doc.get("embedding_source_hash") or "") or None,
+                        _safe_int(doc.get("embedding_updated_at"), 0) or None,
+                        aid,
+                    ),
                 )
             con.commit()
         finally:
@@ -583,14 +595,6 @@ class SqliteStore:
             if not row:
                 return False
             doc = _json_loads(row["doc_json"]) or {}
-            for legacy_field in (
-                "embedding_vector",
-                "embedding_model",
-                "embedding_source_hash",
-                "embedding_updated_at",
-            ):
-                if purpose is not None:
-                    doc.pop(legacy_field, None)
             if purpose is None:
                 doc.update(
                     {
@@ -654,15 +658,6 @@ class SqliteStore:
                         _json_dumps(doc),
                         str(article_id),
                     ),
-                )
-            if purpose is not None and "embedding_vector" in existing_columns:
-                con.execute(
-                    """
-                    UPDATE articles SET embedding_vector = NULL, embedding_model = NULL,
-                        embedding_source_hash = NULL, embedding_updated_at = NULL
-                    WHERE id = ?
-                    """,
-                    (str(article_id),),
                 )
             con.commit()
             return True

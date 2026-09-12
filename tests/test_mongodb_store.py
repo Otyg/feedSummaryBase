@@ -183,7 +183,7 @@ class MongoDBStoreTests(unittest.TestCase):
             )
         )
         article = self.store.get_article("article-1")
-        self.assertNotIn("embedding_vector", article)
+        self.assertEqual([9.0, 9.0], article["embedding_vector"])
         self.assertEqual("embedding-model", article["similarity_embedding_model"])
         self.assertEqual([1.0, 0.0], article["similarity_embedding_vector"])
         self.assertEqual(

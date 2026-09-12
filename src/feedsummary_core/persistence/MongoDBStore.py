@@ -300,6 +300,10 @@ class MongoDBStore:
         existing = self.db.articles.find_one(
             {"_id": doc["_id"]},
             {
+                "embedding_vector": 1,
+                "embedding_model": 1,
+                "embedding_source_hash": 1,
+                "embedding_updated_at": 1,
                 "similarity_embedding_vector": 1,
                 "similarity_embedding_model": 1,
                 "similarity_embedding_source_hash": 1,
@@ -314,6 +318,10 @@ class MongoDBStore:
         )
         if existing:
             for field in (
+                "embedding_vector",
+                "embedding_model",
+                "embedding_source_hash",
+                "embedding_updated_at",
                 "similarity_embedding_vector",
                 "similarity_embedding_model",
                 "similarity_embedding_source_hash",
@@ -367,12 +375,7 @@ class MongoDBStore:
                 f"{prefix}_instruction": str(instruction or "").strip(),
                 f"{prefix}_updated_at": _now_ts(),
             }
-            unset_fields = {
-                "embedding_vector": "",
-                "embedding_model": "",
-                "embedding_source_hash": "",
-                "embedding_updated_at": "",
-            }
+            unset_fields = {}
         result = self.db.articles.update_one(
             {"_id": str(article_id)},
             {

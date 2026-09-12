@@ -42,7 +42,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tinydb import Query, TinyDB
 from tinydb.operations import delete as delete_field
-
 from feedsummary_core.persistence import CleanupPolicy
 from feedsummary_core.long_term.reconciliation import (
     validate_cluster_merge_operation,
@@ -69,14 +68,12 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 
 @contextmanager
-def _long_term_file_lock(database_path: str):
-    """Serialize TinyDB long-term writes across threads and, on Unix, processes."""
-
+def _db_file_lock(database_path: str, suffix: str):
     resolved = os.path.abspath(database_path)
     with _LONG_TERM_LOCKS_GUARD:
-        thread_lock = _LONG_TERM_LOCKS.setdefault(resolved, threading.Lock())
+        thread_lock = _LONG_TERM_LOCKS.setdefault(f"{resolved}:{suffix}", threading.Lock())
     with thread_lock:
-        lock_path = f"{resolved}.long-term.lock"
+        lock_path = f"{resolved}.{suffix}"
         with open(lock_path, "a+", encoding="utf-8") as handle:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -85,6 +82,22 @@ def _long_term_file_lock(database_path: str):
             finally:
                 if fcntl is not None:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _article_file_lock(database_path: str):
+    """Serialize TinyDB article writes across threads and, on Unix, processes."""
+
+    with _db_file_lock(database_path, "articles.lock"):
+        yield
+
+
+@contextmanager
+def _long_term_file_lock(database_path: str):
+    """Serialize TinyDB long-term writes across threads and, on Unix, processes."""
+
+    with _db_file_lock(database_path, "long-term.lock"):
+        yield
 
 
 def _normalize_summary_id(value: Any) -> Optional[str]:
@@ -114,7 +127,7 @@ class TinyDBStore:
         return res[0] if res else None
 
     def upsert_article(self, article_doc: Dict[str, Any]) -> None:
-        with _long_term_file_lock(self.path):
+        with _article_file_lock(self.path):
             db = self._db()
             try:
                 A = Query()
@@ -157,22 +170,11 @@ class TinyDBStore:
                 f"{prefix}_instruction": str(instruction or "").strip(),
                 f"{prefix}_updated_at": int(time.time()),
             }
-        with _long_term_file_lock(self.path):
+        with _article_file_lock(self.path):
             db = self._db()
             try:
                 A = Query()
                 updated = db.table("articles").update(fields, A.id == str(article_id))
-                if purpose_name is not None:
-                    for legacy_field in (
-                        "embedding_vector",
-                        "embedding_model",
-                        "embedding_source_hash",
-                        "embedding_updated_at",
-                    ):
-                        db.table("articles").update(
-                            delete_field(legacy_field),
-                            (A.id == str(article_id)) & A[legacy_field].exists(),
-                        )
                 return bool(updated)
             finally:
                 db.close()
@@ -255,7 +257,7 @@ class TinyDBStore:
         """
         Legacy: Behålls för bakåtkomp, men pipeline använder den inte längre.
         """
-        with _long_term_file_lock(self.path):
+        with _article_file_lock(self.path):
             db = self._db()
             try:
                 A = Query()
@@ -1642,7 +1644,7 @@ class TinyDBStore:
         # TinyDB import here to avoid dependency if user doesn't use it
         from tinydb import TinyDB
 
-        with _long_term_file_lock(self.path):
+        with _article_file_lock(self.path), _long_term_file_lock(self.path):
             db = TinyDB(self.path)
             try:
                 # Articles
