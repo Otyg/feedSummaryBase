@@ -871,6 +871,7 @@ class TinyDBStore:
                     return False
                 journal.insert(operation)
                 if not self._apply_cluster_assignment(db, operation):
+                    journal.remove(query.id == operation_id)
                     return False
                 journal.remove(query.id == operation_id)
                 return True
@@ -1022,6 +1023,7 @@ class TinyDBStore:
                     return False
                 journal.insert(operation)
                 if not self._apply_cluster_reconciliation(db, operation):
+                    journal.remove(query.id == operation_id)
                     return False
                 journal.remove(query.id == operation_id)
                 return True
@@ -1136,6 +1138,7 @@ class TinyDBStore:
                     return True
                 journal.insert(operation)
                 if not self._apply_cluster_membership_edit(db, operation):
+                    journal.remove(query.id == operation["id"])
                     return False
                 journal.remove(query.id == operation["id"])
                 return True
@@ -1367,6 +1370,11 @@ class TinyDBStore:
                     return False
                 journal.insert(operation)
                 if not self._apply_snapshot_revision(db, operation):
+                    if not db.table("threat_cluster_snapshots").contains(
+                        (query.id == str(snapshot["id"]))
+                        & (query[_SNAPSHOT_PENDING_FIELD] == operation_id)
+                    ):
+                        journal.remove(query.id == operation_id)
                     return False
                 journal.remove(query.id == operation_id)
                 return True

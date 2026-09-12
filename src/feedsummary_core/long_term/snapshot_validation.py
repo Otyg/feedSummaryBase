@@ -177,12 +177,17 @@ def validate_cluster_snapshot(
                 f"facts[{index}].status must be active, disputed or superseded"
             )
     result["facts"] = facts
-    result["timeline"] = _validate_evidenced_items(
+    timeline = _validate_evidenced_items(
         payload.get("timeline"),
         field="timeline",
         allowed_article_ids=allowed,
         extra_fields=frozenset({"event_time"}),
     )
+    for index, event in enumerate(timeline):
+        event["event_time"] = _non_empty_string(
+            event.get("event_time"), f"timeline[{index}].event_time"
+        )
+    result["timeline"] = timeline
     techniques = _validate_evidenced_items(
         payload.get("mitre_techniques"),
         field="mitre_techniques",

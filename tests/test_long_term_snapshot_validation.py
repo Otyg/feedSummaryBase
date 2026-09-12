@@ -68,6 +68,18 @@ class ClusterSnapshotValidationTests(unittest.TestCase):
                 allowed_article_ids={"article-a", "article-b"},
             )
 
+    def test_timeline_event_time_is_required(self):
+        payload = self.payload()
+        payload["timeline"][0].pop("event_time")
+        with self.assertRaisesRegex(SnapshotValidationError, "timeline\\[0\\]\\.event_time"):
+            validate_cluster_snapshot(
+                payload,
+                profile_id="profile",
+                cluster_id="cluster-1",
+                membership_revision=2,
+                allowed_article_ids={"article-a", "article-b"},
+            )
+
     def test_identity_unknown_fields_and_markdown_wrappers_are_rejected(self):
         payload = self.payload()
         with self.assertRaisesRegex(SnapshotValidationError, "identity"):
