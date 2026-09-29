@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from feedsummary_core.summarizer.tagging_integration import tag_articles
+from feedsummary_core.summarizer.tagging_integration import tag_articles, tag_articles_safe
 from feedsummary_core.tagging_ml.embedding_sgd import EmbeddingClassifierSettings
 
 
@@ -52,6 +52,19 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "category": "GENERAL",
             "reasoning": "LLM prediction",
         }
+
+    @patch(
+        "feedsummary_core.summarizer.tagging_integration.tag_articles",
+        new_callable=AsyncMock,
+        return_value={"article-1": [{"id": 1}]},
+    )
+    async def test_automatic_tagging_uses_configured_article_limit(self, tag_articles_mock):
+        count = await tag_articles_safe(
+            self.store, object(), ["article-1"],
+            {"tagging": {"article_max_tags": 20}},
+        )
+        self.assertEqual(1, count)
+        self.assertEqual(20, tag_articles_mock.await_args.kwargs["max_tags_per_article"])
 
     @patch(
         "feedsummary_core.summarizer.tagging_integration.TagManager.generate_tags_for_article",

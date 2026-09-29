@@ -1343,7 +1343,7 @@ class TagManager:
         llm_client: LLMClient,
         article: Dict[str, Any],
         config: Dict[str, Any],
-        max_tags: int = 5,
+        max_tags: int = 20,
         excluded_categories: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -1478,7 +1478,7 @@ class TagManager:
     def _build_tagging_prompt(
         self,
         article_text: str,
-        max_tags: int = 5,
+        max_tags: int = 20,
         categories: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Build a prompt for the LLM to generate tags."""
@@ -1569,7 +1569,7 @@ Respond in JSON format:
         llm_client: LLMClient,
         article: Dict[str, Any],
         current_article_tags: List[Dict[str, Any]] = None,
-        max_tags: int = 5,
+        max_tags: int = 20,
     ) -> List[Dict[str, Any]]:
         """
         Reclassify an article by suggesting only from existing tags in the database.
@@ -1666,7 +1666,7 @@ Respond in JSON format:
         self,
         article_text: str,
         available_tags: List[Dict[str, str]],
-        max_tags: int = 5,
+        max_tags: int = 20,
     ) -> str:
         """
         Build a prompt for reclassifying an article using only existing tags.
@@ -1831,7 +1831,7 @@ If NO tags are relevant, respond with:
         self,
         article_id: str,
         article_content: str,
-        max_tags: int = 5,
+        max_tags: int = 20,
         similarity_threshold: float = 0.70,
     ) -> List[Dict[str, Any]]:
         """

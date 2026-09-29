@@ -140,6 +140,30 @@ class MongoDBStore:
         if self._owns_client and self.client is not None:
             self.client.close()
 
+    def reset_long_term_analysis(self, *, dry_run: bool = False) -> Dict[str, int]:
+        """Delete all long-term analysis state while preserving article data."""
+
+        collections = (
+            "long_term_state",
+            "threat_cluster_memberships",
+            "threat_clusters",
+            "long_term_cluster_reconciliations",
+            "long_term_reconciliation_journal",
+            "long_term_cluster_membership_edits",
+            "long_term_membership_edit_journal",
+            "long_term_assignment_journal",
+            "long_term_article_quarantine",
+            "threat_cluster_snapshots",
+            "long_term_snapshot_journal",
+            "threat_landscape_reports",
+            "long_term_runs",
+        )
+        counts = {name: int(self.db[name].count_documents({})) for name in collections}
+        if not dry_run:
+            for name in collections:
+                self.db[name].delete_many({})
+        return counts
+
     def __enter__(self) -> "MongoDBStore":
         return self
 
@@ -147,6 +171,12 @@ class MongoDBStore:
         self.close()
 
     def _init_db(self) -> None:
+        # Replace the old one-membership-per-article index before adding scopes.
+        for name, index in self.db.threat_cluster_memberships.index_information().items():
+            if index.get("unique") and list(index.get("key") or ()) == [
+                ("profile_id", ASCENDING), ("article_id", ASCENDING)
+            ]:
+                self.db.threat_cluster_memberships.drop_index(name)
         indexes = (
             (self.db.articles, [("source", ASCENDING), ("_mongo_sort_ts", ASCENDING)], {}),
             (self.db.articles, [("_mongo_sort_ts", ASCENDING)], {}),
@@ -190,7 +220,7 @@ class MongoDBStore:
             ),
             (
                 self.db.threat_cluster_memberships,
-                [("profile_id", ASCENDING), ("article_id", ASCENDING)],
+                [("profile_id", ASCENDING), ("article_id", ASCENDING), ("tag_scope", ASCENDING)],
                 {"unique": True},
             ),
             (
@@ -708,12 +738,19 @@ class MongoDBStore:
             )
         )
 
+    def list_article_cluster_memberships(
+        self, profile_id: str, article_id: str
+    ) -> List[Dict[str, Any]]:
+        return [_public_doc(row) for row in self.db.threat_cluster_memberships.find(
+            {"profile_id": str(profile_id), "article_id": str(article_id)}
+        ).sort("tag_scope", ASCENDING)]
+
     def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool:
         doc = dict(membership_doc or {})
         required = ("profile_id", "article_id", "cluster_id", "assigned_at")
         if any(doc.get(field) is None for field in required):
             raise ValueError("membership document is incomplete")
-        doc["_id"] = f"{doc['profile_id']}:{doc['article_id']}"
+        doc["_id"] = f"{doc['profile_id']}:{doc['article_id']}:{doc.get('tag_scope') or ''}"
         try:
             self.db.threat_cluster_memberships.insert_one(doc)
             return True
@@ -726,7 +763,7 @@ class MongoDBStore:
         expected = operation.get("expected_membership_revision")
         cluster["id"] = str(cluster["id"])
         cluster["_id"] = cluster["id"]
-        membership["_id"] = f"{membership['profile_id']}:{membership['article_id']}"
+        membership["_id"] = f"{membership['profile_id']}:{membership['article_id']}:{membership.get('tag_scope') or ''}"
 
         existing_membership = self.db.threat_cluster_memberships.find_one(
             {"_id": membership["_id"]}
@@ -798,7 +835,7 @@ class MongoDBStore:
         ):
             raise ValueError("cluster and membership identities do not match")
         cluster.setdefault("updated_at", _now_ts())
-        operation_id = f"{membership['profile_id']}:{membership['article_id']}"
+        operation_id = f"{membership['profile_id']}:{membership['article_id']}:{membership.get('tag_scope') or ''}"
         operation = {
             "_id": operation_id,
             "id": operation_id,
@@ -1055,6 +1092,8 @@ class MongoDBStore:
                     "article_id": {"$in": list(operation["expected_memberships"])},
                 }
             )
+            if row.get("cluster_id") == operation["expected_memberships"].get(row["article_id"])
+            or row.get("membership_edit_id") == operation["id"]
         }
         for article_id, expected_cluster in operation["expected_memberships"].items():
             current = current_memberships.get(article_id)
@@ -1073,7 +1112,7 @@ class MongoDBStore:
                 {"_id": cluster_id}, stored, upsert=True
             )
         for article_id, document in final_memberships.items():
-            stored = {**document, "_id": f"{operation['profile_id']}:{article_id}"}
+            stored = {**document, "_id": current_memberships[article_id]["_id"]}
             self.db.threat_cluster_memberships.replace_one(
                 {"_id": stored["_id"]}, stored
             )

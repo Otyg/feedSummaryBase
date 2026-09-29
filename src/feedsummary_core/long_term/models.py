@@ -84,6 +84,7 @@ class ThreatCluster:
     algorithm_version: str = "online-centroid-v1"
     strong_indicators: tuple[str, ...] = ()
     strict_cve_identity: bool = True
+    tag_scope: str = ""
     summarized_revision: int = 0
     latest_snapshot_id: str | None = None
     last_summarized_at: int | None = None
@@ -160,6 +161,7 @@ class ThreatCluster:
             "algorithm_version": self.algorithm_version,
             "strong_indicators": list(self.strong_indicators),
             "strict_cve_identity": self.strict_cve_identity,
+            "tag_scope": self.tag_scope,
             "summarized_revision": self.summarized_revision,
             "latest_snapshot_id": self.latest_snapshot_id,
             "last_summarized_at": self.last_summarized_at,
@@ -207,11 +209,10 @@ class ThreatCluster:
             # Missing means conservative legacy behaviour. Reconciliation can
             # derive a more precise value from persisted membership evidence.
             strict_cve_identity=bool(document.get("strict_cve_identity", True)),
+            tag_scope=str(document.get("tag_scope") or ""),
             summarized_revision=int(document.get("summarized_revision") or 0),
             latest_snapshot_id=(
-                str(document["latest_snapshot_id"])
-                if document.get("latest_snapshot_id")
-                else None
+                str(document["latest_snapshot_id"]) if document.get("latest_snapshot_id") else None
             ),
             last_summarized_at=(
                 int(document["last_summarized_at"])
@@ -230,9 +231,7 @@ class ThreatCluster:
                 else None
             ),
             reconciliation_id=(
-                str(document["reconciliation_id"])
-                if document.get("reconciliation_id")
-                else None
+                str(document["reconciliation_id"]) if document.get("reconciliation_id") else None
             ),
             reconciled_at=(
                 int(document["reconciled_at"])
@@ -240,20 +239,12 @@ class ThreatCluster:
                 else None
             ),
             review_decision=(
-                str(document["review_decision"])
-                if document.get("review_decision")
-                else None
+                str(document["review_decision"]) if document.get("review_decision") else None
             ),
             reviewed_at=(
-                int(document["reviewed_at"])
-                if document.get("reviewed_at") is not None
-                else None
+                int(document["reviewed_at"]) if document.get("reviewed_at") is not None else None
             ),
-            reviewed_by=(
-                str(document["reviewed_by"])
-                if document.get("reviewed_by")
-                else None
-            ),
+            reviewed_by=(str(document["reviewed_by"]) if document.get("reviewed_by") else None),
             review_comment=(
                 str(document["review_comment"])
                 if document.get("review_comment") is not None

@@ -294,6 +294,10 @@ class NewsStore(Protocol):
         self, profile_id: str, article_id: str
     ) -> Optional[Dict[str, Any]]: ...
 
+    def list_article_cluster_memberships(
+        self, profile_id: str, article_id: str
+    ) -> List[Dict[str, Any]]: ...
+
     def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool: ...
 
     def save_cluster_assignment(

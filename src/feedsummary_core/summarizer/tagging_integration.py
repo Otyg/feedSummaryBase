@@ -65,6 +65,7 @@ from feedsummary_core.tagging_ml.embedding_sgd import (
 )
 
 logger = logging.getLogger(__name__)
+DEFAULT_ARTICLE_MAX_TAGS = 20
 
 
 def _log_ml_event(level: int, event: str, **fields: Any) -> None:
@@ -82,7 +83,7 @@ async def tag_articles(
     llm_client: LLMClient,
     article_ids: List[str],
     config: Dict[str, Any],
-    max_tags_per_article: int = 5,
+    max_tags_per_article: int | None = None,
     skip_if_already_tagged: bool = True,
     enable_embedding_matching: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -106,6 +107,10 @@ async def tag_articles(
     results: Dict[str, List[Dict[str, Any]]] = {}
     ml_tagger: Optional[EmbeddingClassifierTagger] = None
     tagging_cfg = config.get("tagging", {}) or {}
+    if max_tags_per_article is None:
+        max_tags_per_article = max(
+            1, int(tagging_cfg.get("article_max_tags", DEFAULT_ARTICLE_MAX_TAGS))
+        )
     ml_cfg = tagging_cfg.get("ml", {}) or {}
     batching_cfg = config.get("batching", {}) or {}
     embed = getattr(llm_client, "embed", None)
@@ -373,7 +378,7 @@ async def tag_article(
     llm_client: LLMClient,
     article_id: str,
     config: Dict[str, Any],
-    max_tags: int = 5,
+    max_tags: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Tag a single article.
@@ -502,7 +507,7 @@ async def tag_articles_safe(
     article_ids: List[str],
     config: Dict[str, Any],
     job_id: Optional[int] = None,
-    max_tags_per_article: int = 5,
+    max_tags_per_article: int | None = None,
 ) -> int:
     """
     Safely tag articles, ignoring errors.
@@ -523,6 +528,12 @@ async def tag_articles_safe(
     """
     if not article_ids:
         return 0
+
+    if max_tags_per_article is None:
+        tagging_cfg = config.get("tagging") or {}
+        max_tags_per_article = max(
+            1, int(tagging_cfg.get("article_max_tags", DEFAULT_ARTICLE_MAX_TAGS))
+        )
 
     logger.info(
         f"[Job {job_id}] Starting automatic tagging of {len(article_ids)} articles..."

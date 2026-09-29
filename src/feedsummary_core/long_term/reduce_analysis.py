@@ -182,11 +182,22 @@ def _event_cluster_ids(metrics: dict[str, Any]) -> set[str]:
     }
 
 
-def _metrics_for_prompt(metrics: dict[str, Any]) -> dict[str, Any]:
+def _metrics_for_prompt(
+    metrics: dict[str, Any],
+    *,
+    snapshots: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Remove non-citable identifier bulk while retaining counts and time evidence."""
 
     result = copy.deepcopy(metrics)
-    citable_ids = _event_cluster_ids(result)
+    if snapshots is not None:
+        citable_ids = {
+            str(row.get("cluster_id") or "")
+            for row in snapshots
+            if str(row.get("cluster_id") or "")
+        }
+    else:
+        citable_ids = _event_cluster_ids(result)
     omitted_event_ids = 0
     omitted_source_rows = 0
     bucket_presence: dict[str, dict[str, list[int]]] = {}
@@ -202,6 +213,11 @@ def _metrics_for_prompt(metrics: dict[str, Any]) -> dict[str, Any]:
             per_event = source_coverage.pop("unique_sources_per_event", {})
             if isinstance(per_event, dict):
                 omitted_source_rows += len(per_event)
+        coverage = period.get("coverage")
+        if isinstance(coverage, dict):
+            missing_ids = coverage.pop("missing_snapshot_cluster_ids", None)
+            if isinstance(missing_ids, list):
+                omitted_event_ids += len(missing_ids)
 
     for window_number, window in enumerate(result.get("windows") or [], start=1):
         if not isinstance(window, dict):
@@ -541,15 +557,16 @@ def _compact_snapshots_for_final(
 
     result = []
     for snapshot in snapshots:
+        payload = snapshot.get("payload") or {}
         result.append(
             {
                 "cluster_id": str(snapshot.get("cluster_id") or ""),
-                "summary": str(snapshot.get("summary") or "").strip()[:summary_chars],
+                "summary": str(payload.get("summary") or "").strip()[:summary_chars],
                 "key_facts": clipped_strings(
-                    snapshot.get("key_facts"), fact_count, fact_chars
+                    payload.get("key_facts"), fact_count, fact_chars
                 ),
                 "uncertainties": clipped_strings(
-                    snapshot.get("uncertainties"),
+                    payload.get("uncertainties"),
                     uncertainty_count,
                     uncertainty_chars,
                 ),
@@ -640,7 +657,7 @@ async def run_landscape_reduce(
         settings=settings,
     )
     frozen_metrics = _apply_snapshot_coverage(metrics, snapshots)
-    prompt_metrics = _metrics_for_prompt(frozen_metrics)
+    prompt_metrics = _metrics_for_prompt(frozen_metrics, snapshots=snapshots)
     period_end_ts = int(frozen_metrics.get("period_end_ts") or 0)
     previous_report_id, previous = _previous_report(store, profile_id, period_end_ts)
     final_snapshots = snapshots

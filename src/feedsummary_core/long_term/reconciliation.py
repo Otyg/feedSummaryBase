@@ -21,10 +21,30 @@ from feedsummary_core.long_term.models import ClusterStatus, ThreatCluster
 _TITLE_TOKEN = re.compile(r"[a-z0-9][a-z0-9.+_-]*", re.IGNORECASE)
 _TITLE_STOP_WORDS = frozenset(
     {
-        "about", "affecting", "all", "and", "attack", "attacks", "critical",
-        "cyber", "exploited", "exploitation", "flaw", "from", "latest", "new",
-        "security", "the", "this", "under", "vulnerability", "vulnerabilities",
-        "warns", "with", "zero-day", "zeroday",
+        "about",
+        "affecting",
+        "all",
+        "and",
+        "attack",
+        "attacks",
+        "critical",
+        "cyber",
+        "exploited",
+        "exploitation",
+        "flaw",
+        "from",
+        "latest",
+        "new",
+        "security",
+        "the",
+        "this",
+        "under",
+        "vulnerability",
+        "vulnerabilities",
+        "warns",
+        "with",
+        "zero-day",
+        "zeroday",
     }
 )
 _IDENTITY_PREFIXES = ("organization:", "product:")
@@ -117,9 +137,7 @@ def _title_terms(title: str) -> frozenset[str]:
     )
 
 
-def _cluster_view(
-    document: dict[str, Any], memberships: Iterable[dict[str, Any]]
-) -> _ClusterView:
+def _cluster_view(document: dict[str, Any], memberships: Iterable[dict[str, Any]]) -> _ClusterView:
     cluster = ThreatCluster.from_document(document)
     rows = tuple(memberships)
     indicators = {
@@ -128,10 +146,7 @@ def _cluster_view(
         for value in row.get("strong_indicators") or ()
         if str(value).strip()
     } | set(cluster.strong_indicators)
-    titles = [
-        str((row.get("evidence") or {}).get("title") or "").strip()
-        for row in rows
-    ]
+    titles = [str((row.get("evidence") or {}).get("title") or "").strip() for row in rows]
     titles = [value for value in titles if value]
     title = titles[0] if titles else cluster.id
     norm = sqrt(sum(value * value for value in cluster.centroid))
@@ -140,17 +155,13 @@ def _cluster_view(
     return _ClusterView(
         cluster=cluster,
         normalized_centroid=tuple(value / norm for value in cluster.centroid),
-        strict_cve=bool(rows) and all(
-            membership_is_strict_cve_record(row) for row in rows
-        ),
+        strict_cve=bool(rows) and all(membership_is_strict_cve_record(row) for row in rows),
         # Use the representative evidence title. A multi-member incident can
         # legitimately contain one headline about several chained flaws, while a
         # cluster represented by a weekly roundup must remain review-only.
         summary_like=bool(_SUMMARY_TITLE_PATTERN.search(title)),
         cves=frozenset(value for value in indicators if value.startswith("cve:")),
-        identities=frozenset(
-            value for value in indicators if value.startswith(_IDENTITY_PREFIXES)
-        ),
+        identities=frozenset(value for value in indicators if value.startswith(_IDENTITY_PREFIXES)),
         title_terms=frozenset().union(*(_title_terms(value) for value in titles)),
         title=title,
     )
@@ -206,9 +217,7 @@ def _edge(left: _ClusterView, right: _ClusterView, similarity: float) -> Reconci
         right_strict_cve=right.strict_cve,
         left_summary_like=left.summary_like,
         right_summary_like=right.summary_like,
-        interval_gap_days=round(
-            _interval_gap_seconds(left.cluster, right.cluster) / 86400, 3
-        ),
+        interval_gap_days=round(_interval_gap_seconds(left.cluster, right.cluster) / 86400, 3),
         left_title=left.title,
         right_title=right.title,
     )
@@ -230,7 +239,7 @@ def propose_cluster_reconciliation(
     ]
     compatible: dict[str, list[_ClusterView]] = defaultdict(list)
     for view in views:
-        compatible[view.cluster.embedding_signature.key].append(view)
+        compatible[(view.cluster.embedding_signature.key, view.cluster.tag_scope)].append(view)
 
     auto_edges: list[ReconciliationEdge] = []
     review_edges: list[ReconciliationEdge] = []
@@ -255,8 +264,7 @@ def propose_cluster_reconciliation(
                     continue
                 compared += 1
                 similarity = sum(
-                    a * b
-                    for a, b in zip(left.normalized_centroid, right.normalized_centroid)
+                    a * b for a, b in zip(left.normalized_centroid, right.normalized_centroid)
                 )
                 if similarity < settings.review_similarity:
                     continue
@@ -270,9 +278,7 @@ def propose_cluster_reconciliation(
                     auto_edges.append(edge)
                 else:
                     review_edges.append(
-                        ReconciliationEdge(
-                            **{**asdict(edge), "disposition": "review"}
-                        )
+                        ReconciliationEdge(**{**asdict(edge), "disposition": "review"})
                     )
 
     auto_edges.sort(
@@ -300,9 +306,7 @@ def propose_cluster_reconciliation(
         union(edge.left_cluster_id, edge.right_cluster_id)
     components: dict[str, set[str]] = defaultdict(set)
     for edge in auto_edges:
-        components[find(edge.left_cluster_id)].update(
-            (edge.left_cluster_id, edge.right_cluster_id)
-        )
+        components[find(edge.left_cluster_id)].update((edge.left_cluster_id, edge.right_cluster_id))
     view_by_id = {view.cluster.id: view for view in views}
     groups = []
     for ids in components.values():
@@ -316,8 +320,7 @@ def propose_cluster_reconciliation(
             ),
         )
         edge_count = sum(
-            edge.left_cluster_id in ids and edge.right_cluster_id in ids
-            for edge in auto_edges
+            edge.left_cluster_id in ids and edge.right_cluster_id in ids for edge in auto_edges
         )
         groups.append(
             ReconciliationGroup(
@@ -354,8 +357,7 @@ def build_cluster_merge_operation(
     if len(documents) < 2 or primary_cluster_id not in documents:
         raise ValueError("a merge needs a primary and at least one secondary cluster")
     membership_rows = {
-        cluster_id: tuple(memberships_by_cluster.get(cluster_id, ()))
-        for cluster_id in documents
+        cluster_id: tuple(memberships_by_cluster.get(cluster_id, ())) for cluster_id in documents
     }
     views = {
         cluster_id: _cluster_view(document, membership_rows[cluster_id])
@@ -365,6 +367,8 @@ def build_cluster_merge_operation(
     profiles = {view.cluster.profile_id for view in views.values()}
     if len(signatures) != 1 or len(profiles) != 1:
         raise ValueError("merged clusters must have one profile and embedding signature")
+    if len({view.cluster.tag_scope for view in views.values()}) != 1:
+        raise ValueError("merged clusters must have one tag scope")
     if any(view.cluster.superseded_by_cluster_id for view in views.values()):
         raise ValueError("a superseded cluster cannot be merged again")
     for cluster_id, view in views.items():
@@ -377,11 +381,7 @@ def build_cluster_merge_operation(
     ordered_ids = tuple(sorted(documents))
     source_clusters = [views[cluster_id].cluster for cluster_id in ordered_ids]
     ordered_memberships = sorted(
-        (
-            dict(row)
-            for cluster_id in ordered_ids
-            for row in membership_rows[cluster_id]
-        ),
+        (dict(row) for cluster_id in ordered_ids for row in membership_rows[cluster_id]),
         key=lambda row: (
             int(
                 row.get("article_ts")
@@ -398,14 +398,12 @@ def build_cluster_merge_operation(
         raise ValueError("merged memberships must have unique article ids")
     dimensions = source_clusters[0].embedding_signature.dimensions
     vector_sum = tuple(
-        sum(cluster.vector_sum[index] for cluster in source_clusters)
-        for index in range(dimensions)
+        sum(cluster.vector_sum[index] for cluster in source_clusters) for index in range(dimensions)
     )
     member_count = sum(cluster.member_count for cluster in source_clusters)
     base_revision = max(cluster.membership_revision for cluster in source_clusters)
     membership_revision_by_article_id = {
-        article_id: base_revision + index
-        for index, article_id in enumerate(article_ids, start=1)
+        article_id: base_revision + index for index, article_id in enumerate(article_ids, start=1)
     }
     membership_revision = base_revision + member_count
     primary = views[primary_cluster_id].cluster
@@ -471,8 +469,7 @@ def build_cluster_merge_operation(
         "primary_cluster_id": primary_cluster_id,
         "source_cluster_ids": list(ordered_ids),
         "expected_membership_revisions": {
-            cluster_id: views[cluster_id].cluster.membership_revision
-            for cluster_id in ordered_ids
+            cluster_id: views[cluster_id].cluster.membership_revision for cluster_id in ordered_ids
         },
         "membership_revision_by_article_id": membership_revision_by_article_id,
         "merged_cluster": merged,
@@ -516,9 +513,7 @@ def validate_cluster_merge_operation(operation: dict[str, Any]) -> dict[str, Any
         raise ValueError("expected revisions must cover every source cluster")
     membership_revisions = {
         str(key): int(value)
-        for key, value in dict(
-            document["membership_revision_by_article_id"]
-        ).items()
+        for key, value in dict(document["membership_revision_by_article_id"]).items()
     }
     merged = dict(document["merged_cluster"])
     if (
@@ -530,20 +525,18 @@ def validate_cluster_merge_operation(operation: dict[str, Any]) -> dict[str, Any
     ):
         raise ValueError("merged cluster does not satisfy reconciliation invariants")
     base_revision = int(merged.get("summarized_revision") or 0)
-    expected_new_revisions = set(
-        range(base_revision + 1, int(merged["membership_revision"]) + 1)
-    )
+    expected_new_revisions = set(range(base_revision + 1, int(merged["membership_revision"]) + 1))
     if (
         len(membership_revisions) != int(merged["member_count"])
         or set(membership_revisions.values()) != expected_new_revisions
     ):
         raise ValueError("membership reconciliation revisions are not contiguous")
-    tombstones = {
-        str(row.get("id") or ""): dict(row)
-        for row in document["superseded_clusters"]
-    }
+    tombstones = {str(row.get("id") or ""): dict(row) for row in document["superseded_clusters"]}
     if set(tombstones) != set(source_ids) - {primary_id}:
         raise ValueError("superseded cluster set does not match source clusters")
+    if any(str(row.get("tag_scope") or "") != str(merged.get("tag_scope") or "")
+           for row in tombstones.values()):
+        raise ValueError("reconciled clusters must share a tag scope")
     for cluster_id, row in tombstones.items():
         if (
             str(row.get("profile_id") or "") != profile_id

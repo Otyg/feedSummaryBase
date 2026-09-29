@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 _LONG_TERM_LOCKS: Dict[str, threading.Lock] = {}
 _LONG_TERM_LOCKS_GUARD = threading.Lock()
 
+
+def _membership_scope_match(query: Query, scope: str):
+    match = query.tag_scope == scope
+    return match if scope else match | ~query.tag_scope.exists()
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
@@ -721,6 +726,18 @@ class TinyDBStore:
         finally:
             db.close()
 
+    def list_article_cluster_memberships(
+        self, profile_id: str, article_id: str
+    ) -> List[Dict[str, Any]]:
+        db = self._db()
+        try:
+            query = Query()
+            return [dict(row) for row in db.table("threat_cluster_memberships").search(
+                (query.profile_id == str(profile_id)) & (query.article_id == str(article_id))
+            )]
+        finally:
+            db.close()
+
     def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool:
         doc = dict(membership_doc or {})
         required = ("profile_id", "article_id", "cluster_id", "assigned_at")
@@ -733,7 +750,7 @@ class TinyDBStore:
                 query = Query()
                 match = (query.profile_id == str(doc["profile_id"])) & (
                     query.article_id == str(doc["article_id"])
-                )
+                ) & _membership_scope_match(query, str(doc.get("tag_scope") or ""))
                 if table.contains(match):
                     return False
                 table.insert(doc)
@@ -751,7 +768,7 @@ class TinyDBStore:
         query = Query()
         membership_match = (query.profile_id == str(membership["profile_id"])) & (
             query.article_id == str(membership["article_id"])
-        )
+        ) & _membership_scope_match(query, str(membership.get("tag_scope") or ""))
         existing_membership = membership_table.get(membership_match)
         if existing_membership is not None and str(
             existing_membership.get("cluster_id")
@@ -815,7 +832,7 @@ class TinyDBStore:
         ):
             raise ValueError("cluster and membership identities do not match")
         cluster.setdefault("updated_at", int(time.time()))
-        operation_id = f"{membership['profile_id']}:{membership['article_id']}"
+        operation_id = f"{membership['profile_id']}:{membership['article_id']}:{membership.get('tag_scope') or ''}"
         operation = {
             "id": operation_id,
             "cluster": cluster,
@@ -835,7 +852,7 @@ class TinyDBStore:
 
                 membership_match = (
                     query.profile_id == str(membership["profile_id"])
-                ) & (query.article_id == str(membership["article_id"]))
+                ) & (query.article_id == str(membership["article_id"])) & _membership_scope_match(query, str(membership.get("tag_scope") or ""))
                 if db.table("threat_cluster_memberships").contains(membership_match):
                     return False
                 if journal.contains(query.id == operation_id):
@@ -943,7 +960,7 @@ class TinyDBStore:
             )
             match = (query.profile_id == profile_id) & (
                 query.article_id == str(membership["article_id"])
-            )
+            ) & (query.cluster_id == previous_id)
 
             def replace_membership(row, replacement=membership):
                 row.clear()
@@ -1051,7 +1068,7 @@ class TinyDBStore:
         for article_id, expected_cluster in operation["expected_memberships"].items():
             match = (query.profile_id == operation["profile_id"]) & (
                 query.article_id == article_id
-            )
+            ) & ((query.cluster_id == expected_cluster) | (query.membership_edit_id == operation["id"]))
             current = memberships.get(match)
             already_final = (
                 current is not None
@@ -1078,7 +1095,9 @@ class TinyDBStore:
             memberships.update(
                 replace(document),
                 (query.profile_id == operation["profile_id"])
-                & (query.article_id == article_id),
+                & (query.article_id == article_id)
+                & ((query.cluster_id == operation["expected_memberships"][article_id])
+                   | (query.membership_edit_id == operation["id"])),
             )
         edits.insert(
             {**operation, "status": "applied", "applied_at": operation["edited_at"]}

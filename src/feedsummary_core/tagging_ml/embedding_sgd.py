@@ -70,7 +70,7 @@ class EmbeddingClassifierSettings:
     embedding_model: str = ""
     min_label_support: int = 10
     min_training_articles: int = 30
-    max_tags_per_article: int = 5
+    max_tags_per_article: int = 20
     threshold: float = 0.5
     regularization_c: float = 1.0
     alpha: float = 0.0001
@@ -120,7 +120,7 @@ class EmbeddingClassifierSettings:
             embedding_model=str(raw.get("embedding_model") or embedding_model or "").strip(),
             min_label_support=max(2, int(raw.get("min_label_support", 10))),
             min_training_articles=max(10, int(raw.get("min_training_articles", 30))),
-            max_tags_per_article=max(1, int(raw.get("max_tags_per_article", 5))),
+            max_tags_per_article=max(1, int(raw.get("max_tags_per_article", 20))),
             threshold=float(raw.get("threshold", 0.5)),
             regularization_c=float(raw.get("regularization_c", raw.get("c", 1.0))),
             alpha=float(raw.get("alpha", 0.0001)),

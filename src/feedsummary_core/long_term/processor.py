@@ -59,8 +59,14 @@ from feedsummary_core.long_term.models import (
 from feedsummary_core.long_term.lease import LeaseLostError
 from feedsummary_core.long_term.identity import CVE_PATTERN, is_strict_cve_record
 
-_STRONG_TAG_CATEGORIES = frozenset(
-    {"THREAT", "VULNERABILITY", "ORGANIZATION", "PRODUCT"}
+_STRONG_TAG_CATEGORIES = frozenset({"THREAT", "VULNERABILITY", "ORGANIZATION", "PRODUCT"})
+DEFAULT_TAG_SCOPE_CATEGORIES = (
+    "DOMAIN_ENTITY",
+    "MALWARE",
+    "THREAT_ACTOR",
+    "SECTOR",
+    "LOCATION",
+    "ORGANIZATION",
 )
 
 
@@ -106,9 +112,11 @@ class LongTermStore(Protocol):
         expected_membership_revision: int | None = None,
     ) -> bool: ...
 
-    def get_cluster_membership(
+    def get_cluster_membership(self, profile_id: str, article_id: str) -> dict[str, Any] | None: ...
+
+    def list_article_cluster_memberships(
         self, profile_id: str, article_id: str
-    ) -> dict[str, Any] | None: ...
+    ) -> list[dict[str, Any]]: ...
 
     def save_cluster_assignment(
         self,
@@ -160,6 +168,7 @@ class IncrementalSettings:
     dormant_after_days: int = 30
     close_after_days: int = 180
     clustering: ClusteringSettings = field(default_factory=ClusteringSettings)
+    tag_scope_categories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -183,6 +192,7 @@ class ArticleAssignment:
     cluster_id: str | None
     reason: str
     similarity: float | None = None
+    tag_scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -252,11 +262,14 @@ def _membership_document(
     strong_indicators: Sequence[str],
     strict_cve_identity: bool,
     article: dict[str, Any],
+    tag_scope: str = "",
+    matching_cluster_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     return {
         "profile_id": profile_id,
         "article_id": article_id,
         "cluster_id": cluster.id,
+        "tag_scope": tag_scope,
         "article_ts": article_ts,
         "assigned_at": assigned_at,
         "assignment_action": action.value,
@@ -265,6 +278,7 @@ def _membership_document(
         "second_similarity": second_similarity,
         "best_candidate_cluster_id": best_candidate_cluster_id,
         "second_candidate_cluster_id": second_candidate_cluster_id,
+        "matching_cluster_ids": list(matching_cluster_ids),
         "cluster_membership_revision": cluster.membership_revision,
         "algorithm_version": cluster.algorithm_version,
         "embedding_model": cluster.embedding_signature.model,
@@ -302,8 +316,7 @@ def _strong_indicators(
     article: dict[str, Any], article_tags: Sequence[dict[str, Any]]
 ) -> tuple[str, ...]:
     text = "\n".join(
-        str(article.get(field) or "")
-        for field in ("title", "text", "content", "summary")
+        str(article.get(field) or "") for field in ("title", "text", "content", "summary")
     )
     indicators = {f"cve:{match.group(0).casefold()}" for match in CVE_PATTERN.finditer(text)}
     for tag in article_tags:
@@ -317,6 +330,25 @@ def _strong_indicators(
         else:
             indicators.add(f"{category.casefold()}:{name}")
     return tuple(sorted(indicators))
+
+
+def _tag_scopes(
+    article_tags: Sequence[dict[str, Any]], categories: frozenset[str]
+) -> tuple[str, ...]:
+    tags = {
+        f"{category}:{name}"
+        for tag in article_tags
+        if (category := str(tag.get("category") or "").strip().upper()) in categories
+        and category not in {"VULNERABILITY", "VULNERABILITIES"}
+        if (name := str(tag.get("name") or "").strip().casefold())
+    }
+    return ("|".join(sorted(tags)),) if tags else ()
+
+
+def _scope_contains(container: str, contained: str) -> bool:
+    container_tags = {value for value in container.split("|") if value}
+    contained_tags = {value for value in contained.split("|") if value}
+    return bool(contained_tags) and contained_tags.issubset(container_tags)
 
 
 def run_incremental_clustering(
@@ -346,6 +378,9 @@ def run_incremental_clustering(
         str(tag).strip().casefold() for tag in required_tags or [] if str(tag).strip()
     )
     settings = settings or IncrementalSettings()
+    tag_categories = frozenset(
+        str(value).strip().upper() for value in settings.tag_scope_categories if str(value).strip()
+    )
     now_ts = int(now_ts or time.time())
     until_fetched_at = int(until_fetched_at or now_ts)
     cursor = store.get_long_term_cursor(profile_id)
@@ -390,10 +425,7 @@ def run_incremental_clustering(
             return
         current_monotonic = time.monotonic()
         renewal_interval = max(0.1, settings.lease_seconds / 3)
-        if (
-            not force
-            and current_monotonic - lease_last_renewed_monotonic < renewal_interval
-        ):
+        if not force and current_monotonic - lease_last_renewed_monotonic < renewal_interval:
             return
         elapsed = max(0, ceil(current_monotonic - lease_started_monotonic))
         if not store.renew_long_term_lease(
@@ -446,17 +478,12 @@ def run_incremental_clustering(
             counts["quarantine_retried"] = len(quarantine_rows)
         candidate_rows = (*quarantine_rows, *new_rows)
         rows_by_id = {
-            str(row.get("id") or ""): row
-            for row in candidate_rows
-            if str(row.get("id") or "")
+            str(row.get("id") or ""): row for row in candidate_rows if str(row.get("id") or "")
         }
         identityless_rows = [row for row in candidate_rows if not str(row.get("id") or "")]
         rows = [*identityless_rows, *rows_by_id.values()]
         fetched_cursor = max(
-            (
-                (int(row.get("fetched_at") or 0), str(row.get("id") or ""))
-                for row in new_rows
-            ),
+            ((int(row.get("fetched_at") or 0), str(row.get("id") or "")) for row in new_rows),
             default=scan_cursor_pair,
         )
         ordered = sorted(rows, key=lambda row: (_article_time(row), str(row.get("id") or "")))
@@ -471,9 +498,7 @@ def run_incremental_clustering(
             ):
                 counts["filtered"] += 1
                 if not dry_run:
-                    store.resolve_long_term_quarantine(
-                        profile_id, article_id, resolved_at=now_ts
-                    )
+                    store.resolve_long_term_quarantine(profile_id, article_id, resolved_at=now_ts)
                 assignments.append(
                     ArticleAssignment(
                         article_id,
@@ -484,6 +509,13 @@ def run_incremental_clustering(
                 )
                 continue
             indicators = _strong_indicators(article, article_tags)
+            tag_scopes = _tag_scopes(article_tags, tag_categories) if tag_categories else ("",)
+            if not tag_scopes:
+                counts["filtered"] += 1
+                assignments.append(
+                    ArticleAssignment(article_id, "filtered", None, "no_clustering_tags")
+                )
+                continue
             strict_cve_identity = is_strict_cve_record(article)
             try:
                 article_id, article_ts, vector, signature = _article_embedding(
@@ -504,35 +536,60 @@ def run_incremental_clustering(
                             "observed_at": now_ts,
                             "fetched_at": int(article.get("fetched_at") or 0),
                             "article_ts": _article_time(article),
-                            "embedding_model": str(
-                                article.get("similarity_embedding_model") or ""
-                            ),
+                            "embedding_model": str(article.get("similarity_embedding_model") or ""),
                             "embedding_instruction": str(
                                 article.get("similarity_embedding_instruction") or ""
                             ),
                         }
                     )
                 counts["quarantined"] += 1
-                assignments.append(
-                    ArticleAssignment(article_id, "quarantined", None, reason)
-                )
+                assignments.append(ArticleAssignment(article_id, "quarantined", None, reason))
                 continue
 
-            existing = store.get_cluster_membership(profile_id, article_id)
-            if existing is not None:
-                if not dry_run:
-                    store.resolve_long_term_quarantine(
-                        profile_id, article_id, resolved_at=now_ts
-                    )
-                counts["existing"] += 1
-                assignments.append(
-                    ArticleAssignment(
-                        article_id,
-                        "existing",
-                        str(existing.get("cluster_id") or "") or None,
-                        "membership_already_exists",
-                    )
+            existing_memberships = store.list_article_cluster_memberships(
+                profile_id, article_id
+            )
+            existing_scopes = {
+                str(row.get("tag_scope") or ""): row for row in existing_memberships
+            }
+            existing_cluster_ids = {
+                str(row.get("cluster_id") or "") for row in existing_memberships
+            }
+
+            def membership_complete(row: dict[str, Any]) -> bool:
+                expected = row.get("matching_cluster_ids") or [row.get("cluster_id")]
+                return all(str(cluster_id) in existing_cluster_ids for cluster_id in expected)
+
+            existing_for_scope = {
+                scope: next(
+                    (
+                        row
+                        for existing_scope, row in existing_scopes.items()
+                        if existing_scope == scope
+                        or (scope and _scope_contains(existing_scope, scope))
+                    ),
+                    None,
                 )
+                for scope in tag_scopes
+            }
+            if all(
+                existing_for_scope[scope] is not None
+                and membership_complete(existing_for_scope[scope])
+                for scope in tag_scopes
+            ):
+                if not dry_run:
+                    store.resolve_long_term_quarantine(profile_id, article_id, resolved_at=now_ts)
+                for scope in tag_scopes:
+                    counts["existing"] += 1
+                    assignments.append(
+                        ArticleAssignment(
+                            article_id,
+                            "existing",
+                            str(existing_for_scope[scope].get("cluster_id") or "") or None,
+                            "membership_already_exists",
+                            tag_scope=scope,
+                        )
+                    )
                 continue
 
             candidates = cluster_cache.get(signature.key)
@@ -547,98 +604,204 @@ def run_incremental_clustering(
                 candidates = [ThreatCluster.from_document(doc) for doc in candidate_docs]
                 cluster_cache[signature.key] = candidates
 
-            decision = assign_article(
-                profile_id=profile_id,
-                article_ts=article_ts,
-                embedding=vector,
-                signature=signature,
-                candidates=candidates,
-                strong_indicators=indicators,
-                strict_cve_identity=strict_cve_identity,
-                settings=settings.clustering,
-            )
-            previous_revision: int | None = None
-            if decision.action is AssignmentAction.MATCH:
-                index = next(
-                    i for i, candidate in enumerate(candidates) if candidate.id == decision.cluster_id
-                )
-                previous = candidates[index]
-                previous_revision = previous.membership_revision
-                cluster = add_cluster_member(
-                    previous,
-                    article_ts=article_ts,
-                    embedding=vector,
-                    strong_indicators=indicators,
-                    strict_cve_identity=strict_cve_identity,
-                )
-                candidates[index] = cluster
-                counts["matched"] += 1
-            else:
-                cluster = create_cluster(
-                    profile_id=profile_id,
-                    article_id=article_id,
-                    article_ts=article_ts,
-                    embedding=vector,
-                    signature=signature,
-                    strong_indicators=indicators,
-                    strict_cve_identity=strict_cve_identity,
-                )
-                if decision.action is AssignmentAction.NEEDS_REVIEW:
-                    cluster = replace(cluster, status=ClusterStatus.NEEDS_REVIEW)
-                    counts["needs_review"] += 1
-                else:
-                    counts["created"] += 1
-                candidates.append(cluster)
+            for tag_scope in tag_scopes:
+                existing = existing_for_scope[tag_scope]
+                if existing is not None and membership_complete(existing):
+                    counts["existing"] += 1
+                    assignments.append(
+                        ArticleAssignment(
+                            article_id,
+                            "existing",
+                            str(existing_for_scope[tag_scope].get("cluster_id") or "") or None,
+                            "membership_already_exists",
+                            tag_scope=tag_scope,
+                        )
+                    )
+                    continue
 
-            membership = _membership_document(
-                profile_id=profile_id,
-                article_id=article_id,
-                article_ts=article_ts,
-                cluster=cluster,
-                action=decision.action,
-                reason=decision.reason,
-                similarity=decision.similarity,
-                second_similarity=decision.second_similarity,
-                best_candidate_cluster_id=decision.best_candidate_cluster_id,
-                second_candidate_cluster_id=decision.second_candidate_cluster_id,
-                assigned_at=now_ts,
-                strong_indicators=indicators,
-                strict_cve_identity=strict_cve_identity,
-                article=article,
-            )
-            if not dry_run and not store.save_cluster_assignment(
-                cluster.to_document(),
-                membership,
-                expected_membership_revision=previous_revision,
-            ):
-                if store.get_cluster_membership(profile_id, article_id) is None:
-                    raise ConcurrentAssignmentError(
-                        f"cluster revision changed while assigning article {article_id}"
+                decision = (
+                    assign_article(
+                        profile_id=profile_id,
+                        article_ts=article_ts,
+                        embedding=vector,
+                        signature=signature,
+                        candidates=candidates,
+                        strong_indicators=indicators,
+                        strict_cve_identity=strict_cve_identity,
+                        tag_scope=tag_scope,
+                        settings=settings.clustering,
                     )
-                counts["existing"] += 1
-                assignments.append(
-                    ArticleAssignment(
-                        article_id,
-                        "existing",
-                        cluster.id,
-                        "membership_won_by_concurrent_retry",
-                    )
+                    if existing is None else None
                 )
-                continue
-            counts["assigned"] += 1
+                previous_revision: int | None = None
+                if existing is not None:
+                    primary_cluster_id = str(existing.get("cluster_id") or "")
+                    matching_cluster_ids = tuple(
+                        str(value) for value in existing.get("matching_cluster_ids") or []
+                    )
+                    counts["existing"] += 1
+                    assignments.append(ArticleAssignment(
+                        article_id, "existing", primary_cluster_id,
+                        "membership_already_exists", tag_scope=tag_scope,
+                    ))
+                elif decision.action is AssignmentAction.MATCH:
+                    index = next(
+                        i
+                        for i, candidate in enumerate(candidates)
+                        if candidate.id == decision.cluster_id
+                    )
+                    previous = candidates[index]
+                    previous_revision = previous.membership_revision
+                    cluster = add_cluster_member(
+                        previous,
+                        article_ts=article_ts,
+                        embedding=vector,
+                        strong_indicators=indicators,
+                        strict_cve_identity=strict_cve_identity,
+                        tag_scope=tag_scope,
+                    )
+                    candidates[index] = cluster
+                    primary_cluster_id = cluster.id
+                    matching_cluster_ids = decision.matching_cluster_ids
+                    counts["matched"] += 1
+                else:
+                    cluster = create_cluster(
+                        profile_id=profile_id,
+                        article_id=article_id,
+                        article_ts=article_ts,
+                        embedding=vector,
+                        signature=signature,
+                        strong_indicators=indicators,
+                        strict_cve_identity=strict_cve_identity,
+                        tag_scope=tag_scope,
+                        algorithm_version="tag-scoped-centroid-v1"
+                        if tag_categories
+                        else "online-centroid-v1",
+                    )
+                    counts["created"] += 1
+                    candidates.append(cluster)
+                    primary_cluster_id = cluster.id
+                    matching_cluster_ids = ()
+
+                if existing is None:
+                    membership = _membership_document(
+                        profile_id=profile_id,
+                        article_id=article_id,
+                        article_ts=article_ts,
+                        cluster=cluster,
+                        action=decision.action,
+                        reason=decision.reason,
+                        similarity=decision.similarity,
+                        second_similarity=decision.second_similarity,
+                        best_candidate_cluster_id=decision.best_candidate_cluster_id,
+                        second_candidate_cluster_id=decision.second_candidate_cluster_id,
+                        assigned_at=now_ts,
+                        strong_indicators=indicators,
+                        strict_cve_identity=strict_cve_identity,
+                        article=article,
+                        tag_scope=tag_scope,
+                        matching_cluster_ids=matching_cluster_ids,
+                    )
+                if existing is None and not dry_run and not store.save_cluster_assignment(
+                    cluster.to_document(),
+                    membership,
+                    expected_membership_revision=previous_revision,
+                ):
+                    current = store.list_article_cluster_memberships(profile_id, article_id)
+                    if not any(
+                        row and str(row.get("tag_scope") or "") == tag_scope for row in current
+                    ):
+                        raise ConcurrentAssignmentError(
+                            f"cluster revision changed while assigning article {article_id}"
+                        )
+                    counts["existing"] += 1
+                    assignments.append(
+                        ArticleAssignment(
+                            article_id,
+                            "existing",
+                            cluster.id,
+                            "membership_won_by_concurrent_retry",
+                        )
+                    )
+                    continue
+                if existing is None:
+                    counts["assigned"] += 1
+                    assignments.append(
+                        ArticleAssignment(
+                            article_id,
+                            decision.action.value,
+                            cluster.id,
+                            decision.reason,
+                            decision.similarity,
+                            tag_scope,
+                        )
+                    )
+                if matching_cluster_ids:
+                    for extra_cluster_id in matching_cluster_ids:
+                        if extra_cluster_id == primary_cluster_id or extra_cluster_id in existing_cluster_ids:
+                            continue
+                        extra_index = next(
+                            (
+                                index
+                                for index, candidate in enumerate(candidates)
+                                if candidate.id == extra_cluster_id
+                            ),
+                            None,
+                        )
+                        if extra_index is None:
+                            continue
+                        extra_previous = candidates[extra_index]
+                        extra_similarity = cosine_similarity(vector, extra_previous.centroid)
+                        extra_cluster = add_cluster_member(
+                            extra_previous,
+                            article_ts=article_ts,
+                            embedding=vector,
+                            strong_indicators=indicators,
+                            strict_cve_identity=strict_cve_identity,
+                            tag_scope=tag_scope,
+                        )
+                        candidates[extra_index] = extra_cluster
+                        extra_membership = _membership_document(
+                            profile_id=profile_id,
+                            article_id=article_id,
+                            article_ts=article_ts,
+                            cluster=extra_cluster,
+                            action=AssignmentAction.MATCH,
+                            reason="additional_similarity_match",
+                            similarity=extra_similarity,
+                            second_similarity=(decision.second_similarity if decision else existing.get("second_similarity")),
+                            best_candidate_cluster_id=extra_cluster_id,
+                            second_candidate_cluster_id=None,
+                            assigned_at=now_ts,
+                            strong_indicators=indicators,
+                            strict_cve_identity=strict_cve_identity,
+                            article=article,
+                            tag_scope=f"{tag_scope}#cluster:{extra_cluster_id}",
+                            matching_cluster_ids=matching_cluster_ids,
+                        )
+                        if not dry_run and not store.save_cluster_assignment(
+                            extra_cluster.to_document(),
+                            extra_membership,
+                            expected_membership_revision=extra_previous.membership_revision,
+                        ):
+                            raise ConcurrentAssignmentError(
+                                f"cluster revision changed while assigning article {article_id}"
+                            )
+                        counts["assigned"] += 1
+                        counts["matched"] += 1
+                        existing_cluster_ids.add(extra_cluster_id)
+                        assignments.append(
+                            ArticleAssignment(
+                                article_id,
+                                AssignmentAction.MATCH.value,
+                                extra_cluster.id,
+                                "additional_similarity_match",
+                                extra_similarity,
+                                tag_scope,
+                            )
+                        )
             if not dry_run:
-                store.resolve_long_term_quarantine(
-                    profile_id, article_id, resolved_at=now_ts
-                )
-            assignments.append(
-                ArticleAssignment(
-                    article_id,
-                    decision.action.value,
-                    cluster.id,
-                    decision.reason,
-                    decision.similarity,
-                )
-            )
+                store.resolve_long_term_quarantine(profile_id, article_id, resolved_at=now_ts)
 
         lifecycle_reference_ts = max(
             (_article_time(row) for row in rows),

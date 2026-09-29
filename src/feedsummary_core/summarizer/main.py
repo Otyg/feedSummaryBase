@@ -1450,7 +1450,9 @@ async def run_pipeline(
                 message="Startar ingest...",
             )
 
-        ins, upd = await gather_articles_to_store(config, store, job_id=job_id)
+        ins, upd, _changed_article_ids = await gather_articles_to_store(
+            config, store, job_id=job_id
+        )
 
         if job_id is not None:
             store.update_job(
@@ -1470,7 +1472,6 @@ async def run_pipeline(
                     article_ids=primary_ids,
                     config=config,
                     job_id=job_id,
-                    max_tags_per_article=5,
                 )
             to_sum, enrichment_info = _enrich_articles_with_vulnerabilities(
                 config=config,
@@ -1524,7 +1525,6 @@ async def run_pipeline(
                 article_ids=article_ids,
                 config=config,
                 job_id=job_id,
-                max_tags_per_article=5,
             )
             logger.info(f"Tagged {tagged_count}/{len(article_ids)} articles")
 
@@ -1600,7 +1600,6 @@ async def run_resume_job(
                 article_ids=article_ids,
                 config=config,
                 job_id=jid,
-                max_tags_per_article=5,
             )
             logger.info(f"Tagged {tagged_count}/{len(article_ids)} articles")
         else:
@@ -1673,7 +1672,7 @@ async def run_fetch_and_tag(
             )
 
         # Fetch articles
-        ins, upd = await gather_articles_to_store(config, store, job_id=job_id)
+        ins, upd, changed_article_ids = await gather_articles_to_store(config, store, job_id=job_id)
         total_fetched = ins + upd
 
         if job_id is not None:
@@ -1682,33 +1681,8 @@ async def run_fetch_and_tag(
                 message=f"Hämtade {total_fetched} artiklar (nye: {ins}, uppdaterade: {upd}). Taggar...",
             )
 
-        # Tag recently fetched articles
-        ingest = config.get("ingest") or {}
-        lookback = str(ingest.get("lookback") or "").strip()
-        now = int(time.time())
-        since_ts = now - parse_lookback_to_seconds(lookback) if lookback else 0
-
-        sources = _selected_source_names(config)
-        
-        # Get articles within the lookback window
-        list_by_filter = getattr(store, "list_articles_by_filter", None)
-        if callable(list_by_filter) and since_ts > 0 and sources:
-            articles = list_by_filter(sources=sources, since_ts=since_ts, until_ts=now, limit=5000)
-        else:
-            list_articles = getattr(store, "list_articles", None)
-            if callable(list_articles):
-                articles = list_articles(limit=5000)
-            else:
-                articles = store.list_unsummarized_articles(limit=5000)
-            
-            if sources:
-                srcset = set(sources)
-                articles = [a for a in articles if a.get("source") in srcset]
-            if since_ts > 0:
-                articles = [a for a in articles if _published_ts(a) >= since_ts]
-
-        # Tag articles
-        article_ids = [a.get("id") for a in articles if a.get("id")]
+        # Tag only articles changed by this fetch, not the entire lookback window.
+        article_ids = changed_article_ids
         tagged_count = 0
         if article_ids:
             tagged_count = await tag_articles_safe(
@@ -1717,7 +1691,6 @@ async def run_fetch_and_tag(
                 article_ids=article_ids,
                 config=config,
                 job_id=job_id,
-                max_tags_per_article=5,
             )
             logger.info(f"Tagged {tagged_count}/{len(article_ids)} articles")
 

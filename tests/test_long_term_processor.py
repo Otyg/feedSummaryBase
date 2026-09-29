@@ -1,3 +1,4 @@
+import sqlite3
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from feedsummary_core.long_term import (
     ClusteringSettings,
+    ConcurrentAssignmentError,
     EmbeddingSignature,
     IncrementalSettings,
     LeaseLostError,
@@ -45,6 +47,128 @@ class LongTermProcessorTests(unittest.TestCase):
                 ambiguity_margin=0.02,
                 candidate_window_days=60,
             ),
+        )
+
+    def test_tag_profiles_exclude_vulnerability_scope_and_gate_similarity(self):
+        legacy = create_cluster(
+            profile_id="profile", article_id="legacy", article_ts=50,
+            embedding=[1.0, 0.0],
+            signature=EmbeddingSignature("embedding-model", 2, "cluster incidents"),
+        )
+        self.store.save_threat_cluster(legacy.to_document())
+        malware_a = self.store.create_tag("Malware A", "MALWARE")
+        malware_b = self.store.create_tag("Malware B", "MALWARE")
+        vulnerability = self.store.create_tag("CVE-2026-1234", "VULNERABILITY")
+        for article_id, ts, tags in (
+            ("article-a", 100, (malware_a, vulnerability)),
+            ("article-b", 200, (malware_a, vulnerability)),
+            ("article-c", 300, (malware_b, vulnerability)),
+        ):
+            self.store.upsert_article(self.article(article_id, ts, [1.0, 0.0]))
+            for tag in tags:
+                self.store.add_tag_to_article(article_id, tag["id"])
+        self.store.upsert_article(self.article("untagged", 400, [1.0, 0.0]))
+
+        settings = IncrementalSettings(
+            batch_size=20,
+            tag_scope_categories=("MALWARE", "VULNERABILITY"),
+            clustering=ClusteringSettings(similarity_threshold=0.9),
+        )
+        result = run_incremental_clustering(
+            self.store, profile_id="profile", owner_id="worker",
+            until_fetched_at=500, now_ts=500, settings=settings,
+        )
+
+        self.assertEqual(3, result.assigned)
+        self.assertEqual(2, result.created)
+        self.assertEqual(1, result.matched)
+        self.assertEqual(1, result.filtered)
+        memberships = self.store.list_article_cluster_memberships("profile", "article-a")
+        self.assertEqual(
+            {"MALWARE:malware a"},
+            {row["tag_scope"] for row in memberships},
+        )
+        malware_cluster = memberships[0]
+        self.assertEqual(
+            malware_cluster["cluster_id"],
+            self.store.list_article_cluster_memberships("profile", "article-b")[0]["cluster_id"],
+        )
+        self.assertNotEqual(
+            malware_cluster["cluster_id"],
+            self.store.list_article_cluster_memberships("profile", "article-c")[0]["cluster_id"],
+        )
+
+    def test_article_can_belong_to_multiple_matching_clusters(self):
+        malware = self.store.create_tag("Malware A", "MALWARE")
+        vulnerability = self.store.create_tag("CVE-2026-1234", "VULNERABILITY")
+        signature = EmbeddingSignature("embedding-model", 2, "cluster incidents")
+        first = create_cluster(
+            profile_id="profile", article_id="cluster-a", article_ts=100,
+            embedding=[1.0, 0.0], signature=signature,
+            tag_scope="MALWARE:malware a|VULNERABILITY:cve-2026-1234",
+        )
+        second = create_cluster(
+            profile_id="profile", article_id="cluster-b", article_ts=100,
+            embedding=[0.9, 0.435], signature=signature,
+            tag_scope="MALWARE:malware a|VULNERABILITY:cve-2026-1234",
+        )
+        self.store.save_threat_cluster(first.to_document())
+        self.store.save_threat_cluster(second.to_document())
+        self.store.upsert_article(self.article("article", 200, [1.0, 0.0]))
+        for tag in (malware, vulnerability):
+            self.store.add_tag_to_article("article", tag["id"])
+
+        result = run_incremental_clustering(
+            self.store,
+            profile_id="profile",
+            owner_id="worker",
+            until_fetched_at=500,
+            now_ts=500,
+            settings=IncrementalSettings(
+                batch_size=20,
+                tag_scope_categories=("MALWARE", "VULNERABILITY"),
+                clustering=ClusteringSettings(
+                    similarity_threshold=0.8,
+                    ambiguity_margin=0.01,
+                ),
+            ),
+        )
+
+        self.assertEqual(2, result.assigned)
+        memberships = self.store.list_article_cluster_memberships("profile", "article")
+        self.assertEqual({first.id, second.id}, {row["cluster_id"] for row in memberships})
+
+    def test_existing_sqlite_memberships_migrate_without_losing_rows(self):
+        path = Path(self.directory.name) / "legacy.sqlite"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                """CREATE TABLE threat_cluster_memberships (
+                    profile_id TEXT NOT NULL, article_id TEXT NOT NULL,
+                    cluster_id TEXT NOT NULL, assigned_at INTEGER NOT NULL,
+                    doc_json TEXT NOT NULL, PRIMARY KEY (profile_id, article_id))"""
+            )
+            connection.execute(
+                """INSERT INTO threat_cluster_memberships
+                VALUES ('profile', 'article-a', 'old-cluster', 100,
+                '{"profile_id":"profile","article_id":"article-a","cluster_id":"old-cluster"}')"""
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = SqliteStore(str(path))
+        self.assertEqual(
+            "old-cluster",
+            migrated.get_cluster_membership("profile", "article-a")["cluster_id"],
+        )
+        self.assertTrue(migrated.save_cluster_membership({
+            "profile_id": "profile", "article_id": "article-a",
+            "tag_scope": "MALWARE:malware a", "cluster_id": "new-cluster",
+            "assigned_at": 200,
+        }))
+        self.assertEqual(
+            2, len(migrated.list_article_cluster_memberships("profile", "article-a"))
         )
 
     def test_incremental_batch_clusters_and_advances_cursor(self):
@@ -87,7 +211,7 @@ class LongTermProcessorTests(unittest.TestCase):
         self.assertEqual(0, replay.assigned)
         self.assertEqual(2, len(self.store.list_threat_clusters("profile")))
 
-    def test_ambiguous_membership_retains_both_review_candidate_ids(self):
+    def test_ambiguous_article_joins_both_candidate_clusters(self):
         signature = EmbeddingSignature(
             "embedding-model", 2, "cluster incidents"
         )
@@ -126,10 +250,56 @@ class LongTermProcessorTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(1, result.needs_review)
-        membership = self.store.get_cluster_membership("profile", "ambiguous")
-        self.assertEqual(first.id, membership["best_candidate_cluster_id"])
-        self.assertEqual(second.id, membership["second_candidate_cluster_id"])
+        self.assertEqual(0, result.needs_review)
+        self.assertEqual(2, result.matched)
+        memberships = self.store.list_article_cluster_memberships("profile", "ambiguous")
+        self.assertEqual({first.id, second.id}, {row["cluster_id"] for row in memberships})
+        self.assertEqual(
+            {first.id, second.id},
+            {row["id"] for row in self.store.list_threat_clusters("profile")},
+        )
+
+    def test_retry_completes_interrupted_multiple_assignment(self):
+        signature = EmbeddingSignature("embedding-model", 2, "cluster incidents")
+        first = create_cluster(
+            profile_id="profile", article_id="seed-a", article_ts=100,
+            embedding=[1.0, 0.0], signature=signature,
+        )
+        second = create_cluster(
+            profile_id="profile", article_id="seed-b", article_ts=100,
+            embedding=[0.999, 0.045], signature=signature,
+        )
+        self.store.save_threat_cluster(first.to_document())
+        self.store.save_threat_cluster(second.to_document())
+        self.store.upsert_article(self.article("ambiguous", 200, [1.0, 0.0]))
+        settings = IncrementalSettings(
+            batch_size=20, lease_seconds=60,
+            clustering=ClusteringSettings(similarity_threshold=0.8),
+        )
+        save = self.store.save_cluster_assignment
+        failed = False
+
+        def fail_additional(cluster, membership, **kwargs):
+            nonlocal failed
+            if "#cluster:" in membership["tag_scope"] and not failed:
+                failed = True
+                return False
+            return save(cluster, membership, **kwargs)
+
+        with patch.object(self.store, "save_cluster_assignment", side_effect=fail_additional):
+            with self.assertRaises(ConcurrentAssignmentError):
+                run_incremental_clustering(
+                    self.store, profile_id="profile", owner_id="worker",
+                    until_fetched_at=500, now_ts=500, settings=settings,
+                )
+
+        result = run_incremental_clustering(
+            self.store, profile_id="profile", owner_id="worker",
+            until_fetched_at=500, now_ts=501, settings=settings,
+        )
+        self.assertEqual(1, result.assigned)
+        memberships = self.store.list_article_cluster_memberships("profile", "ambiguous")
+        self.assertEqual({first.id, second.id}, {row["cluster_id"] for row in memberships})
 
     def test_clustering_renews_lease_before_cursor_commit(self):
         self.store.upsert_article(self.article("article-a", 100, [1.0, 0.0]))

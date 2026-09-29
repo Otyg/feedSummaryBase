@@ -179,6 +179,9 @@ class SqliteStore:
                 CREATE INDEX IF NOT EXISTS idx_articles_fetched_at
                   ON articles(fetched_at);
 
+                CREATE INDEX IF NOT EXISTS idx_articles_viewer_ts
+                  ON articles(COALESCE(NULLIF(published_ts, 0), fetched_at, 0), id);
+
                 CREATE TABLE IF NOT EXISTS summary_docs (
                     id       TEXT PRIMARY KEY,
                     created  INTEGER,
@@ -294,10 +297,11 @@ class SqliteStore:
                 CREATE TABLE IF NOT EXISTS threat_cluster_memberships (
                     profile_id TEXT NOT NULL,
                     article_id TEXT NOT NULL,
+                    tag_scope TEXT NOT NULL DEFAULT '',
                     cluster_id TEXT NOT NULL,
                     assigned_at INTEGER NOT NULL,
                     doc_json TEXT NOT NULL,
-                    PRIMARY KEY (profile_id, article_id)
+                    PRIMARY KEY (profile_id, article_id, tag_scope)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_threat_memberships_cluster
@@ -412,7 +416,51 @@ class SqliteStore:
                 for column, column_type in columns.items():
                     if column not in existing:
                         con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            membership_columns = {
+                str(row["name"]): int(row["pk"])
+                for row in con.execute("PRAGMA table_info(threat_cluster_memberships)")
+            }
+            if membership_columns.get("tag_scope") != 3:
+                con.execute("""CREATE TABLE threat_cluster_memberships_new (
+                    profile_id TEXT NOT NULL, article_id TEXT NOT NULL,
+                    tag_scope TEXT NOT NULL DEFAULT '', cluster_id TEXT NOT NULL,
+                    assigned_at INTEGER NOT NULL, doc_json TEXT NOT NULL,
+                    PRIMARY KEY (profile_id, article_id, tag_scope))""")
+                con.execute("""INSERT INTO threat_cluster_memberships_new
+                    (profile_id, article_id, tag_scope, cluster_id, assigned_at, doc_json)
+                    SELECT profile_id, article_id, '', cluster_id, assigned_at, doc_json
+                    FROM threat_cluster_memberships""")
+                con.execute("DROP TABLE threat_cluster_memberships")
+                con.execute("ALTER TABLE threat_cluster_memberships_new RENAME TO threat_cluster_memberships")
+                con.execute("CREATE INDEX idx_threat_memberships_cluster ON threat_cluster_memberships(cluster_id, assigned_at)")
             con.commit()
+        finally:
+            con.close()
+    def reset_long_term_analysis(self, *, dry_run: bool = False) -> Dict[str, int]:
+        """Delete all long-term analysis state while preserving article data."""
+
+        tables = (
+            "long_term_state",
+            "threat_cluster_memberships",
+            "threat_clusters",
+            "long_term_cluster_reconciliations",
+            "long_term_cluster_membership_edits",
+            "long_term_article_quarantine",
+            "threat_cluster_snapshots",
+            "threat_landscape_reports",
+            "long_term_runs",
+        )
+        con = self._connect()
+        try:
+            counts = {
+                table: int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in tables
+            }
+            if not dry_run:
+                for table in tables:
+                    con.execute(f"DELETE FROM {table}")
+                con.commit()
+            return counts
         finally:
             con.close()
 
@@ -1548,6 +1596,19 @@ class SqliteStore:
         finally:
             con.close()
 
+    def list_article_cluster_memberships(
+        self, profile_id: str, article_id: str
+    ) -> List[Dict[str, Any]]:
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT doc_json FROM threat_cluster_memberships WHERE profile_id=? AND article_id=? ORDER BY tag_scope",
+                (str(profile_id), str(article_id)),
+            ).fetchall()
+            return [doc for row in rows if isinstance((doc := _json_loads(row["doc_json"])), dict)]
+        finally:
+            con.close()
+
     def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool:
         doc = dict(membership_doc or {})
         required = ("profile_id", "article_id", "cluster_id", "assigned_at")
@@ -1558,12 +1619,13 @@ class SqliteStore:
             con.execute(
                 """
                 INSERT INTO threat_cluster_memberships (
-                    profile_id, article_id, cluster_id, assigned_at, doc_json
-                ) VALUES (?, ?, ?, ?, ?)
+                    profile_id, article_id, tag_scope, cluster_id, assigned_at, doc_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(doc["profile_id"]),
                     str(doc["article_id"]),
+                    str(doc.get("tag_scope") or ""),
                     str(doc["cluster_id"]),
                     _safe_int(doc["assigned_at"]),
                     _json_dumps(doc),
@@ -1616,9 +1678,9 @@ class SqliteStore:
             duplicate = con.execute(
                 """
                 SELECT 1 FROM threat_cluster_memberships
-                WHERE profile_id=? AND article_id=?
+                WHERE profile_id=? AND article_id=? AND tag_scope=?
                 """,
-                (str(membership["profile_id"]), str(membership["article_id"])),
+                (str(membership["profile_id"]), str(membership["article_id"]), str(membership.get("tag_scope") or "")),
             ).fetchone()
             if duplicate:
                 con.rollback()
@@ -1674,12 +1736,13 @@ class SqliteStore:
             con.execute(
                 """
                 INSERT INTO threat_cluster_memberships (
-                    profile_id, article_id, cluster_id, assigned_at, doc_json
-                ) VALUES (?, ?, ?, ?, ?)
+                    profile_id, article_id, tag_scope, cluster_id, assigned_at, doc_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(membership["profile_id"]),
                     str(membership["article_id"]),
+                    str(membership.get("tag_scope") or ""),
                     str(membership["cluster_id"]),
                     _safe_int(membership["assigned_at"]),
                     _json_dumps(membership),
@@ -1821,13 +1884,14 @@ class SqliteStore:
                     """
                     UPDATE threat_cluster_memberships
                     SET cluster_id=?, doc_json=?
-                    WHERE profile_id=? AND article_id=?
+                    WHERE profile_id=? AND article_id=? AND tag_scope=?
                     """,
                     (
                         primary_id,
                         _json_dumps(membership),
                         str(row["profile_id"]),
                         str(row["article_id"]),
+                        str(membership.get("tag_scope") or ""),
                     ),
                 )
 
@@ -1920,7 +1984,8 @@ class SqliteStore:
                 f"WHERE profile_id=? AND article_id IN ({placeholders})",
                 (operation["profile_id"], *expected),
             ).fetchall()
-            if {str(row["article_id"]): str(row["cluster_id"]) for row in rows} != expected:
+            if {str(row["article_id"]): str(row["cluster_id"]) for row in rows
+                if str(row["cluster_id"]) == expected.get(str(row["article_id"]))} != expected:
                 con.rollback()
                 return False
 
@@ -1954,10 +2019,11 @@ class SqliteStore:
             for membership in operation["memberships"]:
                 con.execute(
                     """UPDATE threat_cluster_memberships SET cluster_id=?, doc_json=?
-                    WHERE profile_id=? AND article_id=?""",
+                    WHERE profile_id=? AND article_id=? AND tag_scope=?""",
                     (
                         membership["cluster_id"], _json_dumps(membership),
                         operation["profile_id"], membership["article_id"],
+                        str(membership.get("tag_scope") or ""),
                     ),
                 )
             stored = {**operation, "status": "applied", "applied_at": operation["edited_at"]}

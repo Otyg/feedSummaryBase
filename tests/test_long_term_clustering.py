@@ -54,6 +54,51 @@ class LongTermClusteringTests(unittest.TestCase):
         self.assertEqual(2, updated.membership_revision)
         self.assertEqual(1_000_100, updated.last_seen_ts)
 
+    def test_assignment_requires_configured_shared_tag_count(self):
+        cluster = create_cluster(
+            profile_id="healthcare_europe",
+            article_id="seed",
+            article_ts=1_000_000,
+            embedding=[1, 0],
+            signature=self.signature,
+            tag_scope="MALWARE:a|SECTOR:healthcare",
+        )
+        decision = assign_article(
+            profile_id="healthcare_europe",
+            article_ts=1_000_010,
+            embedding=[1, 0],
+            signature=self.signature,
+            candidates=[cluster],
+            tag_scope="MALWARE:a|SECTOR:healthcare|VULNERABILITY:b",
+            settings=ClusteringSettings(min_shared_tags=2),
+        )
+        self.assertEqual(AssignmentAction.MATCH, decision.action)
+
+        insufficient = assign_article(
+            profile_id="healthcare_europe",
+            article_ts=1_000_010,
+            embedding=[1, 0],
+            signature=self.signature,
+            candidates=[cluster],
+            tag_scope="MALWARE:a|VULNERABILITY:b",
+            settings=ClusteringSettings(min_shared_tags=2),
+        )
+        self.assertEqual(AssignmentAction.NEW_CLUSTER, insufficient.action)
+
+    def test_member_update_unions_tag_scope(self):
+        cluster = self.cluster("a", [1, 0])
+        cluster = replace(cluster, tag_scope="MALWARE:a|SECTOR:healthcare")
+        updated = add_cluster_member(
+            cluster,
+            article_ts=1_000_100,
+            embedding=[1, 0],
+            tag_scope="SECTOR:healthcare|VULNERABILITY:b",
+        )
+        self.assertEqual(
+            "MALWARE:a|SECTOR:healthcare|VULNERABILITY:b",
+            updated.tag_scope,
+        )
+
     def test_adding_to_a_dormant_cluster_records_reopening(self):
         dormant = replace(
             self.cluster("a", [1, 0]),
@@ -154,7 +199,7 @@ class LongTermClusteringTests(unittest.TestCase):
         self.assertEqual(AssignmentAction.NEW_CLUSTER, decision.action)
         self.assertEqual("no_compatible_candidate", decision.reason)
 
-    def test_close_candidates_are_quarantined_as_ambiguous(self):
+    def test_close_candidates_both_receive_the_article(self):
         first = self.cluster("first", [1.0, 0.0])
         second = self.cluster("second", [0.999, 0.045])
         decision = assign_article(
@@ -168,10 +213,11 @@ class LongTermClusteringTests(unittest.TestCase):
                 ambiguity_margin=0.01,
             ),
         )
-        self.assertEqual(AssignmentAction.NEEDS_REVIEW, decision.action)
-        self.assertEqual("ambiguous_candidates", decision.reason)
+        self.assertEqual(AssignmentAction.MATCH, decision.action)
+        self.assertEqual("multiple_compatible_candidates", decision.reason)
         self.assertEqual(first.id, decision.best_candidate_cluster_id)
         self.assertEqual(second.id, decision.second_candidate_cluster_id)
+        self.assertEqual((first.id, second.id), decision.matching_cluster_ids)
 
     def test_conflicting_cves_prevent_high_similarity_merge(self):
         candidate = create_cluster(

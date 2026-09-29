@@ -185,6 +185,38 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
             ],
         )
 
+    def test_prompt_metrics_omits_missing_snapshot_cluster_ids_and_filters_to_snapshots(self):
+        metrics = copy.deepcopy(self.metrics)
+        window = metrics["windows"][0]
+        window["snapshot_eligible_cluster_ids"] = [
+            "cluster-1",
+            "cluster-2",
+            "cluster-3",
+        ]
+        window["coverage"] = {
+            "trend_eligible": False,
+            "missing_snapshot_cluster_ids": ["cluster-2", "cluster-3"],
+            "warnings": ["missing_report_snapshots"],
+        }
+        window["weekly_buckets"][0]["event_cluster_ids"] = ["cluster-1", "cluster-2"]
+
+        # Only cluster-1 snapshot provided
+        snapshots = [{"id": "s-1", "profile_id": "profile", "cluster_id": "cluster-1"}]
+        compact = _metrics_for_prompt(metrics, snapshots=snapshots)
+        compact_window = compact["windows"][0]
+
+        self.assertNotIn("missing_snapshot_cluster_ids", compact_window["coverage"])
+        self.assertEqual(
+            {"window_1": [1]},
+            compact["citable_cluster_bucket_presence"]["cluster-1"],
+        )
+        self.assertNotIn("cluster-2", compact["citable_cluster_bucket_presence"])
+        self.assertNotIn("cluster-3", compact["citable_cluster_bucket_presence"])
+        self.assertEqual(
+            5,  # 3 in snapshot_eligible + 2 in missing_snapshot_cluster_ids
+            compact["prompt_compaction"]["non_citable_event_id_occurrences_omitted"],
+        )
+
     def test_final_compaction_retains_identity_and_bounds_detail(self):
         compact = _compact_snapshots_for_final(
             [
@@ -192,9 +224,11 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
                     "id": "snapshot-1",
                     "profile_id": "profile",
                     "cluster_id": "cluster-1",
-                    "summary": "s" * 500,
-                    "key_facts": ["f" * 200, "second"],
-                    "uncertainties": ["u" * 200],
+                    "payload": {
+                        "summary": "s" * 500,
+                        "key_facts": ["f" * 200, "second"],
+                        "uncertainties": ["u" * 200],
+                    },
                 }
             ],
             level=4,
@@ -465,6 +499,41 @@ class LongTermReduceAnalysisTests(unittest.TestCase):
             + [self.final_prompt["output_schema"]],
             [call[3] for call in llm.calls],
         )
+
+    def test_final_compaction_preserves_segment_qualitative_fields(self):
+        snapshots = copy.deepcopy(self.snapshots)
+        for snapshot in snapshots:
+            snapshot["payload"]["summary"] = "x" * 3000
+        responses = []
+        for snapshot in snapshots:
+            segment = self.segment_payload([snapshot])
+            segment["snapshots"][0].update(
+                {
+                    "summary": "Y" * 3000,
+                    "key_facts": ["Belagd uppgift."],
+                    "uncertainties": ["Osäker omfattning."],
+                }
+            )
+            responses.append(json.dumps(segment))
+        llm = FakeLLM([*responses, json.dumps(self.report())])
+
+        result = self.run_reduce(
+            FakeStore(snapshots),
+            llm,
+            settings=ReduceSettings(
+                max_context_tokens=2000,
+                max_output_tokens=200,
+                safety_margin_tokens=100,
+                max_snapshots_per_segment=1,
+            ),
+        )
+
+        self.assertEqual(3, result.segment_count)
+        final_prompt = llm.calls[-1][0][-1]["content"]
+        self.assertIn("Y" * 600, final_prompt)
+        self.assertNotIn("Y" * 601, final_prompt)
+        self.assertIn("Belagd uppgift.", final_prompt)
+        self.assertIn("Osäker omfattning.", final_prompt)
 
     def test_invalid_segment_and_repair_are_regenerated_in_place(self):
         snapshots = copy.deepcopy(self.snapshots)

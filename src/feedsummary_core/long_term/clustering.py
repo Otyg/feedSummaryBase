@@ -62,6 +62,7 @@ class ClusteringSettings:
     similarity_threshold: float = 0.80
     ambiguity_margin: float = 0.03
     candidate_window_days: int = 60
+    min_shared_tags: int = 1
 
     def __post_init__(self) -> None:
         if not -1.0 <= self.similarity_threshold <= 1.0:
@@ -70,6 +71,8 @@ class ClusteringSettings:
             raise ValueError("ambiguity_margin must be between 0 and 2")
         if self.candidate_window_days < 1:
             raise ValueError("candidate_window_days must be positive")
+        if self.min_shared_tags < 1:
+            raise ValueError("min_shared_tags must be positive")
 
 
 @dataclass(frozen=True)
@@ -81,11 +84,10 @@ class AssignmentDecision:
     reason: str
     best_candidate_cluster_id: str | None = None
     second_candidate_cluster_id: str | None = None
+    matching_cluster_ids: tuple[str, ...] = ()
 
 
-def _validated_vector(
-    values: Sequence[float], dimensions: int | None = None
-) -> tuple[float, ...]:
+def _validated_vector(values: Sequence[float], dimensions: int | None = None) -> tuple[float, ...]:
     if not values:
         raise VectorValidationError("embedding vector must not be empty")
     try:
@@ -103,9 +105,7 @@ def _validated_vector(
     return vector
 
 
-def _unit_vector(
-    values: Sequence[float], dimensions: int | None = None
-) -> tuple[float, ...]:
+def _unit_vector(values: Sequence[float], dimensions: int | None = None) -> tuple[float, ...]:
     vector = _validated_vector(values, dimensions)
     norm = math.sqrt(sum(value * value for value in vector))
     return tuple(value / norm for value in vector)
@@ -118,9 +118,7 @@ def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
     right_vector = _validated_vector(right, len(left_vector))
     left_norm = math.sqrt(sum(value * value for value in left_vector))
     right_norm = math.sqrt(sum(value * value for value in right_vector))
-    return sum(a * b for a, b in zip(left_vector, right_vector)) / (
-        left_norm * right_norm
-    )
+    return sum(a * b for a, b in zip(left_vector, right_vector)) / (left_norm * right_norm)
 
 
 def stable_cluster_id(
@@ -145,6 +143,7 @@ def create_cluster(
     signature: EmbeddingSignature,
     strong_indicators: Iterable[str] = (),
     strict_cve_identity: bool = True,
+    tag_scope: str = "",
     algorithm_version: str = "online-centroid-v1",
 ) -> ThreatCluster:
     """Create a one-member cluster from a validated, normalized article vector."""
@@ -153,7 +152,11 @@ def create_cluster(
         raise ValueError("article_ts must be positive")
     normalized = _unit_vector(embedding, signature.dimensions)
     return ThreatCluster(
-        id=stable_cluster_id(profile_id, article_id, algorithm_version),
+        id=stable_cluster_id(
+            profile_id,
+            article_id,
+            f"{algorithm_version}:{tag_scope}" if tag_scope else algorithm_version,
+        ),
         profile_id=profile_id,
         embedding_signature=signature,
         centroid=normalized,
@@ -165,9 +168,12 @@ def create_cluster(
         status=ClusterStatus.ACTIVE,
         algorithm_version=algorithm_version,
         strong_indicators=tuple(
-            sorted({str(value).strip().casefold() for value in strong_indicators if str(value).strip()})
+            sorted(
+                {str(value).strip().casefold() for value in strong_indicators if str(value).strip()}
+            )
         ),
         strict_cve_identity=bool(strict_cve_identity),
+        tag_scope=tag_scope,
     )
 
 
@@ -178,6 +184,7 @@ def add_cluster_member(
     embedding: Sequence[float],
     strong_indicators: Iterable[str] = (),
     strict_cve_identity: bool = True,
+    tag_scope: str = "",
 ) -> ThreatCluster:
     """Return an updated cluster using an exact incremental arithmetic centroid."""
 
@@ -207,8 +214,15 @@ def add_cluster_member(
                 }
             )
         ),
-        strict_cve_identity=(
-            cluster.strict_cve_identity and bool(strict_cve_identity)
+        strict_cve_identity=(cluster.strict_cve_identity and bool(strict_cve_identity)),
+        tag_scope="|".join(
+            sorted(
+                {
+                    value.strip()
+                    for value in f"{cluster.tag_scope}|{tag_scope}".split("|")
+                    if value.strip()
+                }
+            )
         ),
     )
 
@@ -247,6 +261,7 @@ def assign_article(
     candidates: Iterable[ThreatCluster],
     strong_indicators: Iterable[str] = (),
     strict_cve_identity: bool = True,
+    tag_scope: str = "",
     settings: ClusteringSettings | None = None,
 ) -> AssignmentDecision:
     """Choose a compatible recent cluster or return a deterministic non-match decision."""
@@ -257,13 +272,18 @@ def assign_article(
     article_indicator_set = {
         str(value).strip().casefold() for value in strong_indicators if str(value).strip()
     }
-    article_cves = {
-        value for value in article_indicator_set if value.startswith("cve:")
-    }
+    article_cves = {value for value in article_indicator_set if value.startswith("cve:")}
     scored = []
     conflicting_cves = False
     for cluster in candidates:
         if cluster.profile_id != profile_id:
+            continue
+        if tag_scope and cluster.tag_scope:
+            article_tags = {value for value in tag_scope.split("|") if value}
+            cluster_tags = {value for value in cluster.tag_scope.split("|") if value}
+            if len(article_tags.intersection(cluster_tags)) < settings.min_shared_tags:
+                continue
+        elif cluster.tag_scope != tag_scope:
             continue
         if cluster.embedding_signature != signature:
             continue
@@ -272,9 +292,7 @@ def assign_article(
         if cluster.last_seen_ts < earliest_candidate_ts:
             continue
         cluster_indicator_set = set(cluster.strong_indicators)
-        cluster_cves = {
-            value for value in cluster_indicator_set if value.startswith("cve:")
-        }
+        cluster_cves = {value for value in cluster_indicator_set if value.startswith("cve:")}
         if (
             strict_cve_identity
             and cluster.strict_cve_identity
@@ -285,9 +303,10 @@ def assign_article(
             conflicting_cves = True
             continue
         score = cosine_similarity(vector, cluster.centroid)
-        overlap = len(article_indicator_set.intersection(cluster_indicator_set))
+        tag_overlap = len(article_tags.intersection(cluster_tags)) if tag_scope else 0
+        indicator_overlap = len(article_indicator_set.intersection(cluster_indicator_set))
         time_distance = abs(article_ts - cluster.last_seen_ts)
-        scored.append((score, overlap, time_distance, cluster.id))
+        scored.append((score, tag_overlap, indicator_overlap, time_distance, cluster.id))
 
     if not scored:
         return AssignmentDecision(
@@ -295,15 +314,13 @@ def assign_article(
             None,
             None,
             None,
-            "conflicting_cve_indicators"
-            if conflicting_cves
-            else "no_compatible_candidate",
+            "conflicting_cve_indicators" if conflicting_cves else "no_compatible_candidate",
         )
 
-    scored.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
-    best_similarity, best_overlap, _, best_id = scored[0]
+    scored.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
+    best_similarity, _, best_indicator_overlap, _, best_id = scored[0]
     second_similarity = scored[1][0] if len(scored) > 1 else None
-    second_id = scored[1][3] if len(scored) > 1 else None
+    second_id = scored[1][4] if len(scored) > 1 else None
     if best_similarity < settings.similarity_threshold:
         return AssignmentDecision(
             AssignmentAction.NEW_CLUSTER,
@@ -314,28 +331,24 @@ def assign_article(
             best_candidate_cluster_id=best_id,
             second_candidate_cluster_id=second_id,
         )
-    if (
+    matching_ids = tuple(
+        item[4] for item in scored if item[0] >= settings.similarity_threshold
+    )
+    ambiguous = (
         second_similarity is not None
         and second_similarity >= settings.similarity_threshold
         and best_similarity - second_similarity < settings.ambiguity_margin
-    ):
-        return AssignmentDecision(
-            AssignmentAction.NEEDS_REVIEW,
-            None,
-            best_similarity,
-            second_similarity,
-            "ambiguous_candidates",
-            best_candidate_cluster_id=best_id,
-            second_candidate_cluster_id=second_id,
-        )
+    )
     return AssignmentDecision(
         AssignmentAction.MATCH,
         best_id,
         best_similarity,
         second_similarity,
-        "similarity_match_with_indicator_support"
-        if best_overlap
-        else "similarity_match",
+        "multiple_compatible_candidates" if ambiguous else (
+            "similarity_match_with_indicator_support"
+            if best_indicator_overlap else "similarity_match"
+        ),
         best_candidate_cluster_id=best_id,
         second_candidate_cluster_id=second_id,
+        matching_cluster_ids=matching_ids,
     )

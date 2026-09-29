@@ -103,7 +103,7 @@ def _settings(config: dict[str, Any], args: argparse.Namespace) -> BenchmarkSett
         max_tags_per_article=(
             args.max_tags
             if args.max_tags is not None
-            else int(ml_config.get("max_tags_per_article", 5))
+            else int(ml_config.get("max_tags_per_article", 20))
         ),
         max_text_chars=(
             args.max_text_chars
