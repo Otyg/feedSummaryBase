@@ -47,7 +47,8 @@ def _ml_imports() -> dict[str, Any]:
         import numpy as np
         from sklearn.linear_model import LogisticRegression, SGDClassifier
         from sklearn.multiclass import OneVsRestClassifier
-        from sklearn.preprocessing import MultiLabelBinarizer, Normalizer
+        from sklearn.naive_bayes import ComplementNB, MultinomialNB
+        from sklearn.preprocessing import MinMaxScaler, MultiLabelBinarizer, Normalizer
     except ImportError as error:  # pragma: no cover - installation dependent
         raise RuntimeError("ML dependencies are missing; install feedsummary-core[ml]") from error
     return {
@@ -55,10 +56,21 @@ def _ml_imports() -> dict[str, Any]:
         "np": np,
         "LogisticRegression": LogisticRegression,
         "SGDClassifier": SGDClassifier,
+        "MultinomialNB": MultinomialNB,
+        "ComplementNB": ComplementNB,
         "OneVsRestClassifier": OneVsRestClassifier,
+        "MinMaxScaler": MinMaxScaler,
         "MultiLabelBinarizer": MultiLabelBinarizer,
         "Normalizer": Normalizer,
     }
+
+
+SUPPORTED_ALGORITHMS = {
+    "logistic_regression",
+    "sgd",
+    "multinomial_nb",
+    "complement_nb",
+}
 
 
 @dataclass(frozen=True)
@@ -95,9 +107,10 @@ class EmbeddingClassifierSettings:
             raise TypeError("tagging.ml.categories must be a list of category names")
         algorithm = str(raw.get("classifier") or raw.get("algorithm") or "").strip().lower()
         representation = str(raw.get("representation") or "embedding").strip().lower()
-        if algorithm and algorithm not in {"logistic_regression", "sgd"}:
+        if algorithm and algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError(
-                "tagging.ml.classifier must be 'logistic_regression' or 'sgd'"
+                "tagging.ml.classifier must be one of: "
+                + ", ".join(sorted(SUPPORTED_ALGORITHMS))
             )
         if representation not in {"embedding", "embeddings"}:
             raise ValueError(
@@ -135,7 +148,7 @@ class EmbeddingClassifierSettings:
             raise ValueError("tagging.ml.categories is required when ML tagging is enabled")
         if self.enabled and not self.algorithm:
             raise ValueError("tagging.ml.classifier is required when ML tagging is enabled")
-        if self.algorithm and self.algorithm not in {"logistic_regression", "sgd"}:
+        if self.algorithm and self.algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError("Unsupported tagging.ml.classifier")
         if not 0.0 <= self.threshold <= 1.0:
             raise ValueError("tagging.ml.threshold must be between 0 and 1")
@@ -363,7 +376,13 @@ class EmbeddingClassifierTagger:
         ml = _ml_imports()
         np = ml["np"]
         embeddings = np.asarray([row.embedding for row in rows], dtype=float)
-        feature_transformer = ml["Normalizer"](norm="l2")
+        if self.settings.algorithm in {"multinomial_nb", "complement_nb"}:
+            # Persisted embeddings can contain negative components, while both
+            # count-based NB estimators require non-negative features.  This is
+            # the same transform used by the production benchmark.
+            feature_transformer = ml["MinMaxScaler"](clip=True)
+        else:
+            feature_transformer = ml["Normalizer"](norm="l2")
         features = feature_transformer.fit_transform(embeddings)
         binarizer = ml["MultiLabelBinarizer"](classes=label_names)
         targets = binarizer.fit_transform([row.labels for row in rows])
@@ -375,7 +394,7 @@ class EmbeddingClassifierTagger:
                 tol=self.settings.tolerance,
                 random_state=self.settings.random_state,
             )
-        else:
+        elif self.settings.algorithm == "sgd":
             estimator = ml["SGDClassifier"](
                 loss="log_loss",
                 alpha=self.settings.alpha,
@@ -384,6 +403,10 @@ class EmbeddingClassifierTagger:
                 tol=self.settings.tolerance,
                 random_state=self.settings.random_state,
             )
+        elif self.settings.algorithm == "multinomial_nb":
+            estimator = ml["MultinomialNB"](alpha=self.settings.alpha)
+        else:
+            estimator = ml["ComplementNB"](alpha=self.settings.alpha)
         if targets.shape[1] == 1:
             classifier = estimator.fit(features, targets[:, 0])
             classifier_kind = "binary"

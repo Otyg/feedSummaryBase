@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from feedsummary_core.llm_client.ollama_cloud import LLMRateLimitError, LLMUnavailableError
 
@@ -109,6 +109,18 @@ class FallbackLLMClient:
                 return idx
         return None
 
+    @staticmethod
+    def _provider_allows_new_tags(client: LLMClient) -> bool:
+        return bool(getattr(client, "tagging_allow_new_tags", True))
+
+    @property
+    def tagging_allow_new_tags(self) -> bool:
+        """Tag creation policy for the provider expected to handle the next call."""
+        provider_idx = self._next_provider_idx(self._active_idx)
+        if provider_idx is None:
+            return False
+        return self._provider_allows_new_tags(self.clients[provider_idx])
+
     def _try_advance_provider_permanently(self, current_idx: int, reason: str) -> Optional[int]:
         self._blocked_indices.add(current_idx)
         next_idx = self._next_provider_idx(current_idx + 1)
@@ -130,14 +142,14 @@ class FallbackLLMClient:
         )
         return next_idx
 
-    async def chat(
+    async def _chat_with_provider(
         self,
-        messages: List[Dict[str, str]],
+        messages_for_provider: Callable[[int], List[Dict[str, str]]],
         *,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
         response_format: str | Dict[str, Any] | None = None,
-    ) -> str:
+    ) -> Tuple[str, int]:
         provider_idx = self._next_provider_idx(self._active_idx)
         if provider_idx is None:
             raise RuntimeError(
@@ -146,18 +158,21 @@ class FallbackLLMClient:
 
         while True:
             active = self.clients[provider_idx]
+            messages = messages_for_provider(provider_idx)
 
             attempt = 0
             while True:
                 try:
                     if max_output_tokens is None and response_format is None:
-                        return await active.chat(messages, temperature=temperature)
-                    return await active.chat(
-                        messages,
-                        temperature=temperature,
-                        max_output_tokens=max_output_tokens,
-                        response_format=response_format,
-                    )
+                        response = await active.chat(messages, temperature=temperature)
+                    else:
+                        response = await active.chat(
+                            messages,
+                            temperature=temperature,
+                            max_output_tokens=max_output_tokens,
+                            response_format=response_format,
+                        )
+                    return response, provider_idx
                 except LLMUnavailableError as e:
                     attempt += 1
                     wait_s = int(self.policy.default_wait_s)
@@ -211,6 +226,40 @@ class FallbackLLMClient:
                     )
                     await asyncio.sleep(wait_s)
 
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
+    ) -> str:
+        response, _provider_idx = await self._chat_with_provider(
+            lambda _idx: messages,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            response_format=response_format,
+        )
+        return response
+
+    async def chat_for_tagging(
+        self,
+        allow_new_messages: List[Dict[str, str]],
+        existing_only_messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+    ) -> Tuple[str, bool]:
+        """Use the tagging prompt matching the provider that actually answers."""
+        response, provider_idx = await self._chat_with_provider(
+            lambda idx: (
+                allow_new_messages
+                if self._provider_allows_new_tags(self.clients[idx])
+                else existing_only_messages
+            ),
+            temperature=temperature,
+        )
+        return response, self._provider_allows_new_tags(self.clients[provider_idx])
+
     async def embed(
         self,
         text: str,
@@ -230,9 +279,7 @@ class FallbackLLMClient:
         if not text or not isinstance(text, str):
             return []
         if self.embedding_client is None:
-            raise RuntimeError(
-                "Embeddings kräver en ollama_local-konfiguration i LLM-kedjan."
-            )
+            raise RuntimeError("Embeddings kräver en ollama_local-konfiguration i LLM-kedjan.")
 
         try:
             return await self.embedding_client.embed(
@@ -244,25 +291,23 @@ class FallbackLLMClient:
             if "unexpected keyword argument" not in str(exc):
                 raise
             formatted = (
-                f"Instruct: {instruction.strip()}\nQuery:{text}"
-                if instruction.strip()
-                else text
+                f"Instruct: {instruction.strip()}\nQuery:{text}" if instruction.strip() else text
             )
             return await self.embedding_client.embed(formatted)
 
     async def aclose(self) -> None:
         """
         Close all underlying LLM client sessions.
-        
+
         Call this when the FallbackLLMClient is no longer needed.
         """
         for client in self.clients:
-            if hasattr(client, 'aclose'):
+            if hasattr(client, "aclose"):
                 try:
                     await client.aclose()
                 except Exception as e:
                     log.warning(f"Error closing client: {e}")
-            elif hasattr(client, 'close'):
+            elif hasattr(client, "close"):
                 try:
                     await client.close()
                 except Exception as e:

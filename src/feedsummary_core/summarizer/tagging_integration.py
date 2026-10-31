@@ -78,6 +78,24 @@ def _log_ml_event(level: int, event: str, **fields: Any) -> None:
     )
 
 
+def _merge_ml_and_llm_tags(
+    ml_tags: List[Dict[str, Any]],
+    llm_tags: List[Dict[str, Any]],
+    *,
+    allow_new_tags: bool,
+) -> List[Dict[str, Any]]:
+    """Merge additive results, or trust only the LLM-reviewed strict result."""
+    candidate_groups = [ml_tags, llm_tags] if allow_new_tags else [llm_tags]
+    tags: List[Dict[str, Any]] = []
+    seen_tag_ids = set()
+    for tag in (tag for group in candidate_groups for tag in group):
+        tag_id = tag.get("id")
+        if tag_id and tag_id not in seen_tag_ids:
+            seen_tag_ids.add(tag_id)
+            tags.append(tag)
+    return tags
+
+
 async def tag_articles(
     store: NewsStore,
     llm_client: LLMClient,
@@ -124,9 +142,7 @@ async def tag_articles(
             )
         )
         similarity_instruction = str(
-            batching_cfg.get(
-                "embedding_instruction", SIMILARITY_EMBEDDING_INSTRUCTION
-            )
+            batching_cfg.get("embedding_instruction", SIMILARITY_EMBEDDING_INSTRUCTION)
         ).strip()
         tagging_instruction = str(
             ml_cfg.get("embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION)
@@ -220,9 +236,7 @@ async def tag_articles(
                         ),
                         purpose=TAGGING_EMBEDDING_PURPOSE,
                         instruction=str(
-                            ml_cfg.get(
-                                "embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION
-                            )
+                            ml_cfg.get("embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION)
                         ).strip(),
                         dimensions=get_client_embedding_dimensions(llm_client),
                     )
@@ -268,21 +282,15 @@ async def tag_articles(
                     "ml_tagging.skipped",
                     article_id=article_id,
                     reason=ml_tagger.embedding_incompatibility_reason(article),
-                    expected_embedding_model=ml_tagger.model_metadata.get(
-                        "embedding_model"
-                    ),
-                    actual_embedding_model=str(
-                        article.get("tagging_embedding_model") or ""
-                    ),
-                    expected_dimension=ml_tagger.model_metadata.get(
-                        "embedding_dimension"
-                    ),
+                    expected_embedding_model=ml_tagger.model_metadata.get("embedding_model"),
+                    actual_embedding_model=str(article.get("tagging_embedding_model") or ""),
+                    expected_dimension=ml_tagger.model_metadata.get("embedding_dimension"),
                     actual_dimension=len(vector) if isinstance(vector, list) else None,
                 )
 
-            # Let the LLM supplement ML predictions with existing tags in every
-            # category. Creation restrictions remain independently controlled by
-            # tagging.llm_new_tag_excluded_categories.
+            # A provider with allow_new_tags=false reviews the untrusted ML
+            # suggestions and returns the complete approved set from existing
+            # database tags. Other providers retain the additive ML + LLM flow.
             llm_budget = max(
                 0,
                 max_tags_per_article
@@ -293,14 +301,14 @@ async def tag_articles(
                 article=article,
                 config=config,
                 max_tags=llm_budget,
+                review_tags=ml_tags,
+                review_max_tags=max_tags_per_article,
             )
-            tags = []
-            seen_tag_ids = set()
-            for tag in ml_tags + llm_tags:
-                tag_id = tag.get("id")
-                if tag_id and tag_id not in seen_tag_ids:
-                    seen_tag_ids.add(tag_id)
-                    tags.append(tag)
+            tags = _merge_ml_and_llm_tags(
+                ml_tags,
+                llm_tags,
+                allow_new_tags=tag_manager.last_generation_allowed_new_tags,
+            )
 
             if tags:
                 # Store tags with reasoning
@@ -312,7 +320,7 @@ async def tag_articles(
                         if t.get("reasoning"):
                             entry["reasoning"] = t["reasoning"]
                         tag_entries.append(entry)
-                
+
                 store.add_article_tags(article_id, tag_entries)
 
                 # Update article with tags
@@ -336,11 +344,7 @@ async def tag_articles(
     consistency_cfg = tagging_cfg.get("similarity_consistency", {}) or {}
     batching_cfg = config.get("batching", {}) or {}
     consistency_enabled = bool(consistency_cfg.get("enabled", True))
-    if (
-        consistency_enabled
-        and enable_embedding_matching
-        and has_local_embedding_provider(config)
-    ):
+    if consistency_enabled and enable_embedding_matching and has_local_embedding_provider(config):
         try:
             articles = [store.get_article(article_id) for article_id in article_ids]
             additions = await tag_manager.ensure_similar_articles_share_tags(
@@ -535,9 +539,7 @@ async def tag_articles_safe(
             1, int(tagging_cfg.get("article_max_tags", DEFAULT_ARTICLE_MAX_TAGS))
         )
 
-    logger.info(
-        f"[Job {job_id}] Starting automatic tagging of {len(article_ids)} articles..."
-    )
+    logger.info(f"[Job {job_id}] Starting automatic tagging of {len(article_ids)} articles...")
 
     try:
         result = await tag_articles(

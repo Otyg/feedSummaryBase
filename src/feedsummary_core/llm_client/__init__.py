@@ -73,8 +73,7 @@ def has_local_embedding_provider(config: Dict[str, Any]) -> bool:
     llm_configs.extend(configured if isinstance(configured, list) else [configured])
     llm_configs.append(config.get("llm_fallback"))
     return any(
-        isinstance(item, dict)
-        and str(item.get("provider") or "").strip().lower() == "ollama_local"
+        isinstance(item, dict) and str(item.get("provider") or "").strip().lower() == "ollama_local"
         for item in llm_configs
     )
 
@@ -142,10 +141,23 @@ def _create_single_llm(llm_cfg: Dict[str, Any]):
             sock_read_timeout_s=int(llm_cfg.get("sock_read_timeout_s", 300)),
             progress_log_every_s=float(llm_cfg.get("progress_log_every_s", 2.0)),
             max_retries=int(llm_cfg.get("max_retries", 3)),
+            default_max_output_tokens=(
+                max(1, int(llm_cfg["max_output_tokens"]))
+                if llm_cfg.get("max_output_tokens") is not None
+                else None
+            ),
         )
         return OllamaLocalClient(cfg)
 
     raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+def _tagging_allow_new_tags(llm_cfg: Dict[str, Any]) -> bool:
+    """Read the provider-level tag creation policy with strict type checking."""
+    value = llm_cfg.get("allow_new_tags", True)
+    if not isinstance(value, bool):
+        raise ValueError("LLM-inställningen 'allow_new_tags' måste vara true eller false.")
+    return value
 
 
 def get_primary_llm_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -205,7 +217,14 @@ def create_llm_client(config: Dict[str, Any]):
     if not chain_cfgs:
         raise ValueError("Saknar LLM-konfiguration: config['llm'] är tom.")
 
-    clients = [_create_single_llm(c) for c in chain_cfgs]
+    clients = []
+    for llm_cfg in chain_cfgs:
+        client = _create_single_llm(llm_cfg)
+        # Keep the policy on the concrete provider. FallbackLLMClient can then
+        # choose the correct tagging prompt for the provider that handles the
+        # request, including a provider reached only after failover.
+        client.tagging_allow_new_tags = _tagging_allow_new_tags(llm_cfg)
+        clients.append(client)
     embedding_client = next(
         (
             client

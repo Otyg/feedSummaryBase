@@ -179,6 +179,7 @@ store:
 llm:
   provider: "ollama_local"  # or "ollama_cloud", "fallback"
   model: "mistral:latest"
+  allow_new_tags: true
   temperature: 0.3
   base_url: "http://localhost:11434"
 
@@ -198,6 +199,13 @@ tagging:
     similarity_threshold: 0.78
     max_shared_tags: 1
 ```
+
+`allow_new_tags` is a provider-level article-tagging policy and defaults to
+`true`. Set it to `false` to make that provider select exact tag names already
+stored in the database. In this mode ML predictions are presented as untrusted
+suggestions: the LLM must approve them before they are assigned, and an omitted
+ML suggestion is rejected. Fallback chains select the matching prompt for the
+provider that actually handles the request.
 
 ### Embedding-based ML tagging
 

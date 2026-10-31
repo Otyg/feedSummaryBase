@@ -73,6 +73,7 @@ class OllamaConfig:
 
     # Retry
     max_retries: int = 3
+    default_max_output_tokens: Optional[int] = None
 
 
 class OllamaLocalClient:
@@ -166,9 +167,14 @@ class OllamaLocalClient:
         await self._rate_gate()
         session = await self._get_session()
 
+        effective_max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else self.cfg.default_max_output_tokens
+        )
         options = {"temperature": temperature}
-        if max_output_tokens is not None:
-            options["num_predict"] = int(max_output_tokens)
+        if effective_max_output_tokens is not None:
+            options["num_predict"] = int(effective_max_output_tokens)
 
         payload = {
             "model": self.cfg.model,
@@ -184,6 +190,8 @@ class OllamaLocalClient:
 
         chunks: List[str] = []
         total_chars = 0
+        prompt_tokens = None
+        output_tokens = None
 
         # Här kan vi sätta en *extra* “first byte timeout” på requesten,
         # men vi håller oss till session timeout + max(...) för enkelhet.
@@ -227,10 +235,23 @@ class OllamaLocalClient:
                         last_log = now
 
                     if data.get("done") is True:
+                        prompt_tokens = data.get("prompt_eval_count")
+                        output_tokens = data.get("eval_count")
                         break
 
         text = "".join(chunks).strip()
-        self.log.info("LLM request done (chars=%d)", len(text))
+        total_tokens = None
+        if isinstance(prompt_tokens, int) and isinstance(output_tokens, int):
+            total_tokens = prompt_tokens + output_tokens
+        self.log.info(
+            "LLM request done (model=%s prompt_tokens=%s output_tokens=%s "
+            "total_tokens=%s chars=%d)",
+            self.cfg.model,
+            prompt_tokens,
+            output_tokens,
+            total_tokens,
+            len(text),
+        )
         return text
 
     async def embed(

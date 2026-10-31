@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import uuid
 from dataclasses import dataclass, replace
@@ -42,6 +43,7 @@ from feedsummary_core.long_term.lease import LeaseGuard
 from feedsummary_core.long_term.models import ThreatCluster
 from feedsummary_core.long_term.snapshot_validation import (
     SnapshotValidationError,
+    extract_json_object_text,
     parse_snapshot_json,
     validate_cluster_snapshot,
 )
@@ -229,10 +231,47 @@ def _snapshot_id(cluster_id: str, revision: int, prompt_version: str) -> str:
     return f"threat_snapshot_{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
 
 
-def _normalize_snapshot_candidate(payload: dict[str, Any]) -> dict[str, Any]:
+def _snap_article_id(value: Any, allowed: list[str]) -> Any:
+    """Map an LLM-corrupted ID (a single dropped/changed character) to its unique allowed ID."""
+
+    if not isinstance(value, str) or value in allowed or len(value) < 32:
+        return value
+    matches = [
+        candidate
+        for candidate in allowed
+        if abs(len(candidate) - len(value)) <= 1
+        and difflib.SequenceMatcher(None, candidate, value).ratio() >= 0.97
+    ]
+    return matches[0] if len(matches) == 1 else value
+
+
+def _snap_evidence_ids(node: Any, allowed: list[str]) -> Any:
+    if isinstance(node, dict):
+        result = {}
+        for key, value in node.items():
+            if key == "evidence_article_ids" and isinstance(value, list):
+                snapped: list[Any] = []
+                for item in value:
+                    item = _snap_article_id(item, allowed)
+                    if item not in snapped:
+                        snapped.append(item)
+                result[key] = snapped
+            else:
+                result[key] = _snap_evidence_ids(value, allowed)
+        return result
+    if isinstance(node, list):
+        return [_snap_evidence_ids(item, allowed) for item in node]
+    return node
+
+
+def _normalize_snapshot_candidate(
+    payload: dict[str, Any], allowed_ids: list[str] | None = None
+) -> dict[str, Any]:
     """Normalize uncertainty markers without manufacturing or losing evidence."""
 
     normalized = dict(payload)
+    if allowed_ids:
+        normalized = _snap_evidence_ids(normalized, allowed_ids)
     uncertainties = normalized.get("uncertainties")
     if isinstance(uncertainties, list):
         normalized_uncertainties: list[Any] = []
@@ -368,7 +407,7 @@ async def update_cluster_map_snapshot(
     repair_attempted = False
     try:
         payload = validate_cluster_snapshot(
-            _normalize_snapshot_candidate(parse_snapshot_json(raw)),
+            _normalize_snapshot_candidate(parse_snapshot_json(raw), allowed_ids),
             profile_id=cluster.profile_id,
             cluster_id=cluster.id,
             membership_revision=target_revision,
@@ -399,15 +438,17 @@ async def update_cluster_map_snapshot(
                 ),
             },
         ]
-        repaired = await llm.chat(
-            repair_messages,
-            temperature=0.0,
-            max_output_tokens=settings.max_output_tokens,
-            response_format=prompt_package["output_schema"],
+        repaired = extract_json_object_text(
+            await llm.chat(
+                repair_messages,
+                temperature=0.0,
+                max_output_tokens=settings.max_output_tokens,
+                response_format=prompt_package["output_schema"],
+            )
         )
         try:
             payload = validate_cluster_snapshot(
-                _normalize_snapshot_candidate(parse_snapshot_json(repaired)),
+                _normalize_snapshot_candidate(parse_snapshot_json(repaired), allowed_ids),
                 profile_id=cluster.profile_id,
                 cluster_id=cluster.id,
                 membership_revision=target_revision,

@@ -62,6 +62,16 @@ class SnapshotValidationError(ValueError):
     """A cluster snapshot is malformed or cites evidence outside its input."""
 
 
+def extract_json_object_text(raw: str) -> str:
+    """Unwrap Markdown fences or surrounding prose from a repair reply, if any."""
+
+    text = str(raw or "").strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    start, end = text.find("{"), text.rfind("}")
+    return text[start : end + 1] if 0 <= start < end else text
+
+
 def parse_snapshot_json(raw: str) -> dict[str, Any]:
     """Parse a bare JSON object; wrappers and Markdown fences are rejected."""
 

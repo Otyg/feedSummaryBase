@@ -40,6 +40,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from feedsummary_core.long_term.snapshot_validation import extract_json_object_text
 from feedsummary_core.long_term.lease import LeaseGuard
 from feedsummary_core.long_term.reporting import (
     ReportValidationError,
@@ -430,6 +431,32 @@ def validate_landscape_segment(
     if not isinstance(payload, dict):
         raise ReportValidationError("segment must be an object")
     _exact_fields(payload, _SEGMENT_FIELDS, "segment")
+    # Identity echoes are known to the caller; models often garble long IDs.
+    payload = {
+        **payload,
+        "schema_version": 1,
+        "profile_id": profile_id,
+        "segment_id": segment_id,
+    }
+    if isinstance(payload.get("snapshots"), list):
+        known_clusters = {
+            str(snapshot.get("id") or ""): str(snapshot.get("cluster_id") or "")
+            for snapshot in snapshots
+        }
+        payload["snapshots"] = [
+            {
+                **row,
+                "profile_id": profile_id,
+                **(
+                    {"cluster_id": known_clusters[row["id"]]}
+                    if row.get("id") in known_clusters
+                    else {}
+                ),
+            }
+            if isinstance(row, dict)
+            else row
+            for row in payload["snapshots"]
+        ]
     if (
         payload.get("schema_version") != 1
         or payload.get("profile_id") != profile_id
@@ -497,11 +524,18 @@ def _segment_groups(
             snapshots=candidate,
         )
         estimate = estimate_tokens(messages_to_text(messages))
+        # The segment reply restates every snapshot, so it must also fit the output cap.
+        output_estimate = estimate_tokens(
+            json.dumps(
+                [row.get("payload") or {} for row in candidate], ensure_ascii=False
+            )
+        )
         if (
             current
             and (
                 len(candidate) > settings.max_snapshots_per_segment
                 or estimate > settings.input_budget
+                or output_estimate > settings.max_output_tokens * 0.6
             )
         ):
             groups.append(current)
@@ -619,11 +653,13 @@ async def _repair_json(
             ),
         },
     ]
-    return await llm.chat(
-        messages,
-        temperature=0.0,
-        max_output_tokens=max_output_tokens,
-        response_format=output_schema,
+    return extract_json_object_text(
+        await llm.chat(
+            messages,
+            temperature=0.0,
+            max_output_tokens=max_output_tokens,
+            response_format=output_schema,
+        )
     )
 
 

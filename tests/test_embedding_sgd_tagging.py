@@ -111,6 +111,24 @@ class EmbeddingClassifierSettingsTests(unittest.TestCase):
         self.assertEqual("sgd", settings.algorithm)
         self.assertEqual(("SECTOR",), settings.categories)
 
+    def test_reads_naive_bayes_classifier(self):
+        settings = EmbeddingClassifierSettings.from_config(
+            {
+                "tagging": {
+                    "ml": {
+                        "enabled": True,
+                        "classifier": "multinomial_nb",
+                        "categories": ["location", "organization"],
+                        "alpha": 0.5,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual("multinomial_nb", settings.algorithm)
+        self.assertEqual(("LOCATION", "ORGANIZATION"), settings.categories)
+        self.assertEqual(0.5, settings.alpha)
+
 
 @unittest.skipIf(sklearn is None, "scikit-learn ML dependencies are not installed")
 class EmbeddingClassifierTaggerTests(unittest.TestCase):
@@ -172,6 +190,41 @@ class EmbeddingClassifierTaggerTests(unittest.TestCase):
 
             self.assertEqual(["THREAT"], store.requested_categories)
             self.assertEqual("THREAT", predictions[0]["category"])
+
+    def test_multinomial_nb_scales_embeddings_and_predicts(self):
+        with TemporaryDirectory() as directory:
+            store = FakeTrainingStore()
+            for index, row in enumerate(store.rows):
+                row["article"]["tagging_embedding_vector"] = (
+                    [-2.0, 1.0] if index % 2 == 0 else [1.0, -2.0]
+                )
+            settings = EmbeddingClassifierSettings(
+                **{
+                    **self._settings(directory).__dict__,
+                    "algorithm": "multinomial_nb",
+                    "alpha": 0.5,
+                }
+            )
+            tagger = EmbeddingClassifierTagger(settings)
+
+            self.assertTrue(tagger.refresh_from_store(store))
+            predictions = tagger.predict_tags(
+                {
+                    "tagging_embedding_vector": [-2.0, 1.0],
+                    "tagging_embedding_model": "test-embedding",
+                },
+                store,
+            )
+
+            self.assertEqual(
+                "MinMaxScaler",
+                type(tagger._artifact["feature_transformer"]).__name__,
+            )
+            self.assertEqual(
+                "MultinomialNB",
+                type(tagger._artifact["classifier"].estimators_[0]).__name__,
+            )
+            self.assertEqual("acme", predictions[0]["name"])
 
     def test_changed_article_tags_change_fingerprint_and_retrain(self):
         with TemporaryDirectory() as directory:

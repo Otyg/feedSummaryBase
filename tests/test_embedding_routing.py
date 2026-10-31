@@ -122,6 +122,31 @@ class EmbeddingRoutingTests(unittest.TestCase):
             created_clients[1].embed_calls,
         )
 
+    def test_factory_keeps_provider_specific_new_tag_policy(self):
+        with patch(
+            "feedsummary_core.llm_client._create_single_llm",
+            side_effect=lambda config: FakeClient(config["provider"]),
+        ):
+            client = create_llm_client(
+                {
+                    "llm": [
+                        {"provider": "ollama_cloud", "allow_new_tags": True},
+                        {"provider": "ollama_local", "allow_new_tags": False},
+                    ]
+                }
+            )
+
+        self.assertTrue(client.clients[0].tagging_allow_new_tags)
+        self.assertFalse(client.clients[1].tagging_allow_new_tags)
+
+    def test_factory_rejects_non_boolean_new_tag_policy(self):
+        with patch(
+            "feedsummary_core.llm_client._create_single_llm",
+            return_value=FakeClient("cloud"),
+        ):
+            with self.assertRaisesRegex(ValueError, "allow_new_tags"):
+                create_llm_client({"llm": {"provider": "ollama_cloud", "allow_new_tags": "false"}})
+
     def test_factory_passes_local_embedding_configuration(self):
         config = {
             "llm": [

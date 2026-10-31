@@ -49,6 +49,29 @@ class LegacyClient:
 
 
 class LLMOutputLimitTests(unittest.TestCase):
+    def test_tagging_fallback_uses_policy_of_provider_that_answers(self):
+        primary = RecordingClient(error=LLMUnavailableError("unavailable"))
+        primary.tagging_allow_new_tags = True
+        fallback = RecordingClient(response="strict-response")
+        fallback.tagging_allow_new_tags = False
+        client = FallbackLLMClient(
+            [primary, fallback],
+            policy=FallbackPolicy(max_quota_retries=0, default_wait_s=0),
+        )
+
+        response, allowed = asyncio.run(
+            client.chat_for_tagging(
+                [{"role": "user", "content": "allow-new"}],
+                [{"role": "user", "content": "existing-only"}],
+                temperature=0.3,
+            )
+        )
+
+        self.assertEqual("strict-response", response)
+        self.assertFalse(allowed)
+        self.assertEqual("allow-new", primary.calls[0]["messages"][0]["content"])
+        self.assertEqual("existing-only", fallback.calls[0]["messages"][0]["content"])
+
     def test_fallback_forwards_same_limit_to_next_provider(self):
         primary = RecordingClient(error=LLMUnavailableError("unavailable"))
         fallback = RecordingClient(response="fallback")
@@ -128,6 +151,43 @@ class LLMOutputLimitTests(unittest.TestCase):
         self.assertEqual({"type": "object"}, session.requests[0][1]["format"])
         self.assertNotIn("num_predict", session.requests[1][1]["options"])
 
+    def test_local_ollama_uses_configured_default_limit(self):
+        class Content:
+            def __init__(self):
+                self._lines = [json.dumps({"message": {"content": "ok"}, "done": True}).encode()]
+
+            async def readline(self):
+                return self._lines.pop(0) if self._lines else b""
+
+        class Response:
+            status = 200
+            content = Content()
+
+        class RequestContext:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class Session:
+            def __init__(self):
+                self.payload = None
+
+            def post(self, _url, *, json):
+                self.payload = json
+                return RequestContext()
+
+        session = Session()
+        client = OllamaLocalClient(
+            OllamaConfig(max_rps=0, default_max_output_tokens=321)
+        )
+        client._get_session = AsyncMock(return_value=session)
+
+        asyncio.run(client.chat([{"role": "user", "content": "default"}]))
+
+        self.assertEqual(321, session.payload["options"]["num_predict"])
+
     def test_cloud_ollama_maps_limit_to_num_predict(self):
         client = OllamaCloudClient(
             {
@@ -154,8 +214,26 @@ class LLMOutputLimitTests(unittest.TestCase):
             654,
             client._client.chat.await_args.kwargs["options"]["num_predict"],
         )
+        self.assertEqual({"type": "object"}, client._client.chat.await_args.kwargs["format"])
+
+    def test_cloud_ollama_uses_configured_default_limit(self):
+        client = OllamaCloudClient(
+            {
+                "api_key": "test-key",
+                "max_output_tokens": 432,
+                "quota": {"preflight": False, "min_interval_seconds": 0},
+            }
+        )
+        client._client = AsyncMock()
+        client._client.chat.return_value = {"message": {"content": "ok"}}
+        client._throttle = AsyncMock()
+        client._preflight_quota_check = AsyncMock()
+
+        asyncio.run(client.chat([{"role": "user", "content": "default"}]))
+
         self.assertEqual(
-            {"type": "object"}, client._client.chat.await_args.kwargs["format"]
+            432,
+            client._client.chat.await_args.kwargs["options"]["num_predict"],
         )
 
 

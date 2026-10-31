@@ -93,6 +93,7 @@ class OllamaCloudConfig:
     min_interval_seconds: float = 1.0
     timeout_seconds: float = 180.0
     max_concurrency: int = 1
+    default_max_output_tokens: Optional[int] = None
 
 
 def _resolve_env(value: str) -> str:
@@ -151,6 +152,11 @@ class OllamaCloudClient:
             min_interval_seconds=float(quota_cfg.get("min_interval_seconds", 1.0)),
             timeout_seconds=float(llm_cfg.get("timeout_seconds", 360.0)),
             max_concurrency=max(1, int(quota_cfg.get("max_concurrency", 1))),
+            default_max_output_tokens=(
+                max(1, int(llm_cfg["max_output_tokens"]))
+                if llm_cfg.get("max_output_tokens") is not None
+                else None
+            ),
         )
 
         if not self.cfg.api_key:
@@ -243,9 +249,14 @@ class OllamaCloudClient:
             await self._preflight_quota_check()
 
             self.log.info("LLM request start (model=%s)", self.cfg.model)
+            effective_max_output_tokens = (
+                max_output_tokens
+                if max_output_tokens is not None
+                else self.cfg.default_max_output_tokens
+            )
             payload_options = {"temperature": temperature}
-            if max_output_tokens is not None:
-                payload_options["num_predict"] = int(max_output_tokens)
+            if effective_max_output_tokens is not None:
+                payload_options["num_predict"] = int(effective_max_output_tokens)
 
             try:
                 request_options: Dict[str, Any] = {
@@ -258,8 +269,26 @@ class OllamaCloudClient:
                     request_options["format"] = response_format
                 resp = await self._client.chat(**request_options)
                 if isinstance(resp, dict):
-                    return (resp.get("message") or {}).get("content", "") or ""
-                return getattr(resp.message, "content", "") or ""
+                    content = (resp.get("message") or {}).get("content", "") or ""
+                    prompt_tokens = resp.get("prompt_eval_count")
+                    output_tokens = resp.get("eval_count")
+                else:
+                    content = getattr(resp.message, "content", "") or ""
+                    prompt_tokens = getattr(resp, "prompt_eval_count", None)
+                    output_tokens = getattr(resp, "eval_count", None)
+                total_tokens = None
+                if isinstance(prompt_tokens, int) and isinstance(output_tokens, int):
+                    total_tokens = prompt_tokens + output_tokens
+                self.log.info(
+                    "LLM request done (model=%s prompt_tokens=%s output_tokens=%s "
+                    "total_tokens=%s chars=%d)",
+                    self.cfg.model,
+                    prompt_tokens,
+                    output_tokens,
+                    total_tokens,
+                    len(content),
+                )
+                return content
 
             except Exception as e:
                 try:
