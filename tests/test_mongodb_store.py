@@ -183,7 +183,7 @@ class MongoDBStoreTests(unittest.TestCase):
             )
         )
         article = self.store.get_article("article-1")
-        self.assertNotIn("embedding_vector", article)
+        self.assertEqual([9.0, 9.0], article["embedding_vector"])
         self.assertEqual("embedding-model", article["similarity_embedding_model"])
         self.assertEqual([1.0, 0.0], article["similarity_embedding_vector"])
         self.assertEqual(
@@ -207,6 +207,22 @@ class MongoDBStoreTests(unittest.TestCase):
         tag = self.store.get_tag_by_name("security")
         self.assertEqual("embedding-model", tag["embedding_model"])
         self.assertEqual(embedding_source_hash("security"), tag["embedding_source_hash"])
+
+    def test_legacy_article_embedding_path_remains_supported(self):
+        self.store.upsert_article({"id": "legacy-article"})
+
+        self.assertTrue(
+            self.store.update_article_embedding(
+                "legacy-article",
+                [0.5, 0.5],
+                model="legacy-model",
+                source_hash=embedding_source_hash("Legacy content"),
+            )
+        )
+
+        article = self.store.get_article("legacy-article")
+        self.assertEqual([0.5, 0.5], article["embedding_vector"])
+        self.assertEqual("legacy-model", article["embedding_model"])
 
     def test_cleanup_honors_each_retention_window(self):
         now = int(time.time())

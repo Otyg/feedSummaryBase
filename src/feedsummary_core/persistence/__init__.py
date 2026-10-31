@@ -63,7 +63,7 @@ class NewsStore(Protocol):
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
-        purpose: str = "similarity",
+        purpose: Optional[str] = None,
         instruction: Optional[str] = None,
     ) -> bool: ...
 

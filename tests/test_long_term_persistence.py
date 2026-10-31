@@ -952,6 +952,24 @@ class TinyDBLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
                 expected_membership_revision=1,
             )
         )
+        self.assertIsNone(
+            self.store.get_cluster_membership("profile", "article-recovery")
+        )
+        database = TinyDB(self.store.path)
+        self.assertEqual(1, len(database.table("long_term_assignment_journal").all()))
+        database.table("threat_clusters").update(
+            {"last_assignment_operation_id": "profile:article-recovery"},
+            Query().id == "cluster-recovery",
+        )
+        database.close()
+
+        self.assertFalse(
+            self.store.save_cluster_assignment(
+                target,
+                membership,
+                expected_membership_revision=1,
+            )
+        )
         self.assertEqual(
             "cluster-recovery",
             self.store.get_cluster_membership("profile", "article-recovery")[
@@ -961,6 +979,24 @@ class TinyDBLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
         database = TinyDB(self.store.path)
         self.assertEqual([], database.table("long_term_assignment_journal").all())
         database.close()
+
+    def test_pending_snapshot_is_hidden_until_revision_commits(self):
+        database = TinyDB(self.store.path)
+        database.table("threat_cluster_snapshots").insert(
+            {
+                "id": "snapshot-pending",
+                "profile_id": "profile",
+                "cluster_id": "cluster-pending",
+                "membership_revision": 1,
+                "prompt_version": "cluster-update-v1",
+                "created_at": 1200,
+                "pending_operation_id": "cluster-pending:1:cluster-update-v1",
+            }
+        )
+        database.close()
+
+        self.assertEqual([], self.store.list_cluster_snapshots("profile"))
+        self.assertIsNone(self.store.get_cluster_snapshot("snapshot-pending"))
 
     def test_partial_reconciliation_journal_is_replayed(self):
         operation = self.reconciliation_fixture("tiny-recovery")
@@ -1026,6 +1062,95 @@ class MongoDBLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
             "profile", "article-secondary-mongo-recovery"
         )
         self.assertEqual(operation["primary_cluster_id"], moved["cluster_id"])
+
+    def test_pending_assignment_journal_requires_matching_replay_marker(self):
+        initial = self.cluster_doc()
+        initial["id"] = "cluster-recovery"
+        self.assertTrue(self.store.save_threat_cluster(initial))
+        target = {
+            **initial,
+            "membership_revision": 2,
+            "member_count": 2,
+        }
+        membership = {
+            "profile_id": "profile",
+            "article_id": "article-recovery",
+            "cluster_id": "cluster-recovery",
+            "assigned_at": 1100,
+        }
+        self.assertTrue(
+            self.store.save_threat_cluster(
+                target,
+                expected_membership_revision=1,
+            )
+        )
+
+        self.store.db.long_term_assignment_journal.insert_one(
+            {
+                "_id": "profile:article-recovery",
+                "id": "profile:article-recovery",
+                "cluster": target,
+                "membership": membership,
+                "expected_membership_revision": 1,
+                "created_at": 1100,
+            }
+        )
+
+        self.assertFalse(
+            self.store.save_cluster_assignment(
+                target,
+                membership,
+                expected_membership_revision=1,
+            )
+        )
+        self.assertIsNone(
+            self.store.get_cluster_membership("profile", "article-recovery")
+        )
+        self.assertIsNotNone(
+            self.store.db.long_term_assignment_journal.find_one(
+                {"_id": "profile:article-recovery"}
+            )
+        )
+
+        self.store.db.threat_clusters.update_one(
+            {"_id": "cluster-recovery"},
+            {"$set": {"last_assignment_operation_id": "profile:article-recovery"}},
+        )
+        self.assertFalse(
+            self.store.save_cluster_assignment(
+                target,
+                membership,
+                expected_membership_revision=1,
+            )
+        )
+        self.assertEqual(
+            "cluster-recovery",
+            self.store.get_cluster_membership("profile", "article-recovery")[
+                "cluster_id"
+            ],
+        )
+        self.assertIsNone(
+            self.store.db.long_term_assignment_journal.find_one(
+                {"_id": "profile:article-recovery"}
+            )
+        )
+
+    def test_pending_snapshot_is_hidden_until_revision_commits(self):
+        self.store.db.threat_cluster_snapshots.insert_one(
+            {
+                "_id": "snapshot-pending",
+                "id": "snapshot-pending",
+                "profile_id": "profile",
+                "cluster_id": "cluster-pending",
+                "membership_revision": 1,
+                "prompt_version": "cluster-update-v1",
+                "created_at": 1200,
+                "pending_operation_id": "cluster-pending:1:cluster-update-v1",
+            }
+        )
+
+        self.assertEqual([], self.store.list_cluster_snapshots("profile"))
+        self.assertIsNone(self.store.get_cluster_snapshot("snapshot-pending"))
 
 
 if __name__ == "__main__":
