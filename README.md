@@ -73,6 +73,28 @@ tags = store.get_all_tags()
 - Atomic integer IDs for compatibility with the existing store interface
 - Complete feature parity with TinyDB and SQLite
 
+**CouchDBStore** - CouchDB document backend (no extra dependencies)
+- Same behaviour as MongoDBStore; one CouchDB database per collection, named
+  `<database>_<collection>` (for example `feedsummary_articles`)
+- Single-document atomic updates use `_rev` compare-and-swap; unique indexes are
+  emulated with claim documents. CouchDB has no multi-document transactions, so
+  multi-document operations rely on the same write journals as MongoDB
+- Top-level fields starting with `_` are stored with a `mongo` prefix
+  (`_mongo_sort_ts` becomes `mongo_mongo_sort_ts`)
+
+```python
+store = create_store({
+    "provider": "couchdb",
+    "url": "http://192.168.1.73:5984",
+    "database": "feedsummary",
+    "username": "admin",   # or FEEDSUMMARY_COUCHDB_USER / FEEDSUMMARY_COUCHDB_PASSWORD
+    "password": "...",
+})
+```
+
+Run the CouchDB tests with `COUCHDB_TEST_URL`, `COUCHDB_TEST_USER` and
+`COUCHDB_TEST_PASSWORD` set; they create and remove temporary `fs_test_*` databases.
+
 Install the MongoDB driver and configure the backend:
 
 ```bash

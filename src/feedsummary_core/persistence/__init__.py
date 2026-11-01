@@ -40,6 +40,7 @@ from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
 from feedsummary_core.persistence.TinyDbStore import TinyDBStore
 from feedsummary_core.persistence.SqliteStore import SqliteStore
 from feedsummary_core.persistence.MongoDBStore import MongoDBStore
+from feedsummary_core.persistence.CouchDBStore import CouchDBStore
 from feedsummary_core.persistence.tag_relations import TagRelationError
 
 
@@ -423,6 +424,18 @@ def create_store(cfg: Dict[str, Any]) -> NewsStore:
             database=cfg.get("database") or cfg.get("database_name") or "feedsummary",
             client=cfg.get("client"),
             connect_timeout_ms=int(cfg.get("connect_timeout_ms", 5000)),
+            initialize_schema=initialize_schema,
+        )  # type: ignore
+
+    if provider in ("couch", "couchdb"):
+        return CouchDBStore(
+            url=cfg.get("url") or cfg.get("uri") or "http://localhost:5984",
+            database=cfg.get("database") or cfg.get("database_name") or "feedsummary",
+            username=cfg.get("username") or os.environ.get("FEEDSUMMARY_COUCHDB_USER"),
+            password=cfg.get("password") or os.environ.get("FEEDSUMMARY_COUCHDB_PASSWORD"),
+            client=cfg.get("client"),
+            timeout=float(cfg.get("timeout", 30)),
+            verify_tls=bool(cfg.get("verify_tls", True)),
             initialize_schema=initialize_schema,
         )  # type: ignore
 
