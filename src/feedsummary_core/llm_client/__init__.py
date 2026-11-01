@@ -56,7 +56,14 @@ class LLMError(Exception):
 class LLMClient(Protocol):
     """Protocol implemented by asynchronous chat-oriented LLM clients."""
 
-    async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str: ...
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
+    ) -> str: ...
 
 
 def has_local_embedding_provider(config: Dict[str, Any]) -> bool:
@@ -66,8 +73,7 @@ def has_local_embedding_provider(config: Dict[str, Any]) -> bool:
     llm_configs.extend(configured if isinstance(configured, list) else [configured])
     llm_configs.append(config.get("llm_fallback"))
     return any(
-        isinstance(item, dict)
-        and str(item.get("provider") or "").strip().lower() == "ollama_local"
+        isinstance(item, dict) and str(item.get("provider") or "").strip().lower() == "ollama_local"
         for item in llm_configs
     )
 
@@ -82,8 +88,22 @@ def get_local_embedding_model(config: Dict[str, Any]) -> str:
             isinstance(item, dict)
             and str(item.get("provider") or "").strip().lower() == "ollama_local"
         ):
-            return str(item.get("embedding_model") or "embeddinggemma:latest").strip()
+            return str(item.get("embedding_model") or "qwen3-embedding:0.6b").strip()
     return ""
+
+
+def get_local_embedding_dimensions(config: Dict[str, Any]) -> int:
+    """Return the requested embedding size for the first local Ollama provider."""
+    configured = config.get("llm")
+    llm_configs = list(configured) if isinstance(configured, list) else [configured]
+    llm_configs.append(config.get("llm_fallback"))
+    for item in llm_configs:
+        if (
+            isinstance(item, dict)
+            and str(item.get("provider") or "").strip().lower() == "ollama_local"
+        ):
+            return max(1, int(item.get("embedding_dimensions", 1024)))
+    return 1024
 
 
 def get_client_embedding_model(client: Any) -> str:
@@ -91,6 +111,13 @@ def get_client_embedding_model(client: Any) -> str:
     embedding_client = getattr(client, "embedding_client", None) or client
     cfg = getattr(embedding_client, "cfg", None)
     return str(getattr(cfg, "embedding_model", "") or "").strip()
+
+
+def get_client_embedding_dimensions(client: Any) -> int:
+    """Return an embedding client's configured output size."""
+    embedding_client = getattr(client, "embedding_client", None) or client
+    cfg = getattr(embedding_client, "cfg", None)
+    return max(1, int(getattr(cfg, "embedding_dimensions", 1024) or 1024))
 
 
 def _create_single_llm(llm_cfg: Dict[str, Any]):
@@ -107,16 +134,30 @@ def _create_single_llm(llm_cfg: Dict[str, Any]):
         cfg = OllamaConfig(
             base_url=str(llm_cfg.get("base_url", "http://localhost:11434")),
             model=str(llm_cfg.get("model", "llama3.1:latest")),
-            embedding_model=str(llm_cfg.get("embedding_model", "embeddinggemma:latest")),
+            embedding_model=str(llm_cfg.get("embedding_model", "qwen3-embedding:0.6b")),
+            embedding_dimensions=max(1, int(llm_cfg.get("embedding_dimensions", 1024))),
             max_rps=float(llm_cfg.get("max_rps", 1.0)),
             first_byte_timeout_s=int(llm_cfg.get("first_byte_timeout_s", 900)),
             sock_read_timeout_s=int(llm_cfg.get("sock_read_timeout_s", 300)),
             progress_log_every_s=float(llm_cfg.get("progress_log_every_s", 2.0)),
             max_retries=int(llm_cfg.get("max_retries", 3)),
+            default_max_output_tokens=(
+                max(1, int(llm_cfg["max_output_tokens"]))
+                if llm_cfg.get("max_output_tokens") is not None
+                else None
+            ),
         )
         return OllamaLocalClient(cfg)
 
     raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+def _tagging_allow_new_tags(llm_cfg: Dict[str, Any]) -> bool:
+    """Read the provider-level tag creation policy with strict type checking."""
+    value = llm_cfg.get("allow_new_tags", True)
+    if not isinstance(value, bool):
+        raise ValueError("LLM-inställningen 'allow_new_tags' måste vara true eller false.")
+    return value
 
 
 def get_primary_llm_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -176,7 +217,14 @@ def create_llm_client(config: Dict[str, Any]):
     if not chain_cfgs:
         raise ValueError("Saknar LLM-konfiguration: config['llm'] är tom.")
 
-    clients = [_create_single_llm(c) for c in chain_cfgs]
+    clients = []
+    for llm_cfg in chain_cfgs:
+        client = _create_single_llm(llm_cfg)
+        # Keep the policy on the concrete provider. FallbackLLMClient can then
+        # choose the correct tagging prompt for the provider that handles the
+        # request, including a provider reached only after failover.
+        client.tagging_allow_new_tags = _tagging_allow_new_tags(llm_cfg)
+        clients.append(client)
     embedding_client = next(
         (
             client

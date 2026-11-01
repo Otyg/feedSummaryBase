@@ -165,20 +165,35 @@ class MongoDBStoreTests(unittest.TestCase):
         self.assertEqual([], store.db.list_collection_names())
 
     def test_article_and_tag_embedding_metadata_is_persisted(self):
-        self.store.upsert_article({"id": "article-1", "title": "Title"})
+        self.store.upsert_article(
+            {
+                "id": "article-1",
+                "title": "Title",
+                "embedding_vector": [9.0, 9.0],
+            }
+        )
         self.assertTrue(
             self.store.update_article_embedding(
                 "article-1",
                 [1.0, 0.0],
                 model="embedding-model",
-                source_hash=embedding_source_hash("Title"),
+                source_hash=embedding_source_hash("Title", "event instruction"),
+                purpose="similarity",
+                instruction="event instruction",
             )
         )
         article = self.store.get_article("article-1")
-        self.assertEqual("embedding-model", article["embedding_model"])
-        self.assertEqual([1.0, 0.0], article["embedding_vector"])
+        self.assertEqual([9.0, 9.0], article["embedding_vector"])
+        self.assertEqual("embedding-model", article["similarity_embedding_model"])
+        self.assertEqual([1.0, 0.0], article["similarity_embedding_vector"])
+        self.assertEqual(
+            "event instruction", article["similarity_embedding_instruction"]
+        )
         self.store.upsert_article({"id": "article-1", "title": "Title"})
-        self.assertEqual([1.0, 0.0], self.store.get_article("article-1")["embedding_vector"])
+        self.assertEqual(
+            [1.0, 0.0],
+            self.store.get_article("article-1")["similarity_embedding_vector"],
+        )
 
         tag_id = self.store.add_tag("security")
         self.assertTrue(
@@ -192,6 +207,22 @@ class MongoDBStoreTests(unittest.TestCase):
         tag = self.store.get_tag_by_name("security")
         self.assertEqual("embedding-model", tag["embedding_model"])
         self.assertEqual(embedding_source_hash("security"), tag["embedding_source_hash"])
+
+    def test_legacy_article_embedding_path_remains_supported(self):
+        self.store.upsert_article({"id": "legacy-article"})
+
+        self.assertTrue(
+            self.store.update_article_embedding(
+                "legacy-article",
+                [0.5, 0.5],
+                model="legacy-model",
+                source_hash=embedding_source_hash("Legacy content"),
+            )
+        )
+
+        article = self.store.get_article("legacy-article")
+        self.assertEqual([0.5, 0.5], article["embedding_vector"])
+        self.assertEqual("legacy-model", article["embedding_model"])
 
     def test_cleanup_honors_each_retention_window(self):
         now = int(time.time())
@@ -221,7 +252,18 @@ class MongoDBStoreTests(unittest.TestCase):
         removed = self.store.run_cleanup(CleanupPolicy(articles_days=30))
 
         self.assertEqual(
-            {"articles": 1, "summary_docs": 1, "temp_summaries": 1, "jobs": 1},
+            {
+                "articles": 1,
+                "summary_docs": 1,
+                "temp_summaries": 1,
+                "jobs": 1,
+                "long_term_reports": 0,
+                "long_term_snapshots": 0,
+                "long_term_clusters": 0,
+                "long_term_memberships": 0,
+                "long_term_runs": 0,
+                "long_term_quarantine": 0,
+            },
             removed,
         )
         self.assertIsNotNone(self.store.get_summary_doc("weekly-current"))

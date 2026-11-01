@@ -13,3 +13,6 @@ class CleanupPolicy:
     weekly_summaries_days: int = 30
     temp_summaries_days: int = 30
     jobs_days: int = 90
+    # Opt-in at the library boundary. Applications with long-term analysis
+    # enabled should pass their explicit retention window.
+    long_term_days: int = 0

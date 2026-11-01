@@ -73,6 +73,28 @@ tags = store.get_all_tags()
 - Atomic integer IDs for compatibility with the existing store interface
 - Complete feature parity with TinyDB and SQLite
 
+**CouchDBStore** - CouchDB document backend (no extra dependencies)
+- Same behaviour as MongoDBStore; one CouchDB database per collection, named
+  `<database>_<collection>` (for example `feedsummary_articles`)
+- Single-document atomic updates use `_rev` compare-and-swap; unique indexes are
+  emulated with claim documents. CouchDB has no multi-document transactions, so
+  multi-document operations rely on the same write journals as MongoDB
+- Top-level fields starting with `_` are stored with a `mongo` prefix
+  (`_mongo_sort_ts` becomes `mongo_mongo_sort_ts`)
+
+```python
+store = create_store({
+    "provider": "couchdb",
+    "url": "http://192.168.1.73:5984",
+    "database": "feedsummary",
+    "username": "admin",   # or FEEDSUMMARY_COUCHDB_USER / FEEDSUMMARY_COUCHDB_PASSWORD
+    "password": "...",
+})
+```
+
+Run the CouchDB tests with `COUCHDB_TEST_URL`, `COUCHDB_TEST_USER` and
+`COUCHDB_TEST_PASSWORD` set; they create and remove temporary `fs_test_*` databases.
+
 Install the MongoDB driver and configure the backend:
 
 ```bash
@@ -179,6 +201,7 @@ store:
 llm:
   provider: "ollama_local"  # or "ollama_cloud", "fallback"
   model: "mistral:latest"
+  allow_new_tags: true
   temperature: 0.3
   base_url: "http://localhost:11434"
 
@@ -198,6 +221,13 @@ tagging:
     similarity_threshold: 0.78
     max_shared_tags: 1
 ```
+
+`allow_new_tags` is a provider-level article-tagging policy and defaults to
+`true`. Set it to `false` to make that provider select exact tag names already
+stored in the database. In this mode ML predictions are presented as untrusted
+suggestions: the LLM must approve them before they are assigned, and an omitted
+ML suggestion is rejected. Fallback chains select the matching prompt for the
+provider that actually handles the request.
 
 ### Embedding-based ML tagging
 
@@ -315,20 +345,29 @@ batching:
   similarity_threshold: 0.78
   embedding_text_chars: 2000
   embedding_max_concurrency: 4
+  embedding_instruction: "Represent the specific real-world event described by this article."
+
+tagging:
+  ml:
+    embedding_instruction: "Represent the topics, industries or sectors, type of information, subjects and geographical regions discussed in this article."
 
 llm:
   provider: ollama_local
   model: qwen2.5:7b
-  embedding_model: embeddinggemma:latest
+  embedding_model: qwen3-embedding:0.6b
+  embedding_dimensions: 1024
 ```
 
 Set `similarity_enabled: false` to retain sequential batching. If embeddings
 cannot be generated, the summarizer automatically falls back to sequential
 batching.
 
-Article and tag embeddings are persisted by every storage backend. Cache entries
-contain `embedding_vector`, `embedding_model`, `embedding_source_hash`, and
-`embedding_updated_at`; they are reused until the embedded text or model changes.
+Every article has separate `similarity_embedding_*` and `tagging_embedding_*`
+cache fields. Similarity batching and related-article checks only read the first
+vector, while the ML classifier only reads the second. Each cache also records
+its model, instruction, source hash, and update time, and is reused only while
+all of those inputs and the configured dimension still match. Tag-name
+embeddings retain their existing `embedding_*` fields.
 
 ## Usage Examples
 

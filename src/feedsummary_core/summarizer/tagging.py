@@ -53,7 +53,11 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from feedsummary_core.llm_client import LLMClient, get_client_embedding_model
+from feedsummary_core.llm_client import (
+    LLMClient,
+    get_client_embedding_dimensions,
+    get_client_embedding_model,
+)
 from feedsummary_core.persistence import NewsStore
 from feedsummary_core.summarizer.batching import (
     cached_embedding,
@@ -72,56 +76,188 @@ logger = logging.getLogger(__name__)
 # Patterns and keywords for relevant tags that can be created automatically
 # These include domain entities + general categories that are valuable for tagging
 THREAT_ACTOR_KEYWORDS = {
-    'APT', 'group', 'gang', 'campaign', 'threat actor', 'hacker',
-    'collective', 'organization', 'state-sponsored',
+    "APT",
+    "group",
+    "gang",
+    "campaign",
+    "threat actor",
+    "hacker",
+    "collective",
+    "organization",
+    "state-sponsored",
     # Known ransomware families
-    'clop', 'lockbit', 'conti', 'revil', 'blackmatter', 'darkside',
-    'sodinokibi', 'ragnar', 'netwalker', 'egregor', 'maze', 'ryuk',
+    "clop",
+    "lockbit",
+    "conti",
+    "revil",
+    "blackmatter",
+    "darkside",
+    "sodinokibi",
+    "ragnar",
+    "netwalker",
+    "egregor",
+    "maze",
+    "ryuk",
 }
 
 REGION_KEYWORDS = {
-    'region', 'country', 'continent', 'area', 'nation', 'territory',
-    'Russia', 'China', 'USA', 'Europe', 'Asia', 'Africa', 'Americas',
+    "region",
+    "country",
+    "continent",
+    "area",
+    "nation",
+    "territory",
+    "Russia",
+    "China",
+    "USA",
+    "Europe",
+    "Asia",
+    "Africa",
+    "Americas",
 }
 
 VULNERABILITY_KEYWORDS = {
-    'vulnerability', 'exploit', 'zero-day', '0-day', 'flaw', 'hole',
-    'breach', 'bug', 'issue', 'threat'
+    "vulnerability",
+    "exploit",
+    "zero-day",
+    "0-day",
+    "flaw",
+    "hole",
+    "breach",
+    "bug",
+    "issue",
+    "threat",
 }
 
 # Broad categories that are relevant for new tags
 CATEGORY_KEYWORDS = {
-    'dataskydd', 'privacy', 'data protection', 'gdpr', 'compliance',
-    'juridik', 'legal', 'lag', 'regulations', 'regulatory', 'law',
-    'ransomware', 'malware', 'virus', 'worm', 'trojan', 'spyware',
-    'sårbarhet', 'vulnerability', 'cve', 'zero-day',
-    'säkerhet', 'security', 'incident', 'breach', 'attack', 'hack',
-    'compromise', 'infection', 'exploit', 'exfiltration',
-    'data theft', 'data_theft', 'data_breach', 'exposed_data', 'extortion',
-    'prison', 'sentence', 'criminal', 'crime', 'police', 'arrest',
-    'company', 'corporation', 'business', 'employer', 'employee',
-    'account', 'credential', 'password', 'access', 'authentication',
+    "dataskydd",
+    "privacy",
+    "data protection",
+    "gdpr",
+    "compliance",
+    "juridik",
+    "legal",
+    "lag",
+    "regulations",
+    "regulatory",
+    "law",
+    "ransomware",
+    "malware",
+    "virus",
+    "worm",
+    "trojan",
+    "spyware",
+    "sårbarhet",
+    "vulnerability",
+    "cve",
+    "zero-day",
+    "säkerhet",
+    "security",
+    "incident",
+    "breach",
+    "attack",
+    "hack",
+    "compromise",
+    "infection",
+    "exploit",
+    "exfiltration",
+    "data theft",
+    "data_theft",
+    "data_breach",
+    "exposed_data",
+    "extortion",
+    "prison",
+    "sentence",
+    "criminal",
+    "crime",
+    "police",
+    "arrest",
+    "company",
+    "corporation",
+    "business",
+    "employer",
+    "employee",
+    "account",
+    "credential",
+    "password",
+    "access",
+    "authentication",
 }
 
 # Known organizations and companies (often appear as single-word tags)
 # Allows automatic creation of tags for well-known entities
 KNOWN_ORGANIZATIONS = {
-    'apple', 'microsoft', 'google', 'amazon', 'facebook', 'meta',
-    'ibm', 'cisco', 'vmware', 'oracle', 'salesforce', 'adobe',
-    'nhs', 'fbi', 'cia', 'nsa', 'dhs', 'fcc', 'ftc', 'sec',
-    'interpol', 'europol', 'nato', 'un', 'eu',
-    'tesla', 'uber', 'airbnb', 'netflix', 'twitter', 'linkedin',
-    'walmart', 'target', 'home-depot', 'equifax', 'anthem',
+    "apple",
+    "microsoft",
+    "google",
+    "amazon",
+    "facebook",
+    "meta",
+    "ibm",
+    "cisco",
+    "vmware",
+    "oracle",
+    "salesforce",
+    "adobe",
+    "nhs",
+    "fbi",
+    "cia",
+    "nsa",
+    "dhs",
+    "fcc",
+    "ftc",
+    "sec",
+    "interpol",
+    "europol",
+    "nato",
+    "un",
+    "eu",
+    "tesla",
+    "uber",
+    "airbnb",
+    "netflix",
+    "twitter",
+    "linkedin",
+    "walmart",
+    "target",
+    "home-depot",
+    "equifax",
+    "anthem",
 }
 
 # Keywords that indicate named entities (companies, products, people, locations)
 # These should generally be created as new tags if not found
 NAMED_ENTITY_INDICATORS = {
-    'corp', 'corporation', 'company', 'ltd', 'inc', 'gmbh', 'ag', 'plc',
-    'product', 'software', 'service', 'platform', 'tool',
-    'system', 'application', 'framework', 'library',
-    'city', 'country', 'state', 'province', 'region', 'continent',
-    'apple', 'microsoft', 'google', 'amazon', 'facebook', 'meta',
+    "corp",
+    "corporation",
+    "company",
+    "ltd",
+    "inc",
+    "gmbh",
+    "ag",
+    "plc",
+    "product",
+    "software",
+    "service",
+    "platform",
+    "tool",
+    "system",
+    "application",
+    "framework",
+    "library",
+    "city",
+    "country",
+    "state",
+    "province",
+    "region",
+    "continent",
+    "apple",
+    "microsoft",
+    "google",
+    "amazon",
+    "facebook",
+    "meta",
 }
 
 LITERAL_EVIDENCE_CATEGORIES = {
@@ -134,6 +270,30 @@ LITERAL_EVIDENCE_CATEGORIES = {
 }
 
 
+def _merge_selected_tags(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge tag results while preserving order and removing duplicate tags."""
+    merged: List[Dict[str, Any]] = []
+    seen_ids = set()
+    seen_names = set()
+    for group in groups:
+        for tag in group:
+            if not isinstance(tag, dict):
+                continue
+            tag_id = tag.get("id")
+            name = str(tag.get("name") or "").strip()
+            normalized_name = name.casefold()
+            if (tag_id is not None and tag_id in seen_ids) or (
+                normalized_name and normalized_name in seen_names
+            ):
+                continue
+            if tag_id is not None:
+                seen_ids.add(tag_id)
+            if normalized_name:
+                seen_names.add(normalized_name)
+            merged.append(tag)
+    return merged
+
+
 class TagManager:
     """Manages article tags with priority-based tag selection and embedding support."""
 
@@ -144,7 +304,7 @@ class TagManager:
     def __init__(self, store: NewsStore, llm_client: Optional[Any] = None):
         """
         Initialize the TagManager with a NewsStore and optional LLM client for embeddings.
-        
+
         Args:
             store: NewsStore instance
             llm_client: Optional LLM client with embed() method for embedding-based matching
@@ -152,6 +312,7 @@ class TagManager:
         self.store = store
         self.llm_client = llm_client
         self._embedding_cache: Dict[str, List[float]] = {}
+        self.last_generation_allowed_new_tags = True
 
     def init_tag_tables(self) -> None:
         """Initialize tag tables in the database (idempotent)."""
@@ -196,15 +357,15 @@ class TagManager:
         if not is_cve_tag(name):
             resolved_category = self._resolve_tag_category(category)
             if resolved_category is None:
-                logger.debug(
-                    f"[TagValidate] Rejected tag '{name}': unknown category {category!r}"
-                )
+                logger.debug(f"[TagValidate] Rejected tag '{name}': unknown category {category!r}")
                 return None
             category = resolved_category
 
         # Validate tag name length (max 2 words for GENERAL, unlimited otherwise)
         if not self._is_valid_tag_name(name, category):
-            logger.debug(f"[TagValidate] Rejected tag '{name}': exceeds word limit for category {category}")
+            logger.debug(
+                f"[TagValidate] Rejected tag '{name}': exceeds word limit for category {category}"
+            )
             return None
 
         try:
@@ -282,8 +443,9 @@ class TagManager:
             return self.TAG_CATEGORY_GENERAL
 
         category_names = {
-            str(category.get("name") or "").strip().casefold():
-            str(category.get("name") or "").strip()
+            str(category.get("name") or "").strip().casefold(): str(
+                category.get("name") or ""
+            ).strip()
             for category in available
             if str(category.get("name") or "").strip()
         }
@@ -302,10 +464,7 @@ class TagManager:
     def _ensure_cve_category(self, tag: Dict[str, Any]) -> Dict[str, Any]:
         """Persist and return the canonical category for an existing CVE tag."""
         name = str(tag.get("name") or "").strip()
-        if (
-            not is_cve_tag(name)
-            or tag.get("category") == self.TAG_CATEGORY_VULNERABILITY
-        ):
+        if not is_cve_tag(name) or tag.get("category") == self.TAG_CATEGORY_VULNERABILITY:
             return tag
 
         normalized = tag.copy()
@@ -356,9 +515,11 @@ class TagManager:
             if tag_id not in seen:
                 seen.add(tag_id)
                 unique_tag_ids.append(tag_id)
-        
+
         if len(unique_tag_ids) < len(tag_ids):
-            logger.debug(f"[TagArticle] Deduplicated tag IDs: {len(tag_ids)} → {len(unique_tag_ids)}")
+            logger.debug(
+                f"[TagArticle] Deduplicated tag IDs: {len(tag_ids)} → {len(unique_tag_ids)}"
+            )
 
         try:
             fn = getattr(self.store, "add_article_tags", None)
@@ -410,6 +571,7 @@ class TagManager:
             max_concurrency=max(1, embedding_max_concurrency),
             store=self.store,
             embedding_model=get_client_embedding_model(self.llm_client),
+            embedding_dimensions=get_client_embedding_dimensions(self.llm_client),
         )
         add_tag_to_article = getattr(self.store, "add_tag_to_article", None)
         if not callable(add_tag_to_article):
@@ -496,7 +658,7 @@ class TagManager:
     def _is_relevant_new_tag(self, text: str) -> bool:
         """
         Check if text represents a relevant tag that should be created as a new tag.
-        
+
         This includes:
         - Domain entities (CVEs, threat actors, regions, vulnerabilities)
         - Ransomware families and threat actors (clop, lockbit, etc.)
@@ -504,47 +666,47 @@ class TagManager:
         - Broad categories (data protection, ransomware, legal terms, etc.)
         - Named entities (companies, products, people, locations)
         - Tags that are 2+ words (typically more specific and valuable)
-        
+
         Returns False for very generic terms that shouldn't be new tags.
         """
         if not text or len(text) < 2:
             return False
-            
+
         text_lower = text.lower()
-        
+
         # Normalize underscores and hyphens to spaces for word counting
-        normalized = text.replace('_', ' ').replace('-', ' ')
+        normalized = text.replace("_", " ").replace("-", " ")
         word_count = len(normalized.split())
-        
+
         # CVE pattern - always relevant
         if CVE_PATTERN.search(text):
             return True
-        
+
         # Check for threat actor keywords (includes ransomware families)
         for keyword in THREAT_ACTOR_KEYWORDS:
             if keyword.lower() in text_lower:
                 return True
-        
+
         # Check for region keywords
         for keyword in REGION_KEYWORDS:
             if keyword.lower() in text_lower:
                 return True
-        
+
         # Check for vulnerability keywords
         for keyword in VULNERABILITY_KEYWORDS:
             if keyword.lower() in text_lower:
                 return True
-        
+
         # Check for broad categories (dataskydd, ransomware, legal terms, etc.)
         for keyword in CATEGORY_KEYWORDS:
             if keyword.lower() in text_lower:
                 return True
-        
+
         # Check if it's a known organization (even single-word tags)
         # This allows tags like "apple", "nhs", "microsoft" to be created automatically
         if text_lower in KNOWN_ORGANIZATIONS:
             return True
-        
+
         # Check for named entity indicators (companies, products, etc.)
         # These are relevant if they're multi-word tags (e.g., "Microsoft Corporation")
         # or if they contain named entity keywords
@@ -556,7 +718,7 @@ class TagManager:
             # e.g., "ransomware family", "security vendor", "threat actor",
             # "data theft", "account info", "employer law"
             return True
-        
+
         # Single-word tags: only if they match our keyword lists or known organizations
         # (avoid creating too generic single-word tags)
         return False
@@ -564,7 +726,7 @@ class TagManager:
     def _find_similar_existing_tags(
         self,
         tag_name: str,
-        similarity_threshold: float = 0.6,
+        similarity_threshold: float = 0.8,
         allow_fuzzy_matching: bool = True,
     ) -> List[Dict[str, Any]]:
         """
@@ -578,7 +740,7 @@ class TagManager:
 
         Args:
             tag_name: Tag name to find matches for
-            similarity_threshold: Minimum similarity score (0.0-1.0)
+            similarity_threshold: Minimum embedding similarity score (0.0-1.0)
             allow_fuzzy_matching: If False, only exact names and configured
                 synonyms are considered. Named entities use this stricter mode
                 so one company or product cannot be replaced by another based
@@ -608,9 +770,7 @@ class TagManager:
         for tag in existing_tags:
             existing_name = str(tag.get("name") or "").strip().lower()
             if existing_name == tag_lower:
-                logger.debug(
-                    f"[TagMatch] Exact string match: '{tag_name}' == '{existing_name}'"
-                )
+                logger.debug(f"[TagMatch] Exact string match: '{tag_name}' == '{existing_name}'")
                 return [tag]
 
         # Check if tag_name matches any existing tag's synonyms (synonym-to-main-tag replacement)
@@ -618,22 +778,26 @@ class TagManager:
             tag_synonyms = tag.get("synonyms", [])
             if tag_synonyms and isinstance(tag_synonyms, list):
                 # Normalize synonyms to lowercase for comparison
-                synonyms_lower = [s.lower() if isinstance(s, str) else str(s).lower() for s in tag_synonyms]
+                synonyms_lower = [
+                    s.lower() if isinstance(s, str) else str(s).lower() for s in tag_synonyms
+                ]
                 if tag_lower in synonyms_lower:
-                    logger.info(f"[TagMatch] Synonym match: '{tag_name}' is a synonym of main tag '{tag.get('name')}'")
+                    logger.info(
+                        f"[TagMatch] Synonym match: '{tag_name}' is a synonym of main tag '{tag.get('name')}'"
+                    )
                     return [tag]
 
         if not allow_fuzzy_matching:
             return []
 
         # Try embedding-based matching first if LLM client is available
-        if self.llm_client and hasattr(self.llm_client, 'embed'):
+        if self.llm_client and hasattr(self.llm_client, "embed"):
             try:
                 logger.debug(f"[TagMatch] Attempting embedding-based matching for '{tag_name}'")
-                
+
                 # Get embedding for the candidate tag
                 candidate_embedding = self._get_or_compute_embedding(tag_name)
-                
+
                 if candidate_embedding:
                     # Use the store's embedding similarity method if available
                     fn = getattr(self.store, "get_tags_by_embedding_similarity", None)
@@ -641,7 +805,7 @@ class TagManager:
                         try:
                             similar_by_embedding = fn(
                                 candidate_embedding,
-                                similarity_threshold=max(0.6, similarity_threshold - 0.1),
+                                similarity_threshold=min(1.0, max(0.0, similarity_threshold)),
                                 limit=5,
                                 model=get_client_embedding_model(self.llm_client),
                             )
@@ -649,18 +813,22 @@ class TagManager:
                             # Compatibility with external stores implementing the older API.
                             similar_by_embedding = fn(
                                 candidate_embedding,
-                                similarity_threshold=max(0.6, similarity_threshold - 0.1),
+                                similarity_threshold=min(1.0, max(0.0, similarity_threshold)),
                                 limit=5,
                             )
-                        
+
                         if similar_by_embedding:
                             # Log the embedding matches found
-                            match_details = "; ".join([
-                                f"{t.get('name')} (similarity: {t.get('_similarity_score', 'N/A'):.3f})"
-                                for t in similar_by_embedding
-                            ])
-                            logger.info(f"[TagMatch] Embedding-based match for '{tag_name}': {match_details}")
-                            
+                            match_details = "; ".join(
+                                [
+                                    f"{t.get('name')} (similarity: {t.get('_similarity_score', 'N/A'):.3f})"
+                                    for t in similar_by_embedding
+                                ]
+                            )
+                            logger.info(
+                                f"[TagMatch] Embedding-based match for '{tag_name}': {match_details}"
+                            )
+
                             # Similarity is the primary ordering criterion;
                             # category is only a tie-breaker.
                             similar_by_embedding.sort(
@@ -671,11 +839,16 @@ class TagManager:
                             )
                             return similar_by_embedding
                         else:
-                            logger.debug(f"[TagMatch] No embedding matches found for '{tag_name}' (threshold={max(0.6, similarity_threshold - 0.1):.2f})")
+                            logger.debug(
+                                f"[TagMatch] No embedding matches found for '{tag_name}' "
+                                f"(threshold={min(1.0, max(0.0, similarity_threshold)):.2f})"
+                            )
                 else:
                     logger.debug(f"[TagMatch] Failed to compute embedding for '{tag_name}'")
             except Exception as e:
-                logger.warning(f"[TagMatch] Embedding-based tag matching failed for '{tag_name}', falling back to string similarity: {e}")
+                logger.warning(
+                    f"[TagMatch] Embedding-based tag matching failed for '{tag_name}', falling back to string similarity: {e}"
+                )
 
         # Fallback to string-based similarity matching
         logger.debug(f"[TagMatch] Using string-based matching for '{tag_name}'")
@@ -691,17 +864,17 @@ class TagManager:
             # substring matching incorrectly considered "ray" part of
             # "spraying" and "mfa" part of "comfast".
             if self._contains_complete_term(tag_lower, tag_name_str):
-                logger.debug(
-                    f"[TagMatch] Whole-term match: '{tag_name}' vs '{tag_name_str}'"
-                )
+                logger.debug(f"[TagMatch] Whole-term match: '{tag_name}' vs '{tag_name_str}'")
                 matches.append((tag, 0.9))
                 continue
 
             # Levenshtein-based similarity (much better than char-set similarity)
             # Only accept matches with very high similarity (0.75+) to avoid false positives
             similarity = self._simple_similarity(tag_lower, tag_name_str)
-            if similarity >= max(0.75, similarity_threshold):
-                logger.debug(f"[TagMatch] Levenshtein similarity: '{tag_name}' vs '{tag_name_str}' = {similarity:.3f}")
+            if similarity >= 0.75:
+                logger.debug(
+                    f"[TagMatch] Levenshtein similarity: '{tag_name}' vs '{tag_name_str}' = {similarity:.3f}"
+                )
                 matches.append((tag, similarity))
 
         # Sort by similarity (descending) and prefer GENERAL category
@@ -713,10 +886,12 @@ class TagManager:
         )
 
         if matches:
-            match_details = "; ".join([
-                f"{t.get('name')} (similarity: {s:.3f})"
-                for t, s in matches[:3]  # Show top 3
-            ])
+            match_details = "; ".join(
+                [
+                    f"{t.get('name')} (similarity: {s:.3f})"
+                    for t, s in matches[:3]  # Show top 3
+                ]
+            )
             logger.info(f"[TagMatch] String-based match for '{tag_name}': {match_details}")
 
         return [tag for tag, _ in matches]
@@ -752,6 +927,21 @@ class TagManager:
             return False
         pattern = rf"(?<!\w){re.escape(tag)}(?!\w)"
         return re.search(pattern, text) is not None
+
+    def _candidate_has_literal_evidence(
+        self,
+        candidate: Dict[str, Any],
+        article_text: str,
+    ) -> bool:
+        """Check a candidate name and any stored aliases against article text."""
+        name = str(candidate.get("name") or "").strip()
+        if self._article_mentions_tag(article_text, name):
+            return True
+        stored_tag = self.get_tag_by_name(name)
+        return bool(
+            stored_tag
+            and self._stored_entity_has_literal_evidence(stored_tag, article_text)
+        )
 
     def _candidate_requires_literal_evidence(self, candidate: Dict[str, Any]) -> bool:
         """Return whether a proposed tag represents a named entity."""
@@ -824,17 +1014,12 @@ class TagManager:
             return
 
         existing_tags = self.get_all_tags()
-        exact_names = {
-            str(tag.get("name") or "").strip().lower()
-            for tag in existing_tags
-        }
+        exact_names = {str(tag.get("name") or "").strip().lower() for tag in existing_tags}
         synonym_names: Set[str] = set()
         for tag in existing_tags:
             synonyms = tag.get("synonyms", [])
             if isinstance(synonyms, list):
-                synonym_names.update(
-                    str(synonym).strip().lower() for synonym in synonyms
-                )
+                synonym_names.update(str(synonym).strip().lower() for synonym in synonyms)
 
         seen: Set[str] = set()
         for candidate in candidate_tags:
@@ -861,26 +1046,27 @@ class TagManager:
     def _get_or_compute_embedding(self, text: str) -> Optional[List[float]]:
         """
         Get cached embedding or compute and cache it.
-        
+
         Args:
             text: Text to embed
-            
+
         Returns:
             Embedding vector or None if not available
         """
         if not text or not self.llm_client:
             return None
-        
+
         text_lower = text.lower()
-        
+
         # Check cache
         if text_lower in self._embedding_cache:
             return self._embedding_cache[text_lower]
-        
+
         # Compute synchronously only when no event loop is active. Async callers
         # populate this cache through _cache_candidate_embeddings first.
         try:
             import asyncio
+
             try:
                 asyncio.get_running_loop()
                 logger.debug(
@@ -905,27 +1091,27 @@ class TagManager:
         """
         Calculate similarity between two strings using Levenshtein distance.
         This is much better than char-set similarity for tag matching.
-        
+
         Returns a score between 0.0 (completely different) and 1.0 (identical).
         """
         if not s1 or not s2:
             return 0.0
-        
+
         if s1 == s2:
             return 1.0
-        
+
         # Levenshtein distance implementation
         len1, len2 = len(s1), len(s2)
-        
+
         # Create a matrix to store distances
         matrix = [[0] * (len2 + 1) for _ in range(len1 + 1)]
-        
+
         # Initialize first column and row
         for i in range(len1 + 1):
             matrix[i][0] = i
         for j in range(len2 + 1):
             matrix[0][j] = j
-        
+
         # Fill the matrix
         for i in range(1, len1 + 1):
             for j in range(1, len2 + 1):
@@ -933,15 +1119,15 @@ class TagManager:
                     matrix[i][j] = matrix[i - 1][j - 1]
                 else:
                     matrix[i][j] = 1 + min(
-                        matrix[i - 1][j],      # deletion
-                        matrix[i][j - 1],      # insertion
-                        matrix[i - 1][j - 1]   # substitution
+                        matrix[i - 1][j],  # deletion
+                        matrix[i][j - 1],  # insertion
+                        matrix[i - 1][j - 1],  # substitution
                     )
-        
+
         # Calculate similarity from distance
         distance = matrix[len1][len2]
         max_len = max(len1, len2)
-        
+
         # Convert distance to similarity score (0.0-1.0)
         # Higher score = more similar
         similarity = 1.0 - (distance / max_len)
@@ -951,32 +1137,32 @@ class TagManager:
     def _is_valid_tag_name(tag_name: str, category: str = TAG_CATEGORY_GENERAL) -> bool:
         """
         Validate tag name based on category.
-        
+
         Rules:
         - GENERAL tags: max 2 words (e.g., "data breach" is ok, "security incident response" is not)
         - DOMAIN_ENTITY tags: unlimited words (e.g., "John Smith", "Apple Inc", "SQL Injection Attack")
-        
+
         Args:
             tag_name: Tag name to validate
             category: Tag category
-            
+
         Returns:
             True if valid, False otherwise
         """
         if not tag_name or not isinstance(tag_name, str):
             return False
-        
+
         tag_name = tag_name.strip()
         if not tag_name:
             return False
-        
+
         # Count words (split by whitespace)
         word_count = len(tag_name.split())
-        
+
         # GENERAL tags: max 2 words
         if category == TagManager.TAG_CATEGORY_GENERAL:
             return word_count <= 2
-        
+
         # DOMAIN_ENTITY tags: unlimited
         return True
 
@@ -987,6 +1173,7 @@ class TagManager:
         allow_new_tags: bool = True,
         article_text: str = "",
         new_tag_excluded_categories: Optional[Set[str]] = None,
+        embedding_replacement_threshold: float = 0.8,
     ) -> List[Dict[str, Any]]:
         """
         Select the best tags for an article from a list of candidates.
@@ -1004,6 +1191,8 @@ class TagManager:
             article_text: Optional source text used to reject ungrounded entity tags
             new_tag_excluded_categories: Categories in which new tags may not be
                 created. Existing matching tags in those categories remain usable.
+            embedding_replacement_threshold: Minimum embedding similarity for
+                replacing a proposed tag with an existing tag.
 
         Returns:
             List of selected tags as dicts with 'id', 'name', 'category', and optional 'reasoning' fields
@@ -1012,8 +1201,9 @@ class TagManager:
         processed_tags: Set[str] = set()
         available_categories = self.get_all_categories()
         available_category_names = {
-            str(category.get("name") or "").strip().casefold():
-            str(category.get("name") or "").strip()
+            str(category.get("name") or "").strip().casefold(): str(
+                category.get("name") or ""
+            ).strip()
             for category in available_categories
             if str(category.get("name") or "").strip()
         }
@@ -1026,7 +1216,7 @@ class TagManager:
         for candidate in candidate_tags:
             if not candidate:
                 continue
-            
+
             # Handle both string and dict formats
             if isinstance(candidate, dict):
                 tag_name = candidate.get("name", "").strip().lower()
@@ -1038,7 +1228,7 @@ class TagManager:
                 tag_type = "CATEGORY"  # Default for backward compatibility
                 proposed_category = None
                 tag_reasoning = ""
-            
+
             if not tag_name or tag_name in processed_tags:
                 continue
 
@@ -1046,7 +1236,7 @@ class TagManager:
                 article_text
                 and isinstance(candidate, dict)
                 and self._candidate_requires_literal_evidence(candidate)
-                and not self._article_mentions_tag(article_text, tag_name)
+                and not self._candidate_has_literal_evidence(candidate, article_text)
             ):
                 logger.info("[TagSelect] Rejected ungrounded entity tag '%s'", tag_name)
                 continue
@@ -1056,6 +1246,7 @@ class TagManager:
             # Try to find existing similar tags
             similar_tags = self._find_similar_existing_tags(
                 tag_name,
+                similarity_threshold=embedding_replacement_threshold,
                 allow_fuzzy_matching=tag_type != "NAMED_ENTITY",
             )
 
@@ -1077,7 +1268,9 @@ class TagManager:
                     )
                     continue
                 tag_dict["reasoning"] = tag_reasoning
-                logger.debug(f"[TagSelect] Using existing tag '{tag_dict['name']}' for candidate '{tag_name}'")
+                logger.debug(
+                    f"[TagSelect] Using existing tag '{tag_dict['name']}' for candidate '{tag_name}'"
+                )
                 selected_tags.append(tag_dict)
             elif allow_new_tags:
                 # Decision logic based on tag type
@@ -1095,7 +1288,7 @@ class TagManager:
                     fallback_category=default_category,
                     categories=available_categories,
                 )
-                
+
                 if tag_type == "NAMED_ENTITY":
                     # NAMED_ENTITY tags (organizations, groups, actors) are always created
                     # This allows LLM-identified entities like "Apple", "Clop", "APT28" to be tagged automatically
@@ -1108,7 +1301,7 @@ class TagManager:
                 # a new tag even if the legacy keyword heuristic does not know it.
                 if explicit_category:
                     should_create = True
-                
+
                 if should_create:
                     # Validate tag name (max 2 words for GENERAL, unlimited otherwise)
                     if is_cve_tag(tag_name):
@@ -1130,20 +1323,24 @@ class TagManager:
                             tag_category,
                         )
                         continue
-                    
+
                     if not self._is_valid_tag_name(tag_name, tag_category):
-                        logger.debug(f"[TagSelect] Rejected tag '{tag_name}': exceeds word limit for {tag_type}")
+                        logger.debug(
+                            f"[TagSelect] Rejected tag '{tag_name}': exceeds word limit for {tag_type}"
+                        )
                         continue
-                    
+
                     tag_id = self.add_tag(tag_name, category=tag_category)
                     if tag_id:
                         logger.debug(f"[TagSelect] Created new tag '{tag_name}' (type={tag_type})")
-                        selected_tags.append({
-                            "id": tag_id,
-                            "name": tag_name,
-                            "category": tag_category,
-                            "reasoning": tag_reasoning,
-                        })
+                        selected_tags.append(
+                            {
+                                "id": tag_id,
+                                "name": tag_name,
+                                "category": tag_category,
+                                "reasoning": tag_reasoning,
+                            }
+                        )
                     else:
                         # Tag might already exist, try to get it
                         existing = self.get_tag_by_name(tag_name)
@@ -1152,7 +1349,9 @@ class TagManager:
                             selected_tags.append(existing)
                 else:
                     # Tag not relevant for automatic creation
-                    logger.debug(f"Skipping tag (not classified as relevant): {tag_name} (type={tag_type})")
+                    logger.debug(
+                        f"Skipping tag (not classified as relevant): {tag_name} (type={tag_type})"
+                    )
 
         # Deduplicate by tag ID (prevent same tag being assigned twice)
         seen_tag_ids: Set[int] = set()
@@ -1165,9 +1364,11 @@ class TagManager:
             elif not tag_id:
                 # No ID (shouldn't happen), add anyway
                 deduplicated_tags.append(tag_dict)
-        
+
         if len(deduplicated_tags) < len(selected_tags):
-            logger.info(f"[TagSelect] Deduplicated tags: {len(selected_tags)} → {len(deduplicated_tags)}")
+            logger.info(
+                f"[TagSelect] Deduplicated tags: {len(selected_tags)} → {len(deduplicated_tags)}"
+            )
 
         return deduplicated_tags
 
@@ -1178,6 +1379,7 @@ class TagManager:
         allow_new_tags: bool = True,
         article_text: str = "",
         new_tag_excluded_categories: Optional[Set[str]] = None,
+        embedding_replacement_threshold: float = 0.8,
     ) -> List[Dict[str, Any]]:
         """Async selection path that precomputes embeddings before matching."""
         await self._cache_candidate_embeddings(candidate_tags)
@@ -1187,6 +1389,7 @@ class TagManager:
             allow_new_tags=allow_new_tags,
             article_text=article_text,
             new_tag_excluded_categories=new_tag_excluded_categories,
+            embedding_replacement_threshold=embedding_replacement_threshold,
         )
 
     def extract_tags_from_llm_response(self, response: str) -> List[Dict[str, str]]:
@@ -1201,7 +1404,7 @@ class TagManager:
                 ...
             ]
         }
-        
+
         For backward compatibility, also supports old formats:
         {
             "tags": [
@@ -1211,7 +1414,7 @@ class TagManager:
             ],
             "reasoning": "General explanation"
         }
-        
+
         Or simply:
         {
             "tags": ["tag1", "tag2", ...],
@@ -1231,24 +1434,23 @@ class TagManager:
 
         try:
             import re
-            
+
             # Try to extract tags array using regex
             # This avoids json.loads() issues with control characters
             tags_match = re.search(r'"tags"\s*:\s*\[(.*?)\]', response, re.DOTALL)
             if tags_match:
                 tags_str = tags_match.group(1)
                 tags = []
-                
+
                 # Try to parse as new format: [{"tag": "...", "type": "..."}, ...]
-                if '{' in tags_str:
+                if "{" in tags_str:
                     # Extract objects
-                    obj_matches = re.findall(r'\{[^}]*\}', tags_str)
+                    obj_matches = re.findall(r"\{[^}]*\}", tags_str)
                     for obj_match in obj_matches:
                         try:
                             # Clean and parse
-                            obj_match_clean = ''.join(
-                                c for c in obj_match
-                                if ord(c) >= 32 or c in '\n\r\t'
+                            obj_match_clean = "".join(
+                                c for c in obj_match if ord(c) >= 32 or c in "\n\r\t"
                             )
                             obj = json.loads(obj_match_clean)
                             if isinstance(obj, dict):
@@ -1257,34 +1459,41 @@ class TagManager:
                                 tag_category = obj.get("category")
                                 tag_reasoning = obj.get("reasoning", "")
                                 if tag_name:
-                                    tags.append({
-                                        "name": str(tag_name).strip().lower(),
-                                        "type": tag_type.upper() if tag_type else "CATEGORY",
-                                        "category": str(tag_category).strip() if tag_category else "",
-                                        "reasoning": str(tag_reasoning).strip() if tag_reasoning else ""
-                                    })
+                                    tags.append(
+                                        {
+                                            "name": str(tag_name).strip().lower(),
+                                            "type": tag_type.upper() if tag_type else "CATEGORY",
+                                            "category": str(tag_category).strip()
+                                            if tag_category
+                                            else "",
+                                            "reasoning": str(tag_reasoning).strip()
+                                            if tag_reasoning
+                                            else "",
+                                        }
+                                    )
                         except Exception:
                             pass
                 else:
                     # Fallback: Extract as simple quoted strings (old format)
                     tag_matches = re.findall(r'"([^"]*)"', tags_str)
                     for tag in tag_matches:
-                        cleaned_tag = ''.join(
-                            c for c in tag
-                            if ord(c) >= 32 or c in '\n\r\t'
+                        cleaned_tag = "".join(
+                            c for c in tag if ord(c) >= 32 or c in "\n\r\t"
                         ).strip()
                         if cleaned_tag:
-                            tags.append({
-                                "name": cleaned_tag.lower(),
-                                "type": "CATEGORY",  # Default type for old format
-                                "reasoning": ""  # No reasoning in old format
-                            })
-                
+                            tags.append(
+                                {
+                                    "name": cleaned_tag.lower(),
+                                    "type": "CATEGORY",  # Default type for old format
+                                    "reasoning": "",  # No reasoning in old format
+                                }
+                            )
+
                 if tags:
                     return tags
-            
+
             # Fallback: Try full JSON parsing
-            json_match = re.search(r'\{[\s\S]*\}', response)
+            json_match = re.search(r"\{[\s\S]*\}", response)
             if json_match:
                 json_str = json_match.group(0)
                 try:
@@ -1300,21 +1509,28 @@ class TagManager:
                                     tag_category = t.get("category")
                                     tag_reasoning = t.get("reasoning", "")
                                     if tag_name:
-                                        tags.append({
-                                            "name": str(tag_name).strip().lower(),
-                                            "type": tag_type.upper() if tag_type else "CATEGORY",
-                                            "category": str(tag_category).strip() if tag_category else "",
-                                            "reasoning": str(tag_reasoning).strip() if tag_reasoning else ""
-                                        })
+                                        tags.append(
+                                            {
+                                                "name": str(tag_name).strip().lower(),
+                                                "type": tag_type.upper()
+                                                if tag_type
+                                                else "CATEGORY",
+                                                "category": str(tag_category).strip()
+                                                if tag_category
+                                                else "",
+                                                "reasoning": str(tag_reasoning).strip()
+                                                if tag_reasoning
+                                                else "",
+                                            }
+                                        )
                                 elif isinstance(t, str):
-                                    tags.append({
-                                        "name": str(t).strip().lower(),
-                                        "type": "CATEGORY"
-                                    })
+                                    tags.append(
+                                        {"name": str(t).strip().lower(), "type": "CATEGORY"}
+                                    )
                             return tags
                 except json.JSONDecodeError:
                     pass
-                    
+
         except Exception as e:
             logger.debug(f"Error extracting tags from LLM response: {e}")
 
@@ -1325,8 +1541,10 @@ class TagManager:
         llm_client: LLMClient,
         article: Dict[str, Any],
         config: Dict[str, Any],
-        max_tags: int = 5,
+        max_tags: int = 20,
         excluded_categories: Optional[Set[str]] = None,
+        review_tags: Optional[List[Dict[str, Any]]] = None,
+        review_max_tags: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate and select tags for an article using an LLM.
@@ -1336,10 +1554,16 @@ class TagManager:
             article: Article dict with 'title', 'content', etc.
             config: Configuration dict
             max_tags: Maximum number of non-CVE tags to select
+            review_tags: Untrusted ML suggestions for an existing-only provider
+                to approve or reject
+            review_max_tags: Maximum total tags in existing-only mode
 
         Returns:
             List of selected tags
         """
+        self.last_generation_allowed_new_tags = bool(
+            getattr(llm_client, "tagging_allow_new_tags", True)
+        )
         if not article:
             return []
 
@@ -1356,22 +1580,25 @@ class TagManager:
                 "category": self.TAG_CATEGORY_VULNERABILITY,
                 "reasoning": "CVE identifier mentioned explicitly in the article.",
             }
-            for cve_id in extract_cve_ids(
-                text_context
-            )
+            for cve_id in extract_cve_ids(text_context)
         ]
+        if cve_candidates:
+            cve_candidates.append(
+                {
+                    "name": "vulnerability",
+                    "type": "CATEGORY",
+                    "category": self.TAG_CATEGORY_VULNERABILITY,
+                    "reasoning": "An explicitly mentioned CVE identifies a vulnerability.",
+                }
+            )
 
         excluded = {
             str(category).strip().upper()
             for category in excluded_categories or set()
             if str(category).strip()
         }
-        tagging_config = (
-            config.get("tagging") if isinstance(config.get("tagging"), dict) else {}
-        )
-        raw_creation_excluded = tagging_config.get(
-            "llm_new_tag_excluded_categories", []
-        )
+        tagging_config = config.get("tagging") if isinstance(config.get("tagging"), dict) else {}
+        raw_creation_excluded = tagging_config.get("llm_new_tag_excluded_categories", [])
         if isinstance(raw_creation_excluded, str):
             raw_creation_excluded = [raw_creation_excluded]
         creation_excluded = {
@@ -1379,6 +1606,13 @@ class TagManager:
             for category in raw_creation_excluded
             if str(category).strip()
         }
+        embedding_replacement_threshold = min(
+            1.0,
+            max(
+                0.0,
+                float(tagging_config.get("embedding_replacement_threshold", 0.8)),
+            ),
+        )
         available_categories = self.get_all_categories()
         prompt_categories = [
             category
@@ -1386,28 +1620,74 @@ class TagManager:
             if str(category.get("name") or "").strip().upper() not in excluded
         ]
 
-        if prompt_categories or not available_categories:
-            # Prepare prompt for the categories that are not handled by ML.
-            prompt = self._build_tagging_prompt(
-                text_context,
-                max_tags,
-                categories=prompt_categories,
-            )
+        existing_tags = [
+            tag
+            for tag in self.get_all_tags()
+            if str(tag.get("category") or "").strip().upper() not in excluded
+        ]
+        allow_new_prompt = self._build_tagging_prompt(
+            text_context,
+            max_tags,
+            categories=prompt_categories,
+        )
+        existing_limit = max(0, review_max_tags if review_max_tags is not None else max_tags)
+        existing_only_prompt = self._build_reclassification_prompt(
+            text_context,
+            existing_tags,
+            existing_limit,
+            review_tags=review_tags,
+        )
 
-            try:
-                # Use chat() for compatibility with FallbackLLMClient.
-                response = await llm_client.chat(
-                    [{"role": "user", "content": prompt}],
+        response = ""
+        should_call_allow_new = bool(prompt_categories or not available_categories)
+        should_call_existing_only = bool(existing_tags and existing_limit > 0)
+        try:
+            chat_for_tagging = getattr(llm_client, "chat_for_tagging", None)
+            should_call_current_provider = (
+                should_call_allow_new
+                if self.last_generation_allowed_new_tags
+                else should_call_existing_only
+            )
+            if callable(chat_for_tagging) and should_call_current_provider:
+                response, self.last_generation_allowed_new_tags = await chat_for_tagging(
+                    [{"role": "user", "content": allow_new_prompt}],
+                    [{"role": "user", "content": existing_only_prompt}],
                     temperature=0.3,
                 )
-                candidate_tags = self.extract_tags_from_llm_response(response)
-            except Exception as e:
-                logger.error(f"Error generating LLM tags: {e}")
-                candidate_tags = []
-        else:
-            # Deterministic CVE extraction below still runs when ML covers every
-            # configured LLM category, but no LLM request is needed.
-            candidate_tags = []
+            elif self.last_generation_allowed_new_tags and should_call_allow_new:
+                response = await llm_client.chat(
+                    [{"role": "user", "content": allow_new_prompt}],
+                    temperature=0.3,
+                )
+            elif not self.last_generation_allowed_new_tags and should_call_existing_only:
+                response = await llm_client.chat(
+                    [{"role": "user", "content": existing_only_prompt}],
+                    temperature=0.3,
+                )
+        except Exception as e:
+            logger.error(f"Error generating LLM tags: {e}")
+            response = ""
+
+        if not self.last_generation_allowed_new_tags:
+            selected = self._select_existing_tags_from_response(
+                response,
+                existing_tags,
+                article_text=text_context,
+                max_tags=existing_limit,
+                review_tags=review_tags,
+            )
+            deterministic_tags = []
+            if cve_candidates:
+                deterministic_tags = await self.select_tags_for_article_async(
+                    article_id=article.get("id", ""),
+                    candidate_tags=cve_candidates,
+                    allow_new_tags=True,
+                    article_text="",
+                    embedding_replacement_threshold=embedding_replacement_threshold,
+                )
+            return _merge_selected_tags(selected, deterministic_tags)
+
+        candidate_tags = self.extract_tags_from_llm_response(response)
 
         try:
             # CVEs are prepended so all directly extracted identifiers are processed
@@ -1420,26 +1700,38 @@ class TagManager:
                 and str(candidate.get("category") or "").strip().upper() not in excluded
                 and (
                     not self._candidate_requires_literal_evidence(candidate)
-                    or self._article_mentions_tag(
-                        text_context,
-                        str(candidate.get("name") or ""),
-                    )
+                    or self._candidate_has_literal_evidence(candidate, text_context)
                 )
             ]
+            deterministic_tags = []
+            if cve_candidates:
+                deterministic_tags = await self.select_tags_for_article_async(
+                    article_id=article.get("id", ""),
+                    candidate_tags=cve_candidates,
+                    allow_new_tags=True,
+                    article_text="",
+                    embedding_replacement_threshold=embedding_replacement_threshold,
+                )
             selected = await self.select_tags_for_article_async(
                 article_id=article.get("id", ""),
-                candidate_tags=cve_candidates + regular_candidates[:regular_limit * 2],
+                candidate_tags=regular_candidates[: regular_limit * 2],
                 allow_new_tags=True,
                 article_text=text_context,
                 new_tag_excluded_categories=creation_excluded,
+                embedding_replacement_threshold=embedding_replacement_threshold,
             )
+            selected = _merge_selected_tags(deterministic_tags, selected)
 
             # Preserve selection order while applying the maximum only to non-CVE
-            # tags. Every CVE mentioned in the article remains in the result.
+            # tags. Every CVE mentioned in the article and its vulnerability
+            # category tag remain in the result.
             limited: List[Dict[str, Any]] = []
             regular_count = 0
             for tag in selected:
-                if is_cve_tag(tag.get("name")):
+                if is_cve_tag(tag.get("name")) or (
+                    cve_candidates
+                    and str(tag.get("name") or "").strip().casefold() == "vulnerability"
+                ):
                     limited.append(tag)
                 elif regular_count < regular_limit:
                     limited.append(tag)
@@ -1452,7 +1744,7 @@ class TagManager:
     def _build_tagging_prompt(
         self,
         article_text: str,
-        max_tags: int = 5,
+        max_tags: int = 20,
         categories: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Build a prompt for the LLM to generate tags."""
@@ -1543,20 +1835,20 @@ Respond in JSON format:
         llm_client: LLMClient,
         article: Dict[str, Any],
         current_article_tags: List[Dict[str, Any]] = None,
-        max_tags: int = 5,
+        max_tags: int = 20,
     ) -> List[Dict[str, Any]]:
         """
         Reclassify an article by suggesting only from existing tags in the database.
-        
+
         This method presents all available tags (excluding the article's current tags)
         to the LLM and asks which ones are relevant. No new tags are created.
-        
+
         Args:
             llm_client: LLM client for generating suggestions
             article: Article dict with 'title', 'content', etc.
             current_article_tags: List of tags already on the article (to exclude)
             max_tags: Maximum number of tags to suggest
-        
+
         Returns:
             List of suggested tags with 'id', 'name', 'category', 'reasoning'
         """
@@ -1583,11 +1875,13 @@ Respond in JSON format:
         for tag in all_tags:
             tag_name = tag.get("name", "").lower()
             if tag_name and tag_name not in current_tag_names:
-                available_tags.append({
-                    "name": tag.get("name", ""),
-                    "id": tag.get("id"),
-                    "category": tag.get("category", "GENERAL"),
-                })
+                available_tags.append(
+                    {
+                        "name": tag.get("name", ""),
+                        "id": tag.get("id"),
+                        "category": tag.get("category", "GENERAL"),
+                    }
+                )
 
         if not available_tags:
             logger.info("[Reclassify] No available tags (article already has all tags)")
@@ -1598,40 +1892,14 @@ Respond in JSON format:
 
         try:
             # Use LLM to suggest relevant tags
-            response = await llm_client.chat(
-                [{"role": "user", "content": prompt}],
-                temperature=0.3
+            response = await llm_client.chat([{"role": "user", "content": prompt}], temperature=0.3)
+
+            return self._select_existing_tags_from_response(
+                response,
+                available_tags,
+                article_text=text_context,
+                max_tags=max_tags,
             )
-
-            # Extract suggested tag names
-            suggested_tag_names = self._extract_tag_suggestions_from_response(response)
-            logger.debug(f"[Reclassify] LLM suggested: {suggested_tag_names}")
-
-            # Match suggested names to actual tags
-            suggested_tags = []
-            for suggestion in suggested_tag_names:
-                # Find matching tag (case-insensitive)
-                match = next(
-                    (t for t in available_tags if t["name"].lower() == suggestion.lower()),
-                    None
-                )
-                if match:
-                    category = str(match.get("category") or "").strip().upper()
-                    if category in LITERAL_EVIDENCE_CATEGORIES and not self._article_mentions_tag(
-                        text_context, match["name"]
-                    ):
-                        logger.info(
-                            "[Reclassify] Rejected ungrounded entity tag '%s'",
-                            match["name"],
-                        )
-                        continue
-                    suggested_tags.append({
-                        "id": match["id"],
-                        "name": match["name"],
-                        "category": match["category"],
-                    })
-
-            return suggested_tags[:max_tags]
         except Exception as e:
             logger.error(f"Error reclassifying article: {e}")
             return []
@@ -1640,16 +1908,17 @@ Respond in JSON format:
         self,
         article_text: str,
         available_tags: List[Dict[str, str]],
-        max_tags: int = 5,
+        max_tags: int = 20,
+        review_tags: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Build a prompt for reclassifying an article using only existing tags.
-        
+
         Args:
             article_text: Article title + content
             available_tags: List of dicts with 'name', 'id', 'category'
             max_tags: Maximum suggestions
-        
+
         Returns:
             Prompt string
         """
@@ -1672,6 +1941,45 @@ Respond in JSON format:
             for tag_name in sorted(tags_by_category[category]):
                 tags_list += f"  - {tag_name}\n"
 
+        review_lines = []
+        available_names = {str(tag.get("name") or "").strip().casefold() for tag in available_tags}
+        for tag in review_tags or []:
+            name = str(tag.get("name") or "").strip()
+            if not name or name.casefold() not in available_names:
+                continue
+            category = str(tag.get("category") or "GENERAL").strip()
+            probability = tag.get("ml_probability")
+            confidence = (
+                f", confidence={float(probability):.3f}"
+                if isinstance(probability, (int, float))
+                else ""
+            )
+            synonyms = tag.get("synonyms")
+            alias_text = ""
+            if isinstance(synonyms, list):
+                aliases = sorted(
+                    {
+                        str(synonym).strip()
+                        for synonym in synonyms
+                        if str(synonym or "").strip()
+                    },
+                    key=str.casefold,
+                )
+                if aliases:
+                    alias_text = f", aliases: {', '.join(aliases)}"
+            review_lines.append(f"- {name} ({category}{confidence}{alias_text})")
+        review_section = ""
+        if review_lines:
+            review_section = (
+                """
+UNTRUSTED ML SUGGESTIONS TO REVIEW:
+These tags were suggested by ML. Check each one against the article using its
+name or listed aliases; include it only if directly supported. Omitting a suggestion rejects it.
+"""
+                + "\n".join(review_lines)
+                + "\n"
+            )
+
         return f"""Analyze the following article and suggest relevant tags from the provided list.
 
 IMPORTANT INSTRUCTIONS:
@@ -1684,6 +1992,7 @@ IMPORTANT INSTRUCTIONS:
 
 Available tags organized by category:
 {tags_list}
+{review_section}
 
 SUGGESTION RULES:
 - Suggest up to {max_tags} tags maximum
@@ -1708,20 +2017,74 @@ If NO tags are relevant, respond with:
     "suggested_tags": []
 }}"""
 
+    def _select_existing_tags_from_response(
+        self,
+        response: str,
+        available_tags: List[Dict[str, Any]],
+        *,
+        article_text: str,
+        max_tags: int,
+        review_tags: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Resolve an LLM response strictly to exact tags already in the store."""
+        suggested_tag_names = self._extract_tag_suggestions_from_response(response)
+        logger.debug(f"[Reclassify] LLM suggested: {suggested_tag_names}")
+        by_name = {
+            str(tag.get("name") or "").strip().casefold(): tag
+            for tag in available_tags
+            if str(tag.get("name") or "").strip()
+        }
+        ml_by_name = {
+            str(tag.get("name") or "").strip().casefold(): tag
+            for tag in review_tags or []
+            if str(tag.get("name") or "").strip()
+        }
+        selected = []
+        seen_ids = set()
+        for suggestion in suggested_tag_names:
+            match = by_name.get(str(suggestion).strip().casefold())
+            if not match:
+                continue
+            tag_id = match.get("id")
+            if tag_id in seen_ids:
+                continue
+            category = str(match.get("category") or "").strip().upper()
+            if category in LITERAL_EVIDENCE_CATEGORIES and not self._stored_entity_has_literal_evidence(
+                match, article_text
+            ):
+                logger.info(
+                    "[Reclassify] Rejected ungrounded entity tag '%s'",
+                    match.get("name"),
+                )
+                continue
+            resolved = match.copy()
+            ml_candidate = ml_by_name.get(str(match.get("name") or "").strip().casefold())
+            if ml_candidate and ml_candidate.get("reasoning"):
+                resolved["reasoning"] = "LLM review approved ML suggestion. " + str(
+                    ml_candidate["reasoning"]
+                )
+            selected.append(resolved)
+            if tag_id is not None:
+                seen_ids.add(tag_id)
+            if len(selected) >= max_tags:
+                break
+        return selected
+
     def _extract_tag_suggestions_from_response(self, response: str) -> List[str]:
         """
         Extract suggested tag names from LLM response.
-        
+
         Args:
             response: LLM response string
-        
+
         Returns:
             List of suggested tag names
         """
         try:
             # Try to parse as JSON
             import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+
+            json_match = re.search(r"\{.*\}", response, re.DOTALL)
             if json_match:
                 response_json = json.loads(json_match.group())
                 suggested = response_json.get("suggested_tags", [])
@@ -1737,7 +2100,9 @@ If NO tags are relevant, respond with:
                         if tag_name:
                             tag_names.append(tag_name)
 
-                    logger.debug(f"[ReclassifyExtract] Extracted {len(tag_names)} suggestions: {tag_names}")
+                    logger.debug(
+                        f"[ReclassifyExtract] Extracted {len(tag_names)} suggestions: {tag_names}"
+                    )
                     return tag_names
         except Exception as e:
             logger.debug(f"Error parsing reclassification response: {e}")
@@ -1747,39 +2112,39 @@ If NO tags are relevant, respond with:
     async def generate_embeddings_for_all_tags(self) -> int:
         """
         Generate and cache embeddings for all tags without embeddings.
-        
+
         This method helps populate the embedding vectors for efficient similarity matching.
         Call this periodically to improve tag matching performance.
-        
+
         Returns:
             Number of tags processed
         """
-        if not self.llm_client or not hasattr(self.llm_client, 'embed'):
+        if not self.llm_client or not hasattr(self.llm_client, "embed"):
             logger.warning("LLM client not available or doesn't support embeddings")
             return 0
-        
+
         existing_tags = self.get_all_tags()
         if not existing_tags:
             return 0
-        
+
         processed_count = 0
         embedding_model = get_client_embedding_model(self.llm_client)
-        
+
         for tag in existing_tags:
             try:
                 tag_id = tag.get("id")
                 tag_name = tag.get("name", "")
-                
+
                 # Skip only when both the source text and model still match.
                 if cached_embedding(tag, tag_name, embedding_model) is not None:
                     continue
-                
+
                 if not tag_id or not tag_name:
                     continue
-                
+
                 # Generate embedding
                 embedding = await self.llm_client.embed(tag_name)
-                
+
                 if embedding:
                     # Update tag with embedding
                     fn = getattr(self.store, "update_tag_embedding", None)
@@ -1793,11 +2158,11 @@ If NO tags are relevant, respond with:
                         if success:
                             processed_count += 1
                             logger.info(f"Generated embedding for tag '{tag_name}'")
-                
+
             except Exception as e:
                 logger.warning(f"Failed to generate embedding for tag '{tag.get('name')}': {e}")
                 continue
-        
+
         logger.info(f"Generated embeddings for {processed_count} tags")
         return processed_count
 
@@ -1805,33 +2170,33 @@ If NO tags are relevant, respond with:
         self,
         article_id: str,
         article_content: str,
-        max_tags: int = 5,
+        max_tags: int = 20,
         similarity_threshold: float = 0.70,
     ) -> List[Dict[str, Any]]:
         """
         Tag an article by matching its content embedding to existing tag embeddings.
-        
+
         This provides an alternative/supplementary tagging approach:
         - Compute embedding for article content
         - Find tags with similar embeddings
         - Return top matching tags
-        
+
         Args:
             article_id: Article ID
             article_content: Article summary or content text
             max_tags: Maximum number of tags to assign
             similarity_threshold: Minimum similarity score (0.0-1.0)
-            
+
         Returns:
             List of matched tags
         """
-        if not self.llm_client or not hasattr(self.llm_client, 'embed'):
+        if not self.llm_client or not hasattr(self.llm_client, "embed"):
             logger.warning("LLM client not available for content-based tagging")
             return []
-        
+
         if not article_content or not article_content.strip():
             return []
-        
+
         try:
             embedding_model = get_client_embedding_model(self.llm_client)
             article = self.store.get_article(article_id) or {}
@@ -1846,17 +2211,17 @@ If NO tags are relevant, respond with:
                         model=embedding_model,
                         source_hash=embedding_source_hash(article_content),
                     )
-            
+
             if not content_embedding:
                 logger.warning(f"Failed to embed content for article {article_id}")
                 return []
-            
+
             # Find similar tags by embedding
             fn = getattr(self.store, "get_tags_by_embedding_similarity", None)
             if not callable(fn):
                 logger.warning("Store doesn't support embedding similarity search")
                 return []
-            
+
             try:
                 similar_tags = fn(
                     content_embedding,
@@ -1870,11 +2235,11 @@ If NO tags are relevant, respond with:
                     similarity_threshold=similarity_threshold,
                     limit=max_tags,
                 )
-            
+
             logger.info(f"Found {len(similar_tags)} tags matching content for article {article_id}")
-            
+
             return similar_tags
-            
+
         except Exception as e:
             logger.error(f"Content-based tagging failed for article {article_id}: {e}")
             return []
