@@ -10,7 +10,6 @@ from feedsummary_core.persistence.CouchDBCollection import (
     _plan,
 )
 
-from tests.test_long_term_persistence import LongTermStoreContract
 from tests.test_mongodb_store import MongoDBStoreTests
 
 COUCHDB_URL = os.environ.get("COUCHDB_TEST_URL")
@@ -89,19 +88,6 @@ class CouchDBStoreTests(MongoDBStoreTests):
         self.store.upsert_article({"id": "two", "url": "https://example.test/u"})
 
 
-@unittest.skipUnless(COUCHDB_URL, "COUCHDB_TEST_URL is not set")
-class CouchDBLongTermStoreTests(LongTermStoreContract, unittest.TestCase):
-    def make_store(self, directory):
-        del directory
-        store = CouchDBStore(
-            url=COUCHDB_URL,
-            username=COUCHDB_USER,
-            password=COUCHDB_PASSWORD,
-            database=f"fs_test_{uuid.uuid4().hex[:12]}",
-        )
-        self.addCleanup(_drop_databases, store)
-        self.addCleanup(store.close)
-        return store
 
 
 if __name__ == "__main__":

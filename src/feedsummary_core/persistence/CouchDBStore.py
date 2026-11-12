@@ -57,22 +57,6 @@ _INDEXES = (
     ("tag_relations", ("parent_tag_id",)),
     ("tag_relations", ("child_tag_id",)),
     ("tag_categories", ("name",)),
-    (
-        "threat_clusters",
-        ("profile_id", "status", "embedding_model", "embedding_dimension", "last_seen_ts"),
-    ),
-    ("threat_clusters", ("profile_id", "last_seen_ts")),
-    ("threat_cluster_memberships", ("profile_id", "article_id")),
-    ("threat_cluster_memberships", ("cluster_id", "assigned_at")),
-    ("long_term_cluster_reconciliations", ("profile_id", "reconciled_at")),
-    ("long_term_reconciliation_journal", ("created_at",)),
-    ("long_term_cluster_membership_edits", ("profile_id", "edited_at")),
-    ("long_term_article_quarantine", ("profile_id", "status", "last_seen_at")),
-    ("threat_cluster_snapshots", ("cluster_id", "membership_revision", "prompt_version")),
-    ("threat_cluster_snapshots", ("profile_id", "created_at")),
-    ("threat_landscape_reports", ("profile_id", "period_end_ts")),
-    ("long_term_runs", ("profile_id", "run_type", "started_at")),
-    ("long_term_runs", ("status",)),
 )
 
 _COLLECTIONS = (
@@ -80,23 +64,11 @@ _COLLECTIONS = (
     "article_tags",
     "counters",
     "jobs",
-    "long_term_article_quarantine",
-    "long_term_assignment_journal",
-    "long_term_cluster_membership_edits",
-    "long_term_cluster_reconciliations",
-    "long_term_membership_edit_journal",
-    "long_term_reconciliation_journal",
-    "long_term_runs",
-    "long_term_state",
     "summary_docs",
     "tag_categories",
     "tag_relations",
     "tags",
     "temp_summaries",
-    "threat_cluster_memberships",
-    "threat_cluster_snapshots",
-    "threat_clusters",
-    "threat_landscape_reports",
 )
 
 _UNIQUES = {
@@ -105,9 +77,6 @@ _UNIQUES = {
     ),
     "tags": (UniqueSpec("normalized_name", ("normalized_name",)),),
     "tag_categories": (UniqueSpec("name", ("name",)),),
-    "threat_cluster_snapshots": (
-        UniqueSpec("cluster_revision_prompt", ("cluster_id", "membership_revision", "prompt_version")),
-    ),
 }
 
 
@@ -120,9 +89,7 @@ class CouchDBStore(MongoDBStore):
     inherited from :class:`MongoDBStore`; see ``CouchDBCollection`` for how the
     required Mongo operations map onto CouchDB.
 
-    Atomic single-document updates use ``_rev`` compare-and-swap retries.  CouchDB has
-    no multi-document transactions, so the store relies on the same write journals
-    as the MongoDB backend for recoverable multi-document operations.
+    Atomic single-document updates use ``_rev`` compare-and-swap retries.
     """
 
     def __init__(

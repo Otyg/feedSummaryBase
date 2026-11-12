@@ -215,182 +215,38 @@ class NewsStore(Protocol):
 
     def initialize_default_categories(self) -> None: ...
 
-    # Long-term threat-landscape analysis
-    def list_articles_for_long_term(
-        self,
-        *,
-        after_fetched_at: int = 0,
-        after_article_id: str = "",
-        until_fetched_at: Optional[int] = None,
-        sources: Optional[List[str]] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]: ...
 
-    def get_long_term_cursor(self, profile_id: str) -> Dict[str, Any]: ...
 
-    def claim_long_term_lease(
-        self,
-        profile_id: str,
-        owner_id: str,
-        *,
-        now_ts: int,
-        lease_seconds: int,
-    ) -> bool: ...
 
-    def renew_long_term_lease(
-        self,
-        profile_id: str,
-        owner_id: str,
-        *,
-        now_ts: int,
-        lease_seconds: int,
-    ) -> bool: ...
 
-    def release_long_term_lease(self, profile_id: str, owner_id: str) -> bool: ...
 
-    def advance_long_term_cursor(
-        self,
-        profile_id: str,
-        owner_id: str,
-        *,
-        expected_fetched_at: int,
-        expected_article_id: str,
-        fetched_at: int,
-        article_id: str,
-        now_ts: int,
-    ) -> bool: ...
 
-    def get_threat_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]: ...
 
-    def list_threat_clusters(
-        self,
-        profile_id: str,
-        *,
-        statuses: Optional[List[str]] = None,
-        min_last_seen_ts: Optional[int] = None,
-        embedding_model: Optional[str] = None,
-        embedding_dimension: Optional[int] = None,
-        embedding_instruction: Optional[str] = None,
-        min_member_count: Optional[int] = None,
-        limit: int = 10000,
-        offset: int = 0,
-        include_vectors: bool = True,
-    ) -> List[Dict[str, Any]]: ...
 
-    def save_threat_cluster(
-        self,
-        cluster_doc: Dict[str, Any],
-        *,
-        expected_membership_revision: Optional[int] = None,
-    ) -> bool: ...
 
-    def resolve_threat_cluster_review(
-        self,
-        cluster_doc: Dict[str, Any],
-        *,
-        expected_membership_revision: int,
-    ) -> bool: ...
 
-    def get_cluster_membership(
-        self, profile_id: str, article_id: str
-    ) -> Optional[Dict[str, Any]]: ...
 
-    def list_article_cluster_memberships(
-        self, profile_id: str, article_id: str
-    ) -> List[Dict[str, Any]]: ...
 
-    def save_cluster_membership(self, membership_doc: Dict[str, Any]) -> bool: ...
 
-    def save_cluster_assignment(
-        self,
-        cluster_doc: Dict[str, Any],
-        membership_doc: Dict[str, Any],
-        *,
-        expected_membership_revision: Optional[int] = None,
-    ) -> bool: ...
 
-    def get_long_term_quarantine(
-        self, profile_id: str, article_id: str
-    ) -> Optional[Dict[str, Any]]: ...
 
-    def save_long_term_quarantine(self, quarantine_doc: Dict[str, Any]) -> bool: ...
 
-    def resolve_long_term_quarantine(
-        self, profile_id: str, article_id: str, *, resolved_at: int
-    ) -> bool: ...
 
-    def list_long_term_quarantine(
-        self,
-        profile_id: str,
-        *,
-        status: Optional[str] = None,
-        limit: int = 1000,
-    ) -> List[Dict[str, Any]]: ...
 
-    def list_cluster_memberships(
-        self, cluster_id: str, *, limit: int = 10000
-    ) -> List[Dict[str, Any]]: ...
 
-    def apply_cluster_reconciliation(
-        self, reconciliation_doc: Dict[str, Any]
-    ) -> bool: ...
 
-    def get_cluster_reconciliation(
-        self, reconciliation_id: str
-    ) -> Optional[Dict[str, Any]]: ...
 
-    def apply_cluster_membership_edit(self, edit_doc: Dict[str, Any]) -> bool: ...
 
-    def get_cluster_membership_edit(
-        self, edit_id: str
-    ) -> Optional[Dict[str, Any]]: ...
 
-    def save_cluster_snapshot(self, snapshot_doc: Dict[str, Any]) -> bool: ...
 
-    def save_cluster_snapshot_revision(
-        self,
-        cluster_doc: Dict[str, Any],
-        snapshot_doc: Dict[str, Any],
-        *,
-        expected_membership_revision: int,
-        expected_summarized_revision: int,
-    ) -> bool: ...
 
-    def get_cluster_snapshot(
-        self, snapshot_id: str
-    ) -> Optional[Dict[str, Any]]: ...
 
-    def list_cluster_snapshots(
-        self,
-        profile_id: str,
-        *,
-        cluster_id: Optional[str] = None,
-        limit: int = 1000,
-    ) -> List[Dict[str, Any]]: ...
 
-    def save_threat_landscape_report(self, report_doc: Dict[str, Any]) -> bool: ...
 
-    def get_threat_landscape_report(self, report_id: str) -> Optional[Dict[str, Any]]: ...
 
-    def list_threat_landscape_reports(
-        self, profile_id: str, *, limit: int = 100
-    ) -> List[Dict[str, Any]]: ...
 
-    def create_long_term_run(self, run_doc: Dict[str, Any]) -> bool: ...
 
-    def get_long_term_run(self, run_id: str) -> Optional[Dict[str, Any]]: ...
 
-    def list_long_term_runs(
-        self, profile_id: str, *, limit: int = 100
-    ) -> List[Dict[str, Any]]: ...
-
-    def update_long_term_run(
-        self,
-        run_id: str,
-        *,
-        expected_status: str,
-        fields: Dict[str, Any],
-    ) -> bool: ...
 
 
 def _expand_path(p: str) -> str:
