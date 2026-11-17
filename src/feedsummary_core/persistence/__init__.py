@@ -40,6 +40,7 @@ from feedsummary_core.persistence.CleanUpPolicy import CleanupPolicy
 from feedsummary_core.persistence.TinyDbStore import TinyDBStore
 from feedsummary_core.persistence.SqliteStore import SqliteStore
 from feedsummary_core.persistence.MongoDBStore import MongoDBStore
+from feedsummary_core.persistence.CouchDBStore import CouchDBStore
 from feedsummary_core.persistence.tag_relations import TagRelationError
 
 
@@ -63,6 +64,8 @@ class NewsStore(Protocol):
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
+        purpose: Optional[str] = None,
+        instruction: Optional[str] = None,
     ) -> bool: ...
 
     def list_unsummarized_articles(self, limit: int = 200) -> List[Dict[str, Any]]: ...
@@ -213,6 +216,39 @@ class NewsStore(Protocol):
     def initialize_default_categories(self) -> None: ...
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def _expand_path(p: str) -> str:
     expanded = os.path.expandvars(os.path.expanduser(p))
     return str(Path(expanded).resolve())
@@ -222,18 +258,21 @@ def create_store(cfg: Dict[str, Any]) -> NewsStore:
     """Instantiate the configured storage backend and ensure its parent path exists."""
 
     provider = (cfg.get("provider") or cfg.get("type") or "tinydb").lower()
+    initialize_schema = bool(cfg.get("initialize_schema", True))
 
     if provider == "tinydb":
         raw_path = cfg.get("path", "news_docs.json")
         path = _expand_path(raw_path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        if initialize_schema:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        elif not Path(path).is_file():
+            raise FileNotFoundError(f"TinyDB database does not exist: {path}")
         return TinyDBStore(path=path)  # type: ignore
 
     if provider in ("sqlite", "sqlite3"):
         raw_path = cfg.get("path", "news_docs.sqlite")
         path = _expand_path(raw_path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        return SqliteStore(path=path)  # type: ignore
+        return SqliteStore(path=path, initialize_schema=initialize_schema)  # type: ignore
 
     if provider in ("mongo", "mongodb"):
         return MongoDBStore(
@@ -241,7 +280,19 @@ def create_store(cfg: Dict[str, Any]) -> NewsStore:
             database=cfg.get("database") or cfg.get("database_name") or "feedsummary",
             client=cfg.get("client"),
             connect_timeout_ms=int(cfg.get("connect_timeout_ms", 5000)),
-            initialize_schema=bool(cfg.get("initialize_schema", True)),
+            initialize_schema=initialize_schema,
+        )  # type: ignore
+
+    if provider in ("couch", "couchdb"):
+        return CouchDBStore(
+            url=cfg.get("url") or cfg.get("uri") or "http://localhost:5984",
+            database=cfg.get("database") or cfg.get("database_name") or "feedsummary",
+            username=cfg.get("username") or os.environ.get("FEEDSUMMARY_COUCHDB_USER"),
+            password=cfg.get("password") or os.environ.get("FEEDSUMMARY_COUCHDB_PASSWORD"),
+            client=cfg.get("client"),
+            timeout=float(cfg.get("timeout", 30)),
+            verify_tls=bool(cfg.get("verify_tls", True)),
+            initialize_schema=initialize_schema,
         )  # type: ignore
 
     raise ValueError(f"Unsupported store provider: {provider}")

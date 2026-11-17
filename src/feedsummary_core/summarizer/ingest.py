@@ -65,6 +65,7 @@ from feedsummary_core.summarizer.helpers import (
 logger = logging.getLogger(__name__)
 
 _HTTP_USER_AGENT = "news-summarizer/2.1 (personal; rate-limited)"
+_DEFAULT_FEED_TIMEOUT_S = 20
 
 
 _TLS_MIN_VERSIONS = {
@@ -111,6 +112,14 @@ def _feed_http_client(feed_cfg: Dict[str, Any]) -> str:
             f"Ogiltig http_client {http_client!r}; tillåtna värden är 'aiohttp' och 'curl'"
         )
     return http_client
+
+
+def _feed_timeout_s(feed_cfg: Dict[str, Any]) -> int:
+    """Return the configured RSS request timeout in seconds."""
+    timeout_s = feed_cfg.get("feed_timeout_s", _DEFAULT_FEED_TIMEOUT_S)
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s <= 0:
+        raise ValueError("feed_timeout_s måste vara ett positivt heltal (sekunder)")
+    return timeout_s
 
 
 def _should_fetch_article_page(feed_cfg: Dict[str, Any]) -> bool:
@@ -257,22 +266,23 @@ async def fetch_rss(
     session: aiohttp.ClientSession,
     ssl_context: Optional[ssl.SSLContext] = None,
     http_client: str = "aiohttp",
+    timeout_s: int = _DEFAULT_FEED_TIMEOUT_S,
 ) -> feedparser.FeedParserDict:
     """Download and parse one RSS or Atom feed."""
 
     if http_client == "curl":
-        content = await _fetch_with_curl(feed_url, 20, ssl_context)
+        content = await _fetch_with_curl(feed_url, timeout_s, ssl_context)
         logger.info(f"{feed_url} hämtad med curl")
         return feedparser.parse(content)
 
     try:
-        content = await _fetch_rss_content(feed_url, session, ssl_context)
+        content = await _fetch_rss_content(feed_url, session, ssl_context, timeout_s)
     except aiohttp.ClientResponseError as error:
         if error.status != 403:
             raise
 
         tls_1_3_context = _feed_ssl_context({"tls_min_version": "1.3"})
-        content = await _fetch_with_curl(feed_url, 20, tls_1_3_context)
+        content = await _fetch_with_curl(feed_url, timeout_s, tls_1_3_context)
         _tls_1_3_config_warning(feed_url)
 
     return feedparser.parse(content)
@@ -282,11 +292,12 @@ async def _fetch_rss_content(
     feed_url: str,
     session: aiohttp.ClientSession,
     ssl_context: Optional[ssl.SSLContext],
+    timeout_s: int,
 ) -> bytes:
     """Download RSS bytes once with the supplied TLS context."""
     async with session.get(
         feed_url,
-        timeout=aiohttp.ClientTimeout(total=20),
+        timeout=aiohttp.ClientTimeout(total=timeout_s),
         **_request_ssl_kwargs(ssl_context),
     ) as resp:
         resp.raise_for_status()
@@ -519,7 +530,7 @@ async def gather_articles_to_store(
     config: Dict[str, Any],
     store: NewsStore,
     job_id: Optional[int] = None,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, List[str]]:
     """
     Ingest (RSS -> article text -> store)
 
@@ -527,6 +538,7 @@ async def gather_articles_to_store(
     - max_items_per_feed används fortfarande som safety cap.
     - Per-feed filter:
         category_include / category_exclude (matchar entry.tags[].term m.fl.)
+        feed_timeout_s (valfritt positivt heltal; timeout för RSS-hämtning)
         tls_min_version (valfritt, "1.2" eller "1.3")
         http_client (valfritt, "aiohttp" eller "curl")
         fetch_article (valfritt booleskt värde; false använder endast RSS-innehåll)
@@ -547,6 +559,7 @@ async def gather_articles_to_store(
 
     inserted = 0
     updated = 0
+    changed_article_ids: List[str] = []
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(
         headers=headers,
@@ -562,9 +575,10 @@ async def gather_articles_to_store(
             try:
                 ssl_context = _feed_ssl_context(f)
                 http_client = _feed_http_client(f)
+                feed_timeout_s = _feed_timeout_s(f)
                 fetch_article_page = _should_fetch_article_page(f)
                 logger.info(f"Hämtar RSS: {name}")
-                feed = await fetch_rss(feed_url, session, ssl_context, http_client)
+                feed = await fetch_rss(feed_url, session, ssl_context, http_client, feed_timeout_s)
             except Exception as e:
                 logger.warning(f"Kunde inte läsa RSS: {name} ({feed_url}) -> {e}")
                 continue
@@ -709,12 +723,14 @@ async def gather_articles_to_store(
                     if existing is None:
                         store.upsert_article(doc)
                         inserted += 1
+                        changed_article_ids.append(aid)
                     else:
                         if existing.get("content_hash") != chash:
                             store.upsert_article(doc)
                             updated += 1
+                            changed_article_ids.append(aid)
 
                 except Exception as e:
                     logger.warning("Fel vid sparande av artikel: %s -> %s", link, e)
     logger.info(f"Articles: {str(inserted)} inserted, {str(updated)} updated")
-    return inserted, updated
+    return inserted, updated, changed_article_ids

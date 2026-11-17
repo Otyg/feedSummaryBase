@@ -34,32 +34,93 @@ import asyncio
 import hashlib
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from feedsummary_core.summarizer.helpers import text_clip
 
 logger = logging.getLogger(__name__)
 
+SIMILARITY_EMBEDDING_PURPOSE = "similarity"
+TAGGING_EMBEDDING_PURPOSE = "tagging"
+SIMILARITY_EMBEDDING_INSTRUCTION = (
+    "Represent the specific real-world event described by this article."
+)
+TAGGING_EMBEDDING_INSTRUCTION = (
+    "Represent the topics, industries or sectors, type of information, subjects "
+    "and geographical regions discussed in this article."
+)
+DEFAULT_EMBEDDING_DIMENSIONS = 1024
+_ARTICLE_EMBEDDING_PURPOSES = {
+    SIMILARITY_EMBEDDING_PURPOSE,
+    TAGGING_EMBEDDING_PURPOSE,
+}
 
-def embedding_source_hash(text: str) -> str:
+
+def format_embedding_input(text: str, instruction: str = "") -> str:
+    """Format an instruction-aware Qwen3 embedding input."""
+    instruction = str(instruction or "").strip()
+    return f"Instruct: {instruction}\nQuery:{text}" if instruction else str(text)
+
+
+def embedding_source_hash(text: str, instruction: str = "") -> str:
     """Return a stable fingerprint for the exact text sent to the embedding model."""
-    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+    return hashlib.sha256(format_embedding_input(text, instruction).encode("utf-8")).hexdigest()
+
+
+def _embedding_field(purpose: Optional[str], suffix: str) -> str:
+    if purpose is None:
+        return f"embedding_{suffix}"
+    normalized = str(purpose).strip().lower()
+    if normalized not in _ARTICLE_EMBEDDING_PURPOSES:
+        raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+    return f"{normalized}_embedding_{suffix}"
+
+
+async def _embed_with_options(
+    embed: Callable[..., Awaitable[List[float]]],
+    text: str,
+    *,
+    instruction: str,
+    dimensions: int,
+) -> List[float]:
+    """Call the extended API, retaining support for older text-only clients."""
+    try:
+        return await embed(text, instruction=instruction, dimensions=dimensions)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return await embed(format_embedding_input(text, instruction))
 
 
 def cached_embedding(
     document: dict,
     text: str,
     embedding_model: str = "",
+    *,
+    purpose: Optional[str] = None,
+    instruction: str = "",
+    dimensions: Optional[int] = None,
 ) -> Optional[List[float]]:
     """Return a persisted embedding only when its model and source text still match."""
-    vector = document.get("embedding_vector")
+    vector = document.get(_embedding_field(purpose, "vector"))
     if not isinstance(vector, list) or not vector:
         return None
     if not all(isinstance(value, (int, float)) for value in vector):
         return None
-    if document.get("embedding_source_hash") != embedding_source_hash(text):
+    if dimensions is not None and len(vector) != int(dimensions):
         return None
-    if str(document.get("embedding_model") or "") != str(embedding_model or ""):
+    if document.get(_embedding_field(purpose, "source_hash")) != embedding_source_hash(
+        text, instruction
+    ):
+        return None
+    if str(document.get(_embedding_field(purpose, "model")) or "") != str(
+        embedding_model or ""
+    ):
+        return None
+    if purpose is not None and str(
+        document.get(_embedding_field(purpose, "instruction")) or ""
+    ) != str(instruction or "").strip():
         return None
     return [float(value) for value in vector]
 
@@ -76,26 +137,50 @@ def article_embedding_text(article: dict, embedding_text_chars: int = 2000) -> s
 
 async def ensure_article_embedding(
     article: dict,
-    embed: Callable[[str], Awaitable[List[float]]],
+    embed: Callable[..., Awaitable[List[float]]],
     *,
     store: Any,
     embedding_model: str,
     embedding_text_chars: int = 2000,
+    purpose: str = TAGGING_EMBEDDING_PURPOSE,
+    instruction: str = TAGGING_EMBEDDING_INSTRUCTION,
+    dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
 ) -> Optional[List[float]]:
-    """Reuse or create the canonical embedding and persist it on the article."""
+    """Reuse or create one purpose-specific article embedding and persist it."""
     text = article_embedding_text(article, embedding_text_chars)
     if not text:
         return None
-    persisted = cached_embedding(article, text, embedding_model)
+    persisted = cached_embedding(
+        article,
+        text,
+        embedding_model,
+        purpose=purpose,
+        instruction=instruction,
+        dimensions=dimensions,
+    )
     if persisted is not None:
         return persisted
     try:
-        vector = await embed(text)
+        vector = await _embed_with_options(
+            embed,
+            text,
+            instruction=instruction,
+            dimensions=dimensions,
+        )
         if not vector or not all(isinstance(value, (int, float)) for value in vector):
             return None
         normalized = [float(value) for value in vector]
+        if len(normalized) != dimensions:
+            logger.warning(
+                "Fel embeddingdimension för artikel %s/%s: väntade %d, fick %d",
+                article.get("id"),
+                purpose,
+                dimensions,
+                len(normalized),
+            )
+            return None
         article_id = str(article.get("id") or "").strip()
-        source_hash = embedding_source_hash(text)
+        source_hash = embedding_source_hash(text, instruction)
         update_embedding = getattr(store, "update_article_embedding", None)
         if article_id and callable(update_embedding):
             update_embedding(
@@ -103,12 +188,16 @@ async def ensure_article_embedding(
                 normalized,
                 model=embedding_model,
                 source_hash=source_hash,
+                purpose=purpose,
+                instruction=instruction,
             )
+        prefix = f"{purpose}_embedding"
         article.update(
             {
-                "embedding_vector": normalized,
-                "embedding_model": embedding_model,
-                "embedding_source_hash": source_hash,
+                f"{prefix}_vector": normalized,
+                f"{prefix}_model": embedding_model,
+                f"{prefix}_source_hash": source_hash,
+                f"{prefix}_instruction": instruction.strip(),
             }
         )
         return normalized
@@ -252,48 +341,81 @@ def _batch_similarity_groups(
 
 async def group_articles_by_similarity(
     articles: List[dict],
-    embed: Callable[[str], Awaitable[List[float]]],
+    embed: Callable[..., Awaitable[List[float]]],
     *,
     embedding_text_chars: int = 2000,
     similarity_threshold: float = 0.78,
     max_concurrency: int = 4,
     store: Any = None,
     embedding_model: str = "",
+    embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    similarity_instruction: str = SIMILARITY_EMBEDDING_INSTRUCTION,
+    tagging_instruction: str = TAGGING_EMBEDDING_INSTRUCTION,
 ) -> List[List[dict]]:
-    """Embed articles and return stable groups that likely describe the same story."""
+    """Persist both article vectors and group on the event/similarity vector."""
     embedding_inputs: List[str] = []
     for article in articles:
         embedding_inputs.append(article_embedding_text(article, embedding_text_chars))
 
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def embed_one(article: dict, text: str) -> Optional[List[float]]:
+    async def embed_one(
+        article: dict,
+        text: str,
+        purpose: str,
+        instruction: str,
+    ) -> Optional[List[float]]:
         if not text:
             return None
-        persisted = cached_embedding(article, text, embedding_model)
+        persisted = cached_embedding(
+            article,
+            text,
+            embedding_model,
+            purpose=purpose,
+            instruction=instruction,
+            dimensions=embedding_dimensions,
+        )
         if persisted is not None:
             return persisted
         try:
             async with semaphore:
-                vector = await embed(text)
+                vector = await _embed_with_options(
+                    embed,
+                    text,
+                    instruction=instruction,
+                    dimensions=embedding_dimensions,
+                )
             if vector and all(isinstance(value, (int, float)) for value in vector):
                 normalized = [float(value) for value in vector]
+                if len(normalized) != embedding_dimensions:
+                    logger.warning(
+                        "Fel embeddingdimension för artikel %s/%s: väntade %d, fick %d",
+                        article.get("id"),
+                        purpose,
+                        embedding_dimensions,
+                        len(normalized),
+                    )
+                    return None
                 article_id = str(article.get("id") or "").strip()
                 update_embedding = getattr(store, "update_article_embedding", None)
                 if article_id and callable(update_embedding):
                     try:
-                        source_hash = embedding_source_hash(text)
+                        source_hash = embedding_source_hash(text, instruction)
                         update_embedding(
                             article_id,
                             normalized,
                             model=embedding_model,
                             source_hash=source_hash,
+                            purpose=purpose,
+                            instruction=instruction,
                         )
+                        prefix = f"{purpose}_embedding"
                         article.update(
                             {
-                                "embedding_vector": normalized,
-                                "embedding_model": embedding_model,
-                                "embedding_source_hash": source_hash,
+                                f"{prefix}_vector": normalized,
+                                f"{prefix}_model": embedding_model,
+                                f"{prefix}_source_hash": source_hash,
+                                f"{prefix}_instruction": instruction.strip(),
                             }
                         )
                     except Exception as exc:
@@ -307,9 +429,21 @@ async def group_articles_by_similarity(
             logger.warning("Kunde inte skapa artikel-embedding: %s", exc)
         return None
 
-    embeddings = await asyncio.gather(
-        *(embed_one(article, text) for article, text in zip(articles, embedding_inputs))
-    )
+    similarity_tasks = [
+        embed_one(
+            article,
+            text,
+            SIMILARITY_EMBEDDING_PURPOSE,
+            similarity_instruction,
+        )
+        for article, text in zip(articles, embedding_inputs)
+    ]
+    tagging_tasks = [
+        embed_one(article, text, TAGGING_EMBEDDING_PURPOSE, tagging_instruction)
+        for article, text in zip(articles, embedding_inputs)
+    ]
+    all_embeddings = await asyncio.gather(*(similarity_tasks + tagging_tasks))
+    embeddings = all_embeddings[: len(articles)]
     usable = sum(vector is not None for vector in embeddings)
     if usable < 2:
         logger.warning(
@@ -331,7 +465,7 @@ async def group_articles_by_similarity(
 
 async def batch_articles_by_similarity(
     articles: List[dict],
-    embed: Callable[[str], Awaitable[List[float]]],
+    embed: Callable[..., Awaitable[List[float]]],
     *,
     max_chars_per_batch: int,
     max_articles_per_batch: int,
@@ -341,6 +475,9 @@ async def batch_articles_by_similarity(
     max_concurrency: int = 4,
     store: Any = None,
     embedding_model: str = "",
+    embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    similarity_instruction: str = SIMILARITY_EMBEDDING_INSTRUCTION,
+    tagging_instruction: str = TAGGING_EMBEDDING_INSTRUCTION,
 ) -> List[List[dict]]:
     """Embed articles, group likely duplicate stories, and create bounded batches."""
     clipped: List[dict] = []
@@ -357,6 +494,9 @@ async def batch_articles_by_similarity(
         max_concurrency=max_concurrency,
         store=store,
         embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+        similarity_instruction=similarity_instruction,
+        tagging_instruction=tagging_instruction,
     )
     return _batch_similarity_groups(
         groups,
@@ -655,6 +795,29 @@ def _compact_article_block(a: dict, *, idx: int) -> str:
         head += f" ({source})"
     if url:
         head += f" {url}"
+
+    enrichment = a.get("_summary_enrichment")
+    if isinstance(enrichment, dict):
+        matched_tags = ", ".join(
+            str(tag).strip()
+            for tag in enrichment.get("matched_tags") or []
+            if str(tag).strip()
+        )
+        published_ts = a.get("published_ts")
+        published_date = ""
+        if isinstance(published_ts, int) and published_ts > 0:
+            published_date = datetime.fromtimestamp(
+                published_ts, tz=timezone.utc
+            ).strftime("%Y-%m-%d")
+        details = [
+            "BERIKANDE SÅRBARHETSUNDERLAG",
+            "kan vara äldre än rapportens tidsfönster",
+        ]
+        if published_date:
+            details.append(f"publicerad {published_date}")
+        if matched_tags:
+            details.append(f"matchande tagg: {matched_tags}")
+        head += "\nMATERIALROLL: " + "; ".join(details)
 
     if text:
         return f"{head}\n{text}"

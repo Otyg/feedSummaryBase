@@ -2,6 +2,8 @@ import asyncio
 import unittest
 
 from feedsummary_core.summarizer.batching import (
+    SIMILARITY_EMBEDDING_INSTRUCTION,
+    TAGGING_EMBEDDING_INSTRUCTION,
     batch_articles_by_similarity,
     embedding_source_hash,
 )
@@ -14,16 +16,19 @@ class SimilarityBatchingTests(unittest.TestCase):
                 "id": "cached",
                 "title": "Cached",
                 "text": "first",
-                "embedding_vector": [1.0, 0.0],
-                "embedding_model": "embedding-model",
-                "embedding_source_hash": embedding_source_hash("Cached\n\nfirst"),
+                "similarity_embedding_vector": [1.0, 0.0],
+                "similarity_embedding_model": "embedding-model",
+                "similarity_embedding_instruction": SIMILARITY_EMBEDDING_INSTRUCTION,
+                "similarity_embedding_source_hash": embedding_source_hash(
+                    "Cached\n\nfirst", SIMILARITY_EMBEDDING_INSTRUCTION
+                ),
             },
             {"id": "new", "title": "New", "text": "second"},
         ]
         embed_calls = []
 
-        async def embed(text):
-            embed_calls.append(text)
+        async def embed(text, *, instruction, dimensions):
+            embed_calls.append((text, instruction, dimensions))
             return [0.99, 0.01]
 
         class Store:
@@ -44,12 +49,21 @@ class SimilarityBatchingTests(unittest.TestCase):
                 similarity_threshold=0.9,
                 store=store,
                 embedding_model="embedding-model",
+                embedding_dimensions=2,
             )
         )
 
-        self.assertEqual(["New\n\nsecond"], embed_calls)
-        self.assertEqual("new", store.updates[0][0])
-        self.assertEqual("embedding-model", store.updates[0][2]["model"])
+        self.assertEqual(3, len(embed_calls))
+        self.assertEqual(
+            {SIMILARITY_EMBEDDING_INSTRUCTION, TAGGING_EMBEDDING_INSTRUCTION},
+            {call[1] for call in embed_calls},
+        )
+        self.assertTrue(all(call[2] == 2 for call in embed_calls))
+        self.assertEqual({"cached", "new"}, {update[0] for update in store.updates})
+        self.assertEqual(
+            {"similarity", "tagging"},
+            {update[2]["purpose"] for update in store.updates},
+        )
 
     def test_similar_articles_are_kept_in_the_same_batch(self):
         articles = [
@@ -63,7 +77,7 @@ class SimilarityBatchingTests(unittest.TestCase):
             "Alpha follow-up\n\nthird": [0.99, 0.01],
         }
 
-        async def embed(text):
+        async def embed(text, **_kwargs):
             return vectors[text]
 
         batches = asyncio.run(
@@ -73,6 +87,7 @@ class SimilarityBatchingTests(unittest.TestCase):
                 max_chars_per_batch=10000,
                 max_articles_per_batch=2,
                 similarity_threshold=0.9,
+                embedding_dimensions=2,
             )
         )
 
@@ -83,7 +98,7 @@ class SimilarityBatchingTests(unittest.TestCase):
             {"id": str(index), "title": f"Story {index}", "text": "same"} for index in range(3)
         ]
 
-        async def embed(_text):
+        async def embed(_text, **_kwargs):
             return [1.0, 0.0]
 
         batches = asyncio.run(
@@ -93,6 +108,7 @@ class SimilarityBatchingTests(unittest.TestCase):
                 max_chars_per_batch=10000,
                 max_articles_per_batch=2,
                 similarity_threshold=0.9,
+                embedding_dimensions=2,
             )
         )
 
@@ -104,7 +120,7 @@ class SimilarityBatchingTests(unittest.TestCase):
             {"id": "b", "title": "Two", "text": "second"},
         ]
 
-        async def embed(_text):
+        async def embed(_text, **_kwargs):
             return []
 
         batches = asyncio.run(
@@ -113,6 +129,7 @@ class SimilarityBatchingTests(unittest.TestCase):
                 embed,
                 max_chars_per_batch=10000,
                 max_articles_per_batch=1,
+                embedding_dimensions=2,
             )
         )
 

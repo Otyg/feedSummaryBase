@@ -217,6 +217,25 @@ class CveCategoryTests(unittest.TestCase):
         self.assertEqual(2, len(regular_tags))
         self.assertEqual(4, len(selected))
 
+    def test_default_article_limit_selects_twenty_regular_tags(self):
+        names = (
+            "amber beacon cobalt delta emerald falcon glacier harbor ivory juniper "
+            "kestrel lantern meadow nebula orchard phoenix quartz river summit timber "
+            "umbra violet"
+        ).split()
+        client = FakeTaggingClient(
+            [{"tag": name, "type": "NAMED_ENTITY", "category": "DOMAIN_ENTITY"}
+             for name in names]
+        )
+        selected = asyncio.run(
+            self.manager.generate_tags_for_article(
+                llm_client=client,
+                article={"id": "article-20", "title": " ".join(names)},
+                config={},
+            )
+        )
+        self.assertEqual(20, len(selected))
+
     def test_direct_cve_extraction_survives_llm_failure_and_zero_limit(self):
         selected = asyncio.run(
             self.manager.generate_tags_for_article(

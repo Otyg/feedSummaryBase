@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from feedsummary_core.summarizer.tagging_integration import tag_articles
+from feedsummary_core.summarizer.tagging_integration import (
+    _merge_ml_and_llm_tags,
+    tag_articles,
+    tag_articles_safe,
+)
 from feedsummary_core.tagging_ml.embedding_sgd import EmbeddingClassifierSettings
 
 
@@ -53,6 +57,31 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "reasoning": "LLM prediction",
         }
 
+    def test_strict_provider_drops_ml_tag_not_approved_by_llm(self):
+        self.assertEqual(
+            [self.llm_tag],
+            _merge_ml_and_llm_tags(
+                [self.ml_tag],
+                [self.llm_tag],
+                allow_new_tags=False,
+            ),
+        )
+
+    @patch(
+        "feedsummary_core.summarizer.tagging_integration.tag_articles",
+        new_callable=AsyncMock,
+        return_value={"article-1": [{"id": 1}]},
+    )
+    async def test_automatic_tagging_uses_configured_article_limit(self, tag_articles_mock):
+        count = await tag_articles_safe(
+            self.store,
+            object(),
+            ["article-1"],
+            {"tagging": {"article_max_tags": 20}},
+        )
+        self.assertEqual(1, count)
+        self.assertEqual(20, tag_articles_mock.await_args.kwargs["max_tags_per_article"])
+
     @patch(
         "feedsummary_core.summarizer.tagging_integration.TagManager.generate_tags_for_article",
         new_callable=AsyncMock,
@@ -77,9 +106,7 @@ class MlTaggingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         "feedsummary_core.summarizer.tagging_integration.EmbeddingClassifierTagger.score_names",
         return_value=[("acme", 0.95), ("globex", 0.7)],
     )
-    @patch(
-        "feedsummary_core.summarizer.tagging_integration.EmbeddingClassifierTagger.predict_tags"
-    )
+    @patch("feedsummary_core.summarizer.tagging_integration.EmbeddingClassifierTagger.predict_tags")
     async def test_ml_category_is_merged_without_excluding_it_from_llm(
         self,
         predict_tags,

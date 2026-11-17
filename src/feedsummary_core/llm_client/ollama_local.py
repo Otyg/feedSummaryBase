@@ -57,7 +57,8 @@ class OllamaConfig:
 
     base_url: str = "http://localhost:11434"
     model: str = "gemma3:1b"
-    embedding_model: str = "embeddinggemma:latest"  # Model for embeddings
+    embedding_model: str = "qwen3-embedding:0.6b"  # Model for embeddings
+    embedding_dimensions: int = 1024
     max_rps: float = 1.0
 
     # Hur länge vi kan vänta på att Ollama börjar svara (första bytes/headers).
@@ -72,6 +73,7 @@ class OllamaConfig:
 
     # Retry
     max_retries: int = 3
+    default_max_output_tokens: Optional[int] = None
 
 
 class OllamaLocalClient:
@@ -151,22 +153,45 @@ class OllamaLocalClient:
         ),
         reraise=True,
     )
-    async def chat(self, messages: List[Dict[str, str]], *, temperature: float = 0.2) -> str:
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: Optional[int] = None,
+        response_format: str | Dict[str, Any] | None = None,
+    ) -> str:
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive")
+
         await self._rate_gate()
         session = await self._get_session()
+
+        effective_max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else self.cfg.default_max_output_tokens
+        )
+        options = {"temperature": temperature}
+        if effective_max_output_tokens is not None:
+            options["num_predict"] = int(effective_max_output_tokens)
 
         payload = {
             "model": self.cfg.model,
             "messages": messages,
             "stream": True,
-            "options": {"temperature": temperature},
+            "options": options,
         }
+        if response_format is not None:
+            payload["format"] = response_format
 
         url = f"{self.cfg.base_url.rstrip('/')}/api/chat"
         self.log.info("LLM request start (model=%s)", self.cfg.model)
 
         chunks: List[str] = []
         total_chars = 0
+        prompt_tokens = None
+        output_tokens = None
 
         # Här kan vi sätta en *extra* “first byte timeout” på requesten,
         # men vi håller oss till session timeout + max(...) för enkelhet.
@@ -210,13 +235,32 @@ class OllamaLocalClient:
                         last_log = now
 
                     if data.get("done") is True:
+                        prompt_tokens = data.get("prompt_eval_count")
+                        output_tokens = data.get("eval_count")
                         break
 
         text = "".join(chunks).strip()
-        self.log.info("LLM request done (chars=%d)", len(text))
+        total_tokens = None
+        if isinstance(prompt_tokens, int) and isinstance(output_tokens, int):
+            total_tokens = prompt_tokens + output_tokens
+        self.log.info(
+            "LLM request done (model=%s prompt_tokens=%s output_tokens=%s "
+            "total_tokens=%s chars=%d)",
+            self.cfg.model,
+            prompt_tokens,
+            output_tokens,
+            total_tokens,
+            len(text),
+        )
         return text
 
-    async def embed(self, text: str) -> List[float]:
+    async def embed(
+        self,
+        text: str,
+        *,
+        instruction: str = "",
+        dimensions: Optional[int] = None,
+    ) -> List[float]:
         """
         Generate embeddings for a given text using the embedding model.
 
@@ -232,9 +276,16 @@ class OllamaLocalClient:
         await self._rate_gate()
         session = await self._get_session()
 
+        requested_dimensions = int(dimensions or self.cfg.embedding_dimensions)
+        embedding_input = (
+            f"Instruct: {instruction.strip()}\nQuery:{text}"
+            if instruction.strip()
+            else text
+        )
         payload = {
             "model": self.cfg.embedding_model,
-            "input": text,
+            "input": embedding_input,
+            "dimensions": requested_dimensions,
         }
 
         url = f"{self.cfg.base_url.rstrip('/')}/api/embed"
@@ -253,7 +304,19 @@ class OllamaLocalClient:
                     
                     # Ollama returns a list of embeddings, take the first one
                     if embeddings and len(embeddings) > 0:
-                        return list(embeddings[0]) if isinstance(embeddings[0], (list, tuple)) else []
+                        vector = (
+                            list(embeddings[0])
+                            if isinstance(embeddings[0], (list, tuple))
+                            else []
+                        )
+                        if vector and len(vector) != requested_dimensions:
+                            self.log.error(
+                                "Embedding dimension mismatch: requested=%d received=%d",
+                                requested_dimensions,
+                                len(vector),
+                            )
+                            return []
+                        return vector
                     
                     return []
         except Exception as e:

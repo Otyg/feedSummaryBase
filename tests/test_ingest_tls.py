@@ -4,10 +4,13 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
+import feedparser
 
+from feedsummary_core.summarizer import ingest
 from feedsummary_core.summarizer.ingest import (
     _feed_http_client,
     _feed_ssl_context,
+    _feed_timeout_s,
     fetch_article_html,
     fetch_rss,
 )
@@ -80,6 +83,14 @@ class FeedTlsConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "http_client"):
             _feed_http_client({"http_client": "requests"})
 
+    def test_feed_timeout_defaults_to_20_seconds(self):
+        self.assertEqual(20, _feed_timeout_s({}))
+
+    def test_feed_timeout_rejects_invalid_values(self):
+        for value in (0, -1, 1.5, True, "90"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "feed_timeout_s"):
+                _feed_timeout_s({"feed_timeout_s": value})
+
 
 class FeedTlsRequestTests(unittest.TestCase):
     def test_rss_request_receives_configured_context(self):
@@ -117,6 +128,17 @@ class FeedTlsRequestTests(unittest.TestCase):
 
         self.assertNotIn("ssl", session.calls[0][1])
 
+    def test_rss_request_uses_configured_timeout(self):
+        response = FakeResponse(
+            b"<rss version='2.0'><channel><title>Test</title></channel></rss>",
+            "application/rss+xml",
+        )
+        session = FakeSession(response)
+
+        asyncio.run(fetch_rss("https://example.com/feed.xml", session, timeout_s=90))
+
+        self.assertEqual(90, session.calls[0][1]["timeout"].total)
+
     @patch(
         "feedsummary_core.summarizer.ingest._fetch_with_curl",
         new_callable=AsyncMock,
@@ -129,10 +151,12 @@ class FeedTlsRequestTests(unittest.TestCase):
         session = FakeSession(forbidden)
 
         with self.assertLogs("feedsummary_core.summarizer.ingest", level="WARNING") as logs:
-            asyncio.run(fetch_rss("https://example.com/feed.xml", session))
+            asyncio.run(fetch_rss("https://example.com/feed.xml", session, timeout_s=90))
 
         self.assertEqual(1, len(session.calls))
         self.assertNotIn("ssl", session.calls[0][1])
+        self.assertEqual(90, session.calls[0][1]["timeout"].total)
+        self.assertEqual(90, curl_fetch.await_args.args[1])
         retry_context = curl_fetch.await_args.args[2]
         self.assertEqual(ssl.TLSVersion.TLSv1_3, retry_context.minimum_version)
         self.assertIn('http_client: "curl"', " ".join(logs.output))
@@ -187,6 +211,36 @@ class FeedTlsRequestTests(unittest.TestCase):
             20,
             context,
         )
+
+    @patch(
+        "feedsummary_core.summarizer.ingest._fetch_with_curl",
+        new_callable=AsyncMock,
+    )
+    def test_configured_curl_uses_feed_timeout(self, curl_fetch):
+        curl_fetch.return_value = b"<rss version='2.0'><channel /></rss>"
+
+        asyncio.run(
+            fetch_rss(
+                "https://example.com/feed.xml", FakeSession(), http_client="curl", timeout_s=90
+            )
+        )
+
+        curl_fetch.assert_awaited_once_with("https://example.com/feed.xml", 90, None)
+
+
+class FeedTimeoutConfigTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ingest_passes_feed_timeout_to_rss_fetch(self):
+        feed = {
+            "name": "Slow feed",
+            "url": "https://example.com/feed.xml",
+            "feed_timeout_s": 90,
+        }
+        fetch = AsyncMock(return_value=feedparser.FeedParserDict({"entries": []}))
+
+        with patch.object(ingest, "fetch_rss", new=fetch):
+            await ingest.gather_articles_to_store({"feeds": [feed]}, object())
+
+        self.assertEqual(90, fetch.await_args.args[4])
 
 
 if __name__ == "__main__":

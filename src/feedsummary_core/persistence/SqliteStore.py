@@ -110,16 +110,21 @@ class SqliteStore:
         path: str = "news_docs.sqlite",
         *,
         pragmas: Optional[Dict[str, str]] = None,
+        initialize_schema: bool = True,
     ):
         self.path = str(Path(path))
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        if initialize_schema:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        elif not Path(self.path).is_file():
+            raise FileNotFoundError(f"SQLite database does not exist: {self.path}")
         self._pragmas = pragmas or {
             "journal_mode": "WAL",
             "synchronous": "NORMAL",
             "temp_store": "MEMORY",
             "foreign_keys": "ON",
         }
-        self._init_db()
+        if initialize_schema:
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path)
@@ -147,10 +152,16 @@ class SqliteStore:
                     content_hash  TEXT,
                     summarized    INTEGER DEFAULT 0,
                     summarized_at INTEGER,
-                    embedding_vector TEXT,
-                    embedding_model TEXT,
-                    embedding_source_hash TEXT,
-                    embedding_updated_at INTEGER,
+                    similarity_embedding_vector TEXT,
+                    similarity_embedding_model TEXT,
+                    similarity_embedding_source_hash TEXT,
+                    similarity_embedding_instruction TEXT,
+                    similarity_embedding_updated_at INTEGER,
+                    tagging_embedding_vector TEXT,
+                    tagging_embedding_model TEXT,
+                    tagging_embedding_source_hash TEXT,
+                    tagging_embedding_instruction TEXT,
+                    tagging_embedding_updated_at INTEGER,
                     doc_json      TEXT NOT NULL
                 );
 
@@ -162,6 +173,9 @@ class SqliteStore:
 
                 CREATE INDEX IF NOT EXISTS idx_articles_fetched_at
                   ON articles(fetched_at);
+
+                CREATE INDEX IF NOT EXISTS idx_articles_viewer_ts
+                  ON articles(COALESCE(NULLIF(published_ts, 0), fetched_at, 0), id);
 
                 CREATE TABLE IF NOT EXISTS summary_docs (
                     id       TEXT PRIMARY KEY,
@@ -245,16 +259,23 @@ class SqliteStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_articles_url
                     ON articles(url)
                     WHERE url IS NOT NULL AND url != '';
+
                 """
             )
 
             # Add embedding cache columns to databases created by older versions.
             migrations = {
                 "articles": {
-                    "embedding_vector": "TEXT",
-                    "embedding_model": "TEXT",
-                    "embedding_source_hash": "TEXT",
-                    "embedding_updated_at": "INTEGER",
+                    "similarity_embedding_vector": "TEXT",
+                    "similarity_embedding_model": "TEXT",
+                    "similarity_embedding_source_hash": "TEXT",
+                    "similarity_embedding_instruction": "TEXT",
+                    "similarity_embedding_updated_at": "INTEGER",
+                    "tagging_embedding_vector": "TEXT",
+                    "tagging_embedding_model": "TEXT",
+                    "tagging_embedding_source_hash": "TEXT",
+                    "tagging_embedding_instruction": "TEXT",
+                    "tagging_embedding_updated_at": "INTEGER",
                 },
                 "tags": {
                     "embedding_model": "TEXT",
@@ -306,6 +327,16 @@ class SqliteStore:
                 "embedding_model",
                 "embedding_source_hash",
                 "embedding_updated_at",
+                "similarity_embedding_vector",
+                "similarity_embedding_model",
+                "similarity_embedding_source_hash",
+                "similarity_embedding_instruction",
+                "similarity_embedding_updated_at",
+                "tagging_embedding_vector",
+                "tagging_embedding_model",
+                "tagging_embedding_source_hash",
+                "tagging_embedding_instruction",
+                "tagging_embedding_updated_at",
             ):
                 if field not in doc and field in existing_doc:
                     doc[field] = existing_doc[field]
@@ -320,13 +351,19 @@ class SqliteStore:
 
         summarized = 1 if bool(doc.get("summarized")) else 0
         summarized_at = _safe_int(doc.get("summarized_at"), 0) or None
-        embedding_vector = doc.get("embedding_vector")
-        embedding_json = (
-            _json_dumps(embedding_vector) if isinstance(embedding_vector, list) else None
-        )
-        embedding_model = str(doc.get("embedding_model") or "") or None
-        embedding_source_hash = str(doc.get("embedding_source_hash") or "") or None
-        embedding_updated_at = _safe_int(doc.get("embedding_updated_at"), 0) or None
+        embedding_values: list[Any] = []
+        for purpose in ("similarity", "tagging"):
+            prefix = f"{purpose}_embedding"
+            vector = doc.get(f"{prefix}_vector")
+            embedding_values.extend(
+                (
+                    _json_dumps(vector) if isinstance(vector, list) else None,
+                    str(doc.get(f"{prefix}_model") or "") or None,
+                    str(doc.get(f"{prefix}_source_hash") or "") or None,
+                    str(doc.get(f"{prefix}_instruction") or "") or None,
+                    _safe_int(doc.get(f"{prefix}_updated_at"), 0) or None,
+                )
+            )
 
         doc_json = _json_dumps(doc)
 
@@ -336,11 +373,16 @@ class SqliteStore:
                 """
                 INSERT INTO articles (
                     id, url, source, title, published, published_ts, fetched_at,
-                    content_hash, summarized, summarized_at, embedding_vector,
-                    embedding_model, embedding_source_hash, embedding_updated_at,
+                    content_hash, summarized, summarized_at,
+                    similarity_embedding_vector, similarity_embedding_model,
+                    similarity_embedding_source_hash, similarity_embedding_instruction,
+                    similarity_embedding_updated_at,
+                    tagging_embedding_vector, tagging_embedding_model,
+                    tagging_embedding_source_hash, tagging_embedding_instruction,
+                    tagging_embedding_updated_at,
                     doc_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     url=excluded.url,
                     source=excluded.source,
@@ -351,10 +393,16 @@ class SqliteStore:
                     content_hash=excluded.content_hash,
                     summarized=excluded.summarized,
                     summarized_at=excluded.summarized_at,
-                    embedding_vector=excluded.embedding_vector,
-                    embedding_model=excluded.embedding_model,
-                    embedding_source_hash=excluded.embedding_source_hash,
-                    embedding_updated_at=excluded.embedding_updated_at,
+                    similarity_embedding_vector=excluded.similarity_embedding_vector,
+                    similarity_embedding_model=excluded.similarity_embedding_model,
+                    similarity_embedding_source_hash=excluded.similarity_embedding_source_hash,
+                    similarity_embedding_instruction=excluded.similarity_embedding_instruction,
+                    similarity_embedding_updated_at=excluded.similarity_embedding_updated_at,
+                    tagging_embedding_vector=excluded.tagging_embedding_vector,
+                    tagging_embedding_model=excluded.tagging_embedding_model,
+                    tagging_embedding_source_hash=excluded.tagging_embedding_source_hash,
+                    tagging_embedding_instruction=excluded.tagging_embedding_instruction,
+                    tagging_embedding_updated_at=excluded.tagging_embedding_updated_at,
                     doc_json=excluded.doc_json
                 """,
                 (
@@ -368,13 +416,31 @@ class SqliteStore:
                     content_hash,
                     summarized,
                     summarized_at,
-                    embedding_json,
-                    embedding_model,
-                    embedding_source_hash,
-                    embedding_updated_at,
+                    *embedding_values,
                     doc_json,
                 ),
             )
+            existing_columns = {
+                str(column["name"])
+                for column in con.execute("PRAGMA table_info(articles)").fetchall()
+            }
+            if "embedding_vector" in existing_columns:
+                con.execute(
+                    """
+                    UPDATE articles SET embedding_vector = ?, embedding_model = ?,
+                        embedding_source_hash = ?, embedding_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        _json_dumps(doc.get("embedding_vector"))
+                        if isinstance(doc.get("embedding_vector"), list)
+                        else None,
+                        str(doc.get("embedding_model") or "") or None,
+                        str(doc.get("embedding_source_hash") or "") or None,
+                        _safe_int(doc.get("embedding_updated_at"), 0) or None,
+                        aid,
+                    ),
+                )
             con.commit()
         finally:
             con.close()
@@ -386,8 +452,10 @@ class SqliteStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
+        purpose: Optional[str] = None,
+        instruction: Optional[str] = None,
     ) -> bool:
-        """Persist a reusable embedding for an existing article."""
+        """Persist a purpose-specific embedding for an existing article."""
         if not article_id or not embedding_vector or not all(
             isinstance(value, (int, float)) for value in embedding_vector
         ):
@@ -396,36 +464,80 @@ class SqliteStore:
         updated_at = _now_ts()
         con = self._connect()
         try:
+            existing_columns = {
+                str(column["name"])
+                for column in con.execute("PRAGMA table_info(articles)").fetchall()
+            }
             row = con.execute(
                 "SELECT doc_json FROM articles WHERE id = ?", (str(article_id),)
             ).fetchone()
             if not row:
                 return False
             doc = _json_loads(row["doc_json"]) or {}
-            doc.update(
-                {
-                    "embedding_vector": normalized,
-                    "embedding_model": str(model or ""),
-                    "embedding_source_hash": str(source_hash or ""),
-                    "embedding_updated_at": updated_at,
-                }
-            )
-            con.execute(
-                """
-                UPDATE articles
-                SET embedding_vector = ?, embedding_model = ?,
-                    embedding_source_hash = ?, embedding_updated_at = ?, doc_json = ?
-                WHERE id = ?
-                """,
-                (
-                    _json_dumps(normalized),
-                    str(model or ""),
-                    str(source_hash or ""),
-                    updated_at,
-                    _json_dumps(doc),
-                    str(article_id),
-                ),
-            )
+            if purpose is None:
+                doc.update(
+                    {
+                        "embedding_vector": normalized,
+                        "embedding_model": str(model or ""),
+                        "embedding_source_hash": str(source_hash or ""),
+                        "embedding_updated_at": updated_at,
+                    }
+                )
+                if "embedding_vector" in existing_columns:
+                    con.execute(
+                        """
+                        UPDATE articles SET
+                            embedding_vector = ?, embedding_model = ?,
+                            embedding_source_hash = ?, embedding_updated_at = ?,
+                            doc_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            _json_dumps(normalized),
+                            str(model or ""),
+                            str(source_hash or ""),
+                            updated_at,
+                            _json_dumps(doc),
+                            str(article_id),
+                        ),
+                    )
+                else:
+                    con.execute(
+                        "UPDATE articles SET doc_json = ? WHERE id = ?",
+                        (_json_dumps(doc), str(article_id)),
+                    )
+            else:
+                purpose_name = str(purpose).strip().lower()
+                if purpose_name not in {"similarity", "tagging"}:
+                    raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+                prefix = f"{purpose_name}_embedding"
+                doc.update(
+                    {
+                        f"{prefix}_vector": normalized,
+                        f"{prefix}_model": str(model or ""),
+                        f"{prefix}_source_hash": str(source_hash or ""),
+                        f"{prefix}_instruction": str(instruction or "").strip(),
+                        f"{prefix}_updated_at": updated_at,
+                    }
+                )
+                con.execute(
+                    f"""
+                    UPDATE articles SET
+                        {prefix}_vector = ?, {prefix}_model = ?,
+                        {prefix}_source_hash = ?, {prefix}_instruction = ?,
+                        {prefix}_updated_at = ?, doc_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        _json_dumps(normalized),
+                        str(model or ""),
+                        str(source_hash or ""),
+                        str(instruction or "").strip(),
+                        updated_at,
+                        _json_dumps(doc),
+                        str(article_id),
+                    ),
+                )
             con.commit()
             return True
         finally:
@@ -835,6 +947,43 @@ class SqliteStore:
         finally:
             con.close()
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def save_temp_summary(self, job_id: int, summary_text: str, meta: Dict[str, Any]) -> None:
         jid = _safe_int(job_id, 0)
         con = self._connect()
@@ -884,8 +1033,12 @@ class SqliteStore:
         cut_weekly = now - pol.weekly_summaries_days * 86400
         cut_temp = now - pol.temp_summaries_days * 86400
         cut_jobs = now - pol.jobs_days * 86400
-
-        removed = {"articles": 0, "summary_docs": 0, "temp_summaries": 0, "jobs": 0}
+        removed = {
+            "articles": 0,
+            "summary_docs": 0,
+            "temp_summaries": 0,
+            "jobs": 0,
+        }
 
         con = self._connect()
         try:

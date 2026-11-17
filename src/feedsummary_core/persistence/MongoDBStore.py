@@ -101,6 +101,11 @@ def _public_doc(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return result
 
 
+_ASSIGNMENT_OPERATION_FIELD = "last_assignment_operation_id"
+_SNAPSHOT_OPERATION_FIELD = "last_snapshot_operation_id"
+_SNAPSHOT_PENDING_FIELD = "pending_operation_id"
+
+
 class MongoDBStore:
     """MongoDB-backed persistence store with TinyDB/SQLite feature parity."""
 
@@ -135,6 +140,7 @@ class MongoDBStore:
         if self._owns_client and self.client is not None:
             self.client.close()
 
+
     def __enter__(self) -> "MongoDBStore":
         return self
 
@@ -145,6 +151,7 @@ class MongoDBStore:
         indexes = (
             (self.db.articles, [("source", ASCENDING), ("_mongo_sort_ts", ASCENDING)], {}),
             (self.db.articles, [("_mongo_sort_ts", ASCENDING)], {}),
+            (self.db.articles, [("fetched_at", ASCENDING), ("_id", ASCENDING)], {}),
             (
                 self.db.articles,
                 [("url", ASCENDING)],
@@ -218,6 +225,16 @@ class MongoDBStore:
                 "embedding_model": 1,
                 "embedding_source_hash": 1,
                 "embedding_updated_at": 1,
+                "similarity_embedding_vector": 1,
+                "similarity_embedding_model": 1,
+                "similarity_embedding_source_hash": 1,
+                "similarity_embedding_instruction": 1,
+                "similarity_embedding_updated_at": 1,
+                "tagging_embedding_vector": 1,
+                "tagging_embedding_model": 1,
+                "tagging_embedding_source_hash": 1,
+                "tagging_embedding_instruction": 1,
+                "tagging_embedding_updated_at": 1,
             },
         )
         if existing:
@@ -226,6 +243,16 @@ class MongoDBStore:
                 "embedding_model",
                 "embedding_source_hash",
                 "embedding_updated_at",
+                "similarity_embedding_vector",
+                "similarity_embedding_model",
+                "similarity_embedding_source_hash",
+                "similarity_embedding_instruction",
+                "similarity_embedding_updated_at",
+                "tagging_embedding_vector",
+                "tagging_embedding_model",
+                "tagging_embedding_source_hash",
+                "tagging_embedding_instruction",
+                "tagging_embedding_updated_at",
             ):
                 if field not in doc and field in existing:
                     doc[field] = existing[field]
@@ -239,23 +266,42 @@ class MongoDBStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
+        purpose: Optional[str] = None,
+        instruction: Optional[str] = None,
     ) -> bool:
-        """Persist a reusable embedding for an existing article."""
+        """Persist a purpose-specific embedding for an existing article."""
         if (
             not article_id
             or not embedding_vector
             or not all(isinstance(value, (int, float)) for value in embedding_vector)
         ):
             return False
+        purpose_name = None if purpose is None else str(purpose).strip().lower()
+        if purpose_name is None:
+            set_fields = {
+                "embedding_vector": [float(value) for value in embedding_vector],
+                "embedding_model": str(model or ""),
+                "embedding_source_hash": str(source_hash or ""),
+                "embedding_updated_at": _now_ts(),
+            }
+            unset_fields: Dict[str, str] = {}
+        else:
+            if purpose_name not in {"similarity", "tagging"}:
+                raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+            prefix = f"{purpose_name}_embedding"
+            set_fields = {
+                f"{prefix}_vector": [float(value) for value in embedding_vector],
+                f"{prefix}_model": str(model or ""),
+                f"{prefix}_source_hash": str(source_hash or ""),
+                f"{prefix}_instruction": str(instruction or "").strip(),
+                f"{prefix}_updated_at": _now_ts(),
+            }
+            unset_fields = {}
         result = self.db.articles.update_one(
             {"_id": str(article_id)},
             {
-                "$set": {
-                    "embedding_vector": [float(value) for value in embedding_vector],
-                    "embedding_model": str(model or ""),
-                    "embedding_source_hash": str(source_hash or ""),
-                    "embedding_updated_at": _now_ts(),
-                }
+                "$set": set_fields,
+                "$unset": unset_fields,
             },
         )
         return result.matched_count > 0
@@ -320,6 +366,45 @@ class MongoDBStore:
             for doc in self.db.articles.find({"_id": {"$in": ids}})
         }
         return [found[article_id] for article_id in ids if article_id in found]  # type: ignore[misc]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     # Summary documents
 
@@ -402,7 +487,6 @@ class MongoDBStore:
         cut_weekly = now - pol.weekly_summaries_days * 86400
         cut_temp = now - pol.temp_summaries_days * 86400
         cut_jobs = now - pol.jobs_days * 86400
-
         removed = {
             "articles": self.db.articles.delete_many(
                 {"_mongo_sort_ts": {"$lt": cut_articles}}
@@ -441,6 +525,7 @@ class MongoDBStore:
             removed["summary_docs"] = self.db.summary_docs.delete_many(
                 {"_id": {"$in": summary_ids}}
             ).deleted_count
+
         return {name: int(count) for name, count in removed.items()}
 
     # Tags

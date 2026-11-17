@@ -46,11 +46,18 @@ from typing import Any, Dict, List, Optional
 
 from feedsummary_core.llm_client import (
     LLMClient,
+    get_client_embedding_dimensions,
     get_client_embedding_model,
     has_local_embedding_provider,
 )
 from feedsummary_core.persistence import NewsStore
-from feedsummary_core.summarizer.batching import ensure_article_embedding
+from feedsummary_core.summarizer.batching import (
+    SIMILARITY_EMBEDDING_INSTRUCTION,
+    SIMILARITY_EMBEDDING_PURPOSE,
+    TAGGING_EMBEDDING_INSTRUCTION,
+    TAGGING_EMBEDDING_PURPOSE,
+    ensure_article_embedding,
+)
 from feedsummary_core.summarizer.tagging import TagManager
 from feedsummary_core.tagging_ml.embedding_sgd import (
     EmbeddingClassifierSettings,
@@ -58,6 +65,7 @@ from feedsummary_core.tagging_ml.embedding_sgd import (
 )
 
 logger = logging.getLogger(__name__)
+DEFAULT_ARTICLE_MAX_TAGS = 20
 
 
 def _log_ml_event(level: int, event: str, **fields: Any) -> None:
@@ -70,12 +78,30 @@ def _log_ml_event(level: int, event: str, **fields: Any) -> None:
     )
 
 
+def _merge_ml_and_llm_tags(
+    ml_tags: List[Dict[str, Any]],
+    llm_tags: List[Dict[str, Any]],
+    *,
+    allow_new_tags: bool,
+) -> List[Dict[str, Any]]:
+    """Merge additive results, or trust only the LLM-reviewed strict result."""
+    candidate_groups = [ml_tags, llm_tags] if allow_new_tags else [llm_tags]
+    tags: List[Dict[str, Any]] = []
+    seen_tag_ids = set()
+    for tag in (tag for group in candidate_groups for tag in group):
+        tag_id = tag.get("id")
+        if tag_id and tag_id not in seen_tag_ids:
+            seen_tag_ids.add(tag_id)
+            tags.append(tag)
+    return tags
+
+
 async def tag_articles(
     store: NewsStore,
     llm_client: LLMClient,
     article_ids: List[str],
     config: Dict[str, Any],
-    max_tags_per_article: int = 5,
+    max_tags_per_article: int | None = None,
     skip_if_already_tagged: bool = True,
     enable_embedding_matching: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -98,6 +124,68 @@ async def tag_articles(
     tag_manager = TagManager(store, llm_client=llm_client if enable_embedding_matching else None)
     results: Dict[str, List[Dict[str, Any]]] = {}
     ml_tagger: Optional[EmbeddingClassifierTagger] = None
+    tagging_cfg = config.get("tagging", {}) or {}
+    if max_tags_per_article is None:
+        max_tags_per_article = max(
+            1, int(tagging_cfg.get("article_max_tags", DEFAULT_ARTICLE_MAX_TAGS))
+        )
+    ml_cfg = tagging_cfg.get("ml", {}) or {}
+    batching_cfg = config.get("batching", {}) or {}
+    embed = getattr(llm_client, "embed", None)
+    if callable(embed) and has_local_embedding_provider(config):
+        embedding_model = get_client_embedding_model(llm_client)
+        dimensions = get_client_embedding_dimensions(llm_client)
+        embedding_text_chars = int(
+            ml_cfg.get(
+                "embedding_text_chars",
+                batching_cfg.get("embedding_text_chars", 2000),
+            )
+        )
+        similarity_instruction = str(
+            batching_cfg.get("embedding_instruction", SIMILARITY_EMBEDDING_INSTRUCTION)
+        ).strip()
+        tagging_instruction = str(
+            ml_cfg.get("embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION)
+        ).strip()
+        semaphore = asyncio.Semaphore(
+            max(
+                1,
+                int(
+                    ml_cfg.get(
+                        "embedding_max_concurrency",
+                        batching_cfg.get("embedding_max_concurrency", 4),
+                    )
+                ),
+            )
+        )
+
+        async def ensure_embeddings(article_id: str) -> None:
+            article = store.get_article(article_id)
+            if not article:
+                return
+            async with semaphore:
+                await ensure_article_embedding(
+                    article,
+                    embed,
+                    store=store,
+                    embedding_model=embedding_model,
+                    embedding_text_chars=embedding_text_chars,
+                    purpose=SIMILARITY_EMBEDDING_PURPOSE,
+                    instruction=similarity_instruction,
+                    dimensions=dimensions,
+                )
+                await ensure_article_embedding(
+                    article,
+                    embed,
+                    store=store,
+                    embedding_model=embedding_model,
+                    embedding_text_chars=embedding_text_chars,
+                    purpose=TAGGING_EMBEDDING_PURPOSE,
+                    instruction=tagging_instruction,
+                    dimensions=dimensions,
+                )
+
+        await asyncio.gather(*(ensure_embeddings(article_id) for article_id in article_ids))
     try:
         ml_settings = EmbeddingClassifierSettings.from_config(
             config,
@@ -147,11 +235,7 @@ async def tag_articles(
 
             ml_tags: List[Dict[str, Any]] = []
             if ml_tagger and not ml_tagger.can_predict(article):
-                embed = getattr(llm_client, "embed", None)
                 if callable(embed):
-                    tagging_cfg = config.get("tagging", {}) or {}
-                    ml_cfg = tagging_cfg.get("ml", {}) or {}
-                    batching_cfg = config.get("batching", {}) or {}
                     await ensure_article_embedding(
                         article,
                         embed,
@@ -163,6 +247,11 @@ async def tag_articles(
                                 batching_cfg.get("embedding_text_chars", 2000),
                             )
                         ),
+                        purpose=TAGGING_EMBEDDING_PURPOSE,
+                        instruction=str(
+                            ml_cfg.get("embedding_instruction", TAGGING_EMBEDDING_INSTRUCTION)
+                        ).strip(),
+                        dimensions=get_client_embedding_dimensions(llm_client),
                     )
             if ml_tagger and ml_tagger.can_predict(article):
                 scores = ml_tagger.score_names(article)
@@ -200,25 +289,21 @@ async def tag_articles(
                         ][:5],
                     )
             elif ml_tagger:
-                vector = article.get("embedding_vector")
+                vector = article.get("tagging_embedding_vector")
                 _log_ml_event(
                     logging.INFO,
                     "ml_tagging.skipped",
                     article_id=article_id,
                     reason=ml_tagger.embedding_incompatibility_reason(article),
-                    expected_embedding_model=ml_tagger.model_metadata.get(
-                        "embedding_model"
-                    ),
-                    actual_embedding_model=str(article.get("embedding_model") or ""),
-                    expected_dimension=ml_tagger.model_metadata.get(
-                        "embedding_dimension"
-                    ),
+                    expected_embedding_model=ml_tagger.model_metadata.get("embedding_model"),
+                    actual_embedding_model=str(article.get("tagging_embedding_model") or ""),
+                    expected_dimension=ml_tagger.model_metadata.get("embedding_dimension"),
                     actual_dimension=len(vector) if isinstance(vector, list) else None,
                 )
 
-            # Let the LLM supplement ML predictions with existing tags in every
-            # category. Creation restrictions remain independently controlled by
-            # tagging.llm_new_tag_excluded_categories.
+            # A provider with allow_new_tags=false reviews the untrusted ML
+            # suggestions and returns the complete approved set from existing
+            # database tags. Other providers retain the additive ML + LLM flow.
             llm_budget = max(
                 0,
                 max_tags_per_article
@@ -229,14 +314,14 @@ async def tag_articles(
                 article=article,
                 config=config,
                 max_tags=llm_budget,
+                review_tags=ml_tags,
+                review_max_tags=max_tags_per_article,
             )
-            tags = []
-            seen_tag_ids = set()
-            for tag in ml_tags + llm_tags:
-                tag_id = tag.get("id")
-                if tag_id and tag_id not in seen_tag_ids:
-                    seen_tag_ids.add(tag_id)
-                    tags.append(tag)
+            tags = _merge_ml_and_llm_tags(
+                ml_tags,
+                llm_tags,
+                allow_new_tags=tag_manager.last_generation_allowed_new_tags,
+            )
 
             if tags:
                 # Store tags with reasoning
@@ -248,7 +333,7 @@ async def tag_articles(
                         if t.get("reasoning"):
                             entry["reasoning"] = t["reasoning"]
                         tag_entries.append(entry)
-                
+
                 store.add_article_tags(article_id, tag_entries)
 
                 # Update article with tags
@@ -272,11 +357,7 @@ async def tag_articles(
     consistency_cfg = tagging_cfg.get("similarity_consistency", {}) or {}
     batching_cfg = config.get("batching", {}) or {}
     consistency_enabled = bool(consistency_cfg.get("enabled", True))
-    if (
-        consistency_enabled
-        and enable_embedding_matching
-        and has_local_embedding_provider(config)
-    ):
+    if consistency_enabled and enable_embedding_matching and has_local_embedding_provider(config):
         try:
             articles = [store.get_article(article_id) for article_id in article_ids]
             additions = await tag_manager.ensure_similar_articles_share_tags(
@@ -314,7 +395,7 @@ async def tag_article(
     llm_client: LLMClient,
     article_id: str,
     config: Dict[str, Any],
-    max_tags: int = 5,
+    max_tags: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Tag a single article.
@@ -443,7 +524,7 @@ async def tag_articles_safe(
     article_ids: List[str],
     config: Dict[str, Any],
     job_id: Optional[int] = None,
-    max_tags_per_article: int = 5,
+    max_tags_per_article: int | None = None,
 ) -> int:
     """
     Safely tag articles, ignoring errors.
@@ -465,9 +546,13 @@ async def tag_articles_safe(
     if not article_ids:
         return 0
 
-    logger.info(
-        f"[Job {job_id}] Starting automatic tagging of {len(article_ids)} articles..."
-    )
+    if max_tags_per_article is None:
+        tagging_cfg = config.get("tagging") or {}
+        max_tags_per_article = max(
+            1, int(tagging_cfg.get("article_max_tags", DEFAULT_ARTICLE_MAX_TAGS))
+        )
+
+    logger.info(f"[Job {job_id}] Starting automatic tagging of {len(article_ids)} articles...")
 
     try:
         result = await tag_articles(

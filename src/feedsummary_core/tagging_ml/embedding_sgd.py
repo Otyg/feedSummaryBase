@@ -47,7 +47,8 @@ def _ml_imports() -> dict[str, Any]:
         import numpy as np
         from sklearn.linear_model import LogisticRegression, SGDClassifier
         from sklearn.multiclass import OneVsRestClassifier
-        from sklearn.preprocessing import MultiLabelBinarizer, Normalizer
+        from sklearn.naive_bayes import ComplementNB, MultinomialNB
+        from sklearn.preprocessing import MinMaxScaler, MultiLabelBinarizer, Normalizer
     except ImportError as error:  # pragma: no cover - installation dependent
         raise RuntimeError("ML dependencies are missing; install feedsummary-core[ml]") from error
     return {
@@ -55,10 +56,21 @@ def _ml_imports() -> dict[str, Any]:
         "np": np,
         "LogisticRegression": LogisticRegression,
         "SGDClassifier": SGDClassifier,
+        "MultinomialNB": MultinomialNB,
+        "ComplementNB": ComplementNB,
         "OneVsRestClassifier": OneVsRestClassifier,
+        "MinMaxScaler": MinMaxScaler,
         "MultiLabelBinarizer": MultiLabelBinarizer,
         "Normalizer": Normalizer,
     }
+
+
+SUPPORTED_ALGORITHMS = {
+    "logistic_regression",
+    "sgd",
+    "multinomial_nb",
+    "complement_nb",
+}
 
 
 @dataclass(frozen=True)
@@ -70,7 +82,7 @@ class EmbeddingClassifierSettings:
     embedding_model: str = ""
     min_label_support: int = 10
     min_training_articles: int = 30
-    max_tags_per_article: int = 5
+    max_tags_per_article: int = 20
     threshold: float = 0.5
     regularization_c: float = 1.0
     alpha: float = 0.0001
@@ -95,9 +107,10 @@ class EmbeddingClassifierSettings:
             raise TypeError("tagging.ml.categories must be a list of category names")
         algorithm = str(raw.get("classifier") or raw.get("algorithm") or "").strip().lower()
         representation = str(raw.get("representation") or "embedding").strip().lower()
-        if algorithm and algorithm not in {"logistic_regression", "sgd"}:
+        if algorithm and algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError(
-                "tagging.ml.classifier must be 'logistic_regression' or 'sgd'"
+                "tagging.ml.classifier must be one of: "
+                + ", ".join(sorted(SUPPORTED_ALGORITHMS))
             )
         if representation not in {"embedding", "embeddings"}:
             raise ValueError(
@@ -120,7 +133,7 @@ class EmbeddingClassifierSettings:
             embedding_model=str(raw.get("embedding_model") or embedding_model or "").strip(),
             min_label_support=max(2, int(raw.get("min_label_support", 10))),
             min_training_articles=max(10, int(raw.get("min_training_articles", 30))),
-            max_tags_per_article=max(1, int(raw.get("max_tags_per_article", 5))),
+            max_tags_per_article=max(1, int(raw.get("max_tags_per_article", 20))),
             threshold=float(raw.get("threshold", 0.5)),
             regularization_c=float(raw.get("regularization_c", raw.get("c", 1.0))),
             alpha=float(raw.get("alpha", 0.0001)),
@@ -135,7 +148,7 @@ class EmbeddingClassifierSettings:
             raise ValueError("tagging.ml.categories is required when ML tagging is enabled")
         if self.enabled and not self.algorithm:
             raise ValueError("tagging.ml.classifier is required when ML tagging is enabled")
-        if self.algorithm and self.algorithm not in {"logistic_regression", "sgd"}:
+        if self.algorithm and self.algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError("Unsupported tagging.ml.classifier")
         if not 0.0 <= self.threshold <= 1.0:
             raise ValueError("tagging.ml.threshold must be between 0 and 1")
@@ -158,7 +171,8 @@ class _TrainingRow:
 class EmbeddingClassifierTagger:
     """Train, persist, refresh, and use a configured embedding classifier."""
 
-    ARTIFACT_VERSION = 2
+    # Version 3 trains exclusively on instruction-specific tagging embeddings.
+    ARTIFACT_VERSION = 3
 
     def __init__(self, settings: EmbeddingClassifierSettings):
         self.settings = settings
@@ -201,11 +215,16 @@ class EmbeddingClassifierTagger:
         if not path.is_file():
             return False
         artifact = _ml_imports()["joblib"].load(path)
-        if (
-            not isinstance(artifact, dict)
-            or artifact.get("artifact_version") != self.ARTIFACT_VERSION
-        ):
+        if not isinstance(artifact, dict):
             raise ValueError(f"Unsupported ML tag artifact at {path}")
+        artifact_version = artifact.get("artifact_version")
+        if artifact_version != self.ARTIFACT_VERSION:
+            logger.info(
+                "ML tag artifact version changed (%r -> %d); retraining is required",
+                artifact_version,
+                self.ARTIFACT_VERSION,
+            )
+            return False
         if tuple(artifact.get("categories") or ()) != self.settings.categories:
             logger.info("ML tag artifact categories changed; retraining is required")
             return False
@@ -235,8 +254,8 @@ class EmbeddingClassifierTagger:
             if not isinstance(article, dict):
                 continue
             article_id = str(article.get("id") or "").strip()
-            vector = article.get("embedding_vector")
-            model = str(article.get("embedding_model") or "").strip()
+            vector = article.get("tagging_embedding_vector")
+            model = str(article.get("tagging_embedding_model") or "").strip()
             if not article_id or not isinstance(vector, list) or not vector:
                 continue
             if not all(isinstance(value, (int, float)) for value in vector):
@@ -269,7 +288,7 @@ class EmbeddingClassifierTagger:
                     article_id=article_id,
                     embedding=tuple(float(value) for value in vector),
                     labels=labels,
-                    source_hash=str(article.get("embedding_source_hash") or ""),
+                    source_hash=str(article.get("tagging_embedding_source_hash") or ""),
                 )
             )
 
@@ -357,7 +376,13 @@ class EmbeddingClassifierTagger:
         ml = _ml_imports()
         np = ml["np"]
         embeddings = np.asarray([row.embedding for row in rows], dtype=float)
-        feature_transformer = ml["Normalizer"](norm="l2")
+        if self.settings.algorithm in {"multinomial_nb", "complement_nb"}:
+            # Persisted embeddings can contain negative components, while both
+            # count-based NB estimators require non-negative features.  This is
+            # the same transform used by the production benchmark.
+            feature_transformer = ml["MinMaxScaler"](clip=True)
+        else:
+            feature_transformer = ml["Normalizer"](norm="l2")
         features = feature_transformer.fit_transform(embeddings)
         binarizer = ml["MultiLabelBinarizer"](classes=label_names)
         targets = binarizer.fit_transform([row.labels for row in rows])
@@ -369,7 +394,7 @@ class EmbeddingClassifierTagger:
                 tol=self.settings.tolerance,
                 random_state=self.settings.random_state,
             )
-        else:
+        elif self.settings.algorithm == "sgd":
             estimator = ml["SGDClassifier"](
                 loss="log_loss",
                 alpha=self.settings.alpha,
@@ -378,6 +403,10 @@ class EmbeddingClassifierTagger:
                 tol=self.settings.tolerance,
                 random_state=self.settings.random_state,
             )
+        elif self.settings.algorithm == "multinomial_nb":
+            estimator = ml["MultinomialNB"](alpha=self.settings.alpha)
+        else:
+            estimator = ml["ComplementNB"](alpha=self.settings.alpha)
         if targets.shape[1] == 1:
             classifier = estimator.fit(features, targets[:, 0])
             classifier_kind = "binary"
@@ -431,7 +460,7 @@ class EmbeddingClassifierTagger:
         if not self.can_predict(article):
             return []
         assert self._artifact is not None
-        vector = article.get("embedding_vector")
+        vector = article.get("tagging_embedding_vector")
         assert isinstance(vector, list)
 
         ml = _ml_imports()
@@ -465,7 +494,7 @@ class EmbeddingClassifierTagger:
         """Explain why an article cannot be scored, or return ``None`` when compatible."""
         if not self._artifact:
             return "model_not_ready"
-        vector = article.get("embedding_vector")
+        vector = article.get("tagging_embedding_vector")
         if not isinstance(vector, list) or not vector:
             return "missing_embedding"
         if not all(isinstance(value, (int, float)) for value in vector):
@@ -473,7 +502,10 @@ class EmbeddingClassifierTagger:
         if len(vector) != int(self._artifact["embedding_dimension"]):
             return "embedding_dimension_mismatch"
         expected_model = str(self._artifact.get("embedding_model") or "")
-        if expected_model and str(article.get("embedding_model") or "") != expected_model:
+        if (
+            expected_model
+            and str(article.get("tagging_embedding_model") or "") != expected_model
+        ):
             return "embedding_model_mismatch"
         return None
 

@@ -33,12 +33,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
+from contextlib import contextmanager
 from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tinydb import Query, TinyDB
-
+from tinydb.operations import delete as delete_field
 from feedsummary_core.persistence import CleanupPolicy
 from feedsummary_core.persistence.tag_relations import (
     PARENT_CHILD_RELATION,
@@ -47,6 +50,37 @@ from feedsummary_core.persistence.tag_relations import (
 from feedsummary_core.tagging_rules import VULNERABILITY_TAG_CATEGORY, is_cve_tag
 
 logger = logging.getLogger(__name__)
+_DB_LOCKS: Dict[str, threading.Lock] = {}
+_DB_LOCKS_GUARD = threading.Lock()
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
+
+@contextmanager
+def _db_file_lock(database_path: str, suffix: str):
+    resolved = os.path.abspath(database_path)
+    with _DB_LOCKS_GUARD:
+        thread_lock = _DB_LOCKS.setdefault(f"{resolved}:{suffix}", threading.Lock())
+    with thread_lock:
+        lock_path = f"{resolved}.{suffix}"
+        with open(lock_path, "a+", encoding="utf-8") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _article_file_lock(database_path: str):
+    """Serialize TinyDB article writes across threads and, on Unix, processes."""
+
+    with _db_file_lock(database_path, "articles.lock"):
+        yield
 
 
 def _normalize_summary_id(value: Any) -> Optional[str]:
@@ -76,10 +110,13 @@ class TinyDBStore:
         return res[0] if res else None
 
     def upsert_article(self, article_doc: Dict[str, Any]) -> None:
-        db = self._db()
-        A = Query()
-        db.table("articles").upsert(article_doc, A.id == article_doc["id"])
-        db.close()
+        with _article_file_lock(self.path):
+            db = self._db()
+            try:
+                A = Query()
+                db.table("articles").upsert(article_doc, A.id == article_doc["id"])
+            finally:
+                db.close()
 
     def update_article_embedding(
         self,
@@ -88,27 +125,42 @@ class TinyDBStore:
         *,
         model: Optional[str] = None,
         source_hash: Optional[str] = None,
+        purpose: Optional[str] = None,
+        instruction: Optional[str] = None,
     ) -> bool:
-        """Persist a reusable embedding for an existing article."""
+        """Persist a purpose-specific embedding for an existing article."""
         if not article_id or not embedding_vector or not all(
             isinstance(value, (int, float)) for value in embedding_vector
         ):
             return False
-        db = self._db()
-        try:
-            A = Query()
-            updated = db.table("articles").update(
-                {
-                    "embedding_vector": [float(value) for value in embedding_vector],
-                    "embedding_model": str(model or ""),
-                    "embedding_source_hash": str(source_hash or ""),
-                    "embedding_updated_at": int(time.time()),
-                },
-                A.id == str(article_id),
-            )
-            return bool(updated)
-        finally:
-            db.close()
+        normalized = [float(value) for value in embedding_vector]
+        purpose_name = None if purpose is None else str(purpose).strip().lower()
+        if purpose_name is None:
+            fields = {
+                "embedding_vector": normalized,
+                "embedding_model": str(model or ""),
+                "embedding_source_hash": str(source_hash or ""),
+                "embedding_updated_at": int(time.time()),
+            }
+        else:
+            if purpose_name not in {"similarity", "tagging"}:
+                raise ValueError(f"Unsupported article embedding purpose: {purpose}")
+            prefix = f"{purpose_name}_embedding"
+            fields = {
+                f"{prefix}_vector": normalized,
+                f"{prefix}_model": str(model or ""),
+                f"{prefix}_source_hash": str(source_hash or ""),
+                f"{prefix}_instruction": str(instruction or "").strip(),
+                f"{prefix}_updated_at": int(time.time()),
+            }
+        with _article_file_lock(self.path):
+            db = self._db()
+            try:
+                A = Query()
+                updated = db.table("articles").update(fields, A.id == str(article_id))
+                return bool(updated)
+            finally:
+                db.close()
 
     def list_articles(self, limit: int = 2000) -> List[Dict[str, Any]]:
         """
@@ -188,12 +240,18 @@ class TinyDBStore:
         """
         Legacy: Behålls för bakåtkomp, men pipeline använder den inte längre.
         """
-        db = self._db()
-        A = Query()
-        ts = int(time.time())
-        for aid in article_ids:
-            db.table("articles").update({"summarized": True, "summarized_at": ts}, A.id == aid)
-        db.close()
+        with _article_file_lock(self.path):
+            db = self._db()
+            try:
+                A = Query()
+                ts = int(time.time())
+                for aid in article_ids:
+                    db.table("articles").update(
+                        {"summarized": True, "summarized_at": ts},
+                        A.id == aid,
+                    )
+            finally:
+                db.close()
 
     def save_summary_doc(self, summary_doc: Dict[str, Any]) -> Any:
         db = self._db()
@@ -328,6 +386,47 @@ class TinyDBStore:
         db.close()
         return out
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def put_temp_summary(self, job_id: int, payload: Dict[str, Any]) -> None:
         db = self._db()
         t = db.table("temp_summaries")
@@ -350,6 +449,7 @@ class TinyDBStore:
         db.close()
         return rows[0] if rows else None
 
+
     def run_cleanup(self, pol: CleanupPolicy) -> Dict[str, int]:
         """
         Cleanup for TinyDB schema:
@@ -361,70 +461,70 @@ class TinyDBStore:
         cut_weekly = now - pol.weekly_summaries_days * 86400
         cut_temp = now - pol.temp_summaries_days * 86400
         cut_jobs = now - pol.jobs_days * 86400
-
         removed = {"articles": 0, "summary_docs": 0, "temp_summaries": 0, "jobs": 0}
 
         # TinyDB import here to avoid dependency if user doesn't use it
         from tinydb import TinyDB
 
-        db = TinyDB(self.path)
-        try:
-            # Articles
-            at = db.table("articles")
-            # remove uses a predicate for each row
-            before = len(at)
-            at.remove(
-                lambda r: int(r.get("published_ts") or r.get("fetched_at") or 0) < cut_articles
-            )
-            removed["articles"] = max(0, before - len(at))
+        with _article_file_lock(self.path):
+            db = TinyDB(self.path)
+            try:
+                # Articles
+                at = db.table("articles")
+                # remove uses a predicate for each row
+                before = len(at)
+                at.remove(
+                    lambda r: int(r.get("published_ts") or r.get("fetched_at") or 0)
+                    < cut_articles
+                )
+                removed["articles"] = max(0, before - len(at))
 
-            # Temp summaries
-            tt = db.table("temp_summaries")
-            before = len(tt)
-            tt.remove(lambda r: int(r.get("created_at") or 0) < cut_temp)
-            removed["temp_summaries"] = max(0, before - len(tt))
+                # Temp summaries
+                tt = db.table("temp_summaries")
+                before = len(tt)
+                tt.remove(lambda r: int(r.get("created_at") or 0) < cut_temp)
+                removed["temp_summaries"] = max(0, before - len(tt))
 
-            # Jobs (only done/failed)
-            jt = db.table("jobs")
-            before = len(jt)
+                # Jobs (only done/failed)
+                jt = db.table("jobs")
+                before = len(jt)
 
-            def job_old_finished(r: Dict[str, Any]) -> bool:
-                ts = int(r.get("finished_at") or r.get("created_at") or 0)
-                st = str(r.get("status") or "")
-                return ts < cut_jobs and st in ("done", "failed")
+                def job_old_finished(r: Dict[str, Any]) -> bool:
+                    ts = int(r.get("finished_at") or r.get("created_at") or 0)
+                    st = str(r.get("status") or "")
+                    return ts < cut_jobs and st in ("done", "failed")
 
-            jt.remove(job_old_finished)
-            removed["jobs"] = max(0, before - len(jt))
+                jt.remove(job_old_finished)
+                removed["jobs"] = max(0, before - len(jt))
 
-            # Summary docs
-            sd = db.table("summary_docs")
-            before = len(sd)
+                # Summary docs
+                sd = db.table("summary_docs")
+                before = len(sd)
 
-            def sum_should_remove(r: Dict[str, Any]) -> bool:
-                created = int(r.get("created") or 0)
-                # we need prompt_package; in tinydb it is stored inside the doc itself
-                pkg = ""
-                sel = r.get("selection")
-                if isinstance(sel, dict):
-                    pkg = str(sel.get("prompt_package") or "").lower().strip()
-                kind = "other"
-                if "weekly" in pkg:
-                    kind = "weekly"
-                elif "daily" in pkg:
-                    kind = "daily"
+                def sum_should_remove(r: Dict[str, Any]) -> bool:
+                    created = int(r.get("created") or 0)
+                    # we need prompt_package; in tinydb it is stored inside the doc itself
+                    pkg = ""
+                    sel = r.get("selection")
+                    if isinstance(sel, dict):
+                        pkg = str(sel.get("prompt_package") or "").lower().strip()
+                    kind = "other"
+                    if "weekly" in pkg:
+                        kind = "weekly"
+                    elif "daily" in pkg:
+                        kind = "daily"
 
-                if kind == "daily":
-                    return created < cut_daily
-                if kind == "weekly":
+                    if kind == "daily":
+                        return created < cut_daily
+                    if kind == "weekly":
+                        return created < cut_weekly
                     return created < cut_weekly
-                return created < cut_weekly
 
-            sd.remove(sum_should_remove)
-            removed["summary_docs"] = max(0, before - len(sd))
-
-            return removed
-        finally:
-            db.close()
+                sd.remove(sum_should_remove)
+                removed["summary_docs"] = max(0, before - len(sd))
+            finally:
+                db.close()
+        return removed
 
     # ============================================================================
     # Tag management methods
