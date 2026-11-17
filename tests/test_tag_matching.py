@@ -363,6 +363,32 @@ class TagMatchingTests(unittest.TestCase):
 
         self.assertEqual([], selected)
 
+    def test_manual_reclassification_keeps_unmentioned_entity_candidate(self):
+        ibm = {"id": 1, "name": "ibm", "category": "ORGANIZATION"}
+        store = MemoryTagStore([ibm])
+        client = FakeTaggingClient(
+            '{"suggested_tags": [{"tag": "ibm", "reasoning": "A plausible vendor."}]}'
+        )
+        manager = TagManager(store)
+
+        selected = asyncio.run(
+            manager.reclassify_article_with_existing_tags(
+                client,
+                {
+                    "id": "article-1",
+                    "title": "Server vulnerability",
+                    "text": "A vendor released a patch for its server product.",
+                },
+                manual_review=True,
+            )
+        )
+
+        self.assertEqual(["ibm"], [tag["name"] for tag in selected])
+        prompt = client.messages[0][0]["content"]
+        self.assertIn("human reviewer", prompt)
+        self.assertIn("plausible or indirectly supported candidates", prompt)
+        self.assertNotIn("It is better to suggest too few tags", prompt)
+
     def test_existing_only_review_accepts_product_alias_as_evidence(self):
         product = {
             "id": 1,

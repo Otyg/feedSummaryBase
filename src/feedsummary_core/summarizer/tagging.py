@@ -1836,6 +1836,7 @@ Respond in JSON format:
         article: Dict[str, Any],
         current_article_tags: List[Dict[str, Any]] = None,
         max_tags: int = 20,
+        manual_review: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Reclassify an article by suggesting only from existing tags in the database.
@@ -1848,6 +1849,8 @@ Respond in JSON format:
             article: Article dict with 'title', 'content', etc.
             current_article_tags: List of tags already on the article (to exclude)
             max_tags: Maximum number of tags to suggest
+            manual_review: Return broader candidates for a human to assess instead
+                of applying the conservative automatic-tagging restrictions
 
         Returns:
             List of suggested tags with 'id', 'name', 'category', 'reasoning'
@@ -1888,7 +1891,12 @@ Respond in JSON format:
             return []
 
         # Build the reclassification prompt
-        prompt = self._build_reclassification_prompt(text_context, available_tags, max_tags)
+        prompt = self._build_reclassification_prompt(
+            text_context,
+            available_tags,
+            max_tags,
+            manual_review=manual_review,
+        )
 
         try:
             # Use LLM to suggest relevant tags
@@ -1899,6 +1907,7 @@ Respond in JSON format:
                 available_tags,
                 article_text=text_context,
                 max_tags=max_tags,
+                require_literal_evidence=not manual_review,
             )
         except Exception as e:
             logger.error(f"Error reclassifying article: {e}")
@@ -1910,6 +1919,7 @@ Respond in JSON format:
         available_tags: List[Dict[str, str]],
         max_tags: int = 20,
         review_tags: Optional[List[Dict[str, Any]]] = None,
+        manual_review: bool = False,
     ) -> str:
         """
         Build a prompt for reclassifying an article using only existing tags.
@@ -1980,14 +1990,30 @@ name or listed aliases; include it only if directly supported. Omitting a sugges
                 + "\n"
             )
 
+        if manual_review:
+            relevance_policy = """4. Include any tag that is a credible candidate for human review
+5. The human reviewer will decide which suggested tags are relevant"""
+            relevance_rules = """- Return all credible candidates that a human reviewer may reasonably choose
+- Include clear matches as well as plausible or indirectly supported candidates
+- Do not require an organization, product, actor, or location name to occur literally when the article context supports the tag
+- Do not suppress a candidate merely because its relevance is uncertain; explain the uncertainty in the reasoning
+- The human reviewer, not this response, makes the final relevance decision
+- Return an empty list only when there are no credible candidates in the provided list"""
+        else:
+            relevance_policy = """4. A tag is ONLY relevant if it is DIRECTLY relevant to the article content
+5. It is PERFECTLY OK to suggest NO tags if none are directly relevant"""
+            relevance_rules = """- Only include tags that are directly and clearly related to the article
+- Do not include marginal or loosely related tags
+- If you are unsure whether a tag applies, do NOT include it
+- It is better to suggest too few tags than too many"""
+
         return f"""Analyze the following article and suggest relevant tags from the provided list.
 
 IMPORTANT INSTRUCTIONS:
 1. You MUST ONLY suggest tags from the provided list below
 2. Do NOT suggest tags that are not in the list
 3. Do NOT create new tags or suggest new tag names
-4. A tag is ONLY relevant if it is DIRECTLY relevant to the article content
-5. It is PERFECTLY OK to suggest NO tags if none are directly relevant
+{relevance_policy}
 6. Provide your reasoning for each suggested tag
 
 Available tags organized by category:
@@ -1996,10 +2022,7 @@ Available tags organized by category:
 
 SUGGESTION RULES:
 - Suggest up to {max_tags} tags maximum
-- Only include tags that are directly and clearly related to the article
-- Do not include marginal or loosely related tags
-- If you are unsure whether a tag applies, do NOT include it
-- It is better to suggest too few tags than too many
+{relevance_rules}
 
 Article:
 {article_text}
@@ -2025,6 +2048,7 @@ If NO tags are relevant, respond with:
         article_text: str,
         max_tags: int,
         review_tags: Optional[List[Dict[str, Any]]] = None,
+        require_literal_evidence: bool = True,
     ) -> List[Dict[str, Any]]:
         """Resolve an LLM response strictly to exact tags already in the store."""
         suggested_tag_names = self._extract_tag_suggestions_from_response(response)
@@ -2049,8 +2073,10 @@ If NO tags are relevant, respond with:
             if tag_id in seen_ids:
                 continue
             category = str(match.get("category") or "").strip().upper()
-            if category in LITERAL_EVIDENCE_CATEGORIES and not self._stored_entity_has_literal_evidence(
-                match, article_text
+            if (
+                require_literal_evidence
+                and category in LITERAL_EVIDENCE_CATEGORIES
+                and not self._stored_entity_has_literal_evidence(match, article_text)
             ):
                 logger.info(
                     "[Reclassify] Rejected ungrounded entity tag '%s'",
